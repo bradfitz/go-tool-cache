@@ -22,7 +22,8 @@ type indexEntry struct {
 }
 
 type DiskCache struct {
-	Dir string
+	Dir     string
+	Verbose bool
 }
 
 func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
@@ -31,7 +32,9 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 	if err != nil {
 		if os.IsNotExist(err) {
 			err = nil
-			log.Printf("Miss: %v", actionID)
+			if dc.Verbose {
+				log.Printf("disk miss: %v", actionID)
+			}
 		}
 		return "", "", err
 	}
@@ -45,6 +48,20 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 		return "", "", nil
 	}
 	return ie.OutputID, filepath.Join(dc.Dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
+}
+
+func (dc *DiskCache) OutputFilename(objectID string) string {
+	if len(objectID) < 4 || len(objectID) > 1000 {
+		return ""
+	}
+	for i := range objectID {
+		b := objectID[i]
+		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
+			continue
+		}
+		return ""
+	}
+	return filepath.Join(dc.Dir, fmt.Sprintf("o-%s", objectID))
 }
 
 func (dc *DiskCache) Put(ctx context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
