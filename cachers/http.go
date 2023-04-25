@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 )
 
 // ActionValue is the JSON value returned by the cacher server for an GET /action request.
@@ -65,34 +64,29 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	}
 	outputID = av.OutputID
 
-	diskPath = c.Disk.OutputFilename(outputID)
-	if diskPath == "" {
-		return "", "", fmt.Errorf("invalid outputID %q", av.OutputID)
-	}
-
-	// See if it's already on disk.
-	fi, err := os.Stat(diskPath)
-	if err == nil && fi.Size() == av.Size {
-		return av.OutputID, diskPath, nil
-	}
-
 	// If not on disk, download it to disk.
-	req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
-	res, err = c.httpClient().Do(req)
-	if err != nil {
-		return "", "", err
+	var putBody io.Reader
+	if av.Size == 0 {
+		putBody = bytes.NewReader(nil)
+	} else {
+		req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
+		res, err = c.httpClient().Do(req)
+		if err != nil {
+			return "", "", err
+		}
+		defer res.Body.Close()
+		if res.StatusCode == http.StatusNotFound {
+			return "", "", nil
+		}
+		if res.StatusCode != http.StatusOK {
+			return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
+		}
+		if res.ContentLength == -1 {
+			return "", "", fmt.Errorf("no Content-Length from server")
+		}
+		putBody = res.Body
 	}
-	defer res.Body.Close()
-	if res.StatusCode == http.StatusNotFound {
-		return "", "", nil
-	}
-	if res.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
-	}
-	if res.ContentLength == -1 {
-		return "", "", fmt.Errorf("no Content-Length from server")
-	}
-	diskPath, err = c.Disk.Put(ctx, actionID, outputID, res.ContentLength, res.Body)
+	diskPath, err = c.Disk.Put(ctx, actionID, outputID, av.Size, putBody)
 	return outputID, diskPath, err
 }
 
