@@ -16,7 +16,7 @@ Currently you need to build your own Go toolchain to use this. As of 2023-04-24 
 First, build your cache child process. For example,
 
 ```sh
-$ go install github.com/bradfitz/cmd/go-cacher
+$ go install github.com/bradfitz/go-tool-cache/cmd/go-cacher
 ```
 
 Then tell Go to use it:
