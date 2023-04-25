@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bradfitz/go-tool-cache/cachers"
 )
@@ -37,6 +38,7 @@ var (
 	dir     = flag.String("cache-dir", "", "cache directory")
 	verbose = flag.Bool("verbose", false, "be verbose")
 	listen  = flag.String("listen", ":31364", "listen address")
+	latency = flag.Duration("inject-latency", 0, "the additional latency to add to all requests (for testing)")
 )
 
 func main() {
@@ -59,6 +61,7 @@ func main() {
 	srv := &server{
 		cache:   dc,
 		verbose: *verbose,
+		latency: *latency,
 	}
 
 	log.Fatal(http.ListenAndServe(*listen, srv))
@@ -67,9 +70,11 @@ func main() {
 type server struct {
 	cache   *cachers.DiskCache // TODO: add interface for things other than disk cache? when needed.
 	verbose bool
+	latency time.Duration
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	time.Sleep(s.latency)
 	if s.verbose {
 		log.Printf("%s %s", r.Method, r.RequestURI)
 	}
