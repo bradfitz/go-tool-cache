@@ -2,6 +2,7 @@ package cachers
 
 import (
 	"context"
+	"errors"
 	"io"
 )
 
@@ -28,4 +29,26 @@ type Cache interface {
 		size int64,
 		body io.Reader,
 	) (diskPath string, err error)
+}
+
+// ActionValue is the JSON value returned by the cacher server for an GET /action request.
+type ActionValue struct {
+	OutputID string `json:"outputID"`
+	Size     int64  `json:"size"`
+}
+
+type Upstream interface {
+	GetAction(ctx context.Context, actionID string) (*ActionValue, error)
+	GetOutput(ctx context.Context, outputID string) (body io.ReadCloser, err error)
+
+	Put(ctx context.Context, actionID string, outputID string, size int64, body io.Reader) error
+}
+
+var errNotFound = errors.New("not found")
+
+func IgnoreNotFound(err error) error {
+	if errors.Is(err, errNotFound) {
+		return nil
+	}
+	return err
 }

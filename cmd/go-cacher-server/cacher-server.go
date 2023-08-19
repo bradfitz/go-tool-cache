@@ -66,7 +66,7 @@ func main() {
 }
 
 type server struct {
-	cache *cachers.DiskCache
+	cache cachers.Cache
 
 	verbose bool
 	latency time.Duration
@@ -159,12 +159,12 @@ func (s *server) handleGetOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	outputFile, err := s.cache.Output.Get(r.Context(), outputID)
+	_, diskPath, err := s.cache.Get(r.Context(), outputID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.ServeFile(w, r, outputFile)
+	http.ServeFile(w, r, diskPath)
 }
 
 func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {

@@ -52,10 +52,12 @@ func main() {
 	}
 
 	if *serverBase != "" {
-		hc := &cachers.HTTPClient{
-			BaseURL: *serverBase,
-			Disk:    dc,
-			Verbose: *verbose,
+		hc := &cachers.WithUpstream{
+			Upstream: &cachers.HTTPRemote{
+				BaseURL: *serverBase,
+				Verbose: *verbose,
+			},
+			Local: dc,
 		}
 		p.Get = hc.Get
 		p.Put = hc.Put
