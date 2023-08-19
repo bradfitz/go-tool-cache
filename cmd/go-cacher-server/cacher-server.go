@@ -68,7 +68,7 @@ func main() {
 }
 
 type server struct {
-	cache   *cachers.DiskCache // TODO: add interface for things other than disk cache? when needed.
+	cache   cachers.Cache
 	verbose bool
 	latency time.Duration
 }
