@@ -116,7 +116,7 @@ func (c *CacheUpstream) Put(ctx context.Context, actionID string, outputID strin
 
 	if size > 0 {
 		// TODO: lease blobs for writing?
-		outputBlob := c.containerURL.NewBlockBlobURL(outputBlobName(actionID))
+		outputBlob := c.containerURL.NewBlockBlobURL(outputBlobName(outputID))
 		_, err := azblob.UploadStreamToBlockBlob(ctx, body, outputBlob, azblob.UploadStreamToBlockBlobOptions{
 			BlobHTTPHeaders: azblob.BlobHTTPHeaders{ContentType: "application/octet-stream"},
 			BlobAccessTier:  azblob.DefaultAccessTier,
