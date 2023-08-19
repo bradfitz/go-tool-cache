@@ -5,6 +5,16 @@ import (
 	"io"
 )
 
+type ActionCache interface {
+	Get(ctx context.Context, actionID string) (outputID string, size int64, err error)
+	Put(ctx context.Context, actionID string, outputID string, size int64) (err error)
+}
+
+type OutputDiskCache interface {
+	Get(ctx context.Context, outputID string) (diskPath string, err error)
+	Put(ctx context.Context, outputID string, size int64, body io.Reader) (diskPath string, err error)
+}
+
 // Cache provides cache access.
 type Cache interface {
 	// Get returns the outputID and diskPath for the given actionID.
@@ -18,7 +28,4 @@ type Cache interface {
 		size int64,
 		body io.Reader,
 	) (diskPath string, err error)
-
-	// OutputFilename returns the disk path for the given outputID.
-	OutputFilename(outputID string) string
 }

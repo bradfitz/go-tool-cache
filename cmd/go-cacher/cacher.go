@@ -36,7 +36,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	dc := &cachers.DiskCache{Dir: *dir}
+	dc := cachers.NewDiskCache(*dir, *verbose)
 
 	var p *cacheproc.Process
 	p = &cacheproc.Process{
