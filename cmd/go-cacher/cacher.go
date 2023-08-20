@@ -45,7 +45,7 @@ func main() {
 
 	var cache cachers.Cache
 
-	dc := cachers.NewDiskCache(*dir, *verbose)
+	dc := &cachers.DiskCache{Dir: *dir, Verbose: *verbose}
 
 	switch *remote {
 		case "azure":

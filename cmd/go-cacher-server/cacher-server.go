@@ -57,7 +57,7 @@ func main() {
 	}
 
 	srv := &server{
-		cache:  cachers.NewDiskCache(*dir, *verbose),
+		cache:  &cachers.DiskCache{Dir: *dir, Verbose: *verbose},
 		verbose: *verbose,
 		latency: *latency,
 	}
