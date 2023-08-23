@@ -1,4 +1,4 @@
-package abs
+package azblob
 
 import (
 	"bytes"

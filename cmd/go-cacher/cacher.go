@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/bradfitz/go-tool-cache/abs"
+	"github.com/bradfitz/go-tool-cache/azblob"
 	"github.com/bradfitz/go-tool-cache/cacheproc"
 	"github.com/bradfitz/go-tool-cache/cachers"
 )
@@ -22,10 +22,10 @@ var (
 	verbose    = flag.Bool("verbose", false, "be verbose")
 	remote = flag.String("remote", "", "remote to use. Defaults to disabled. Valid values are: azure")
 
-	absAccountName = flag.String("abs-account-name", "", "Azure Blob Storage account name")
-	absAccountKey  = flag.String("abs-account-key", "", "Azure Blob Storage account key")
-	absEndpoint    = flag.String("abs-endpoint", "", "Azure Blob Storage endpoint")
-	absContainer   = flag.String("abs-container", "", "Azure Blob Storage container")
+	azblobAccountName = flag.String("azblob-account-name", "", "Azure Blob Storage account name")
+	azblobAccountKey  = flag.String("azblob-account-key", "", "Azure Blob Storage account key")
+	azblobEndpoint    = flag.String("azblob-endpoint", "", "Azure Blob Storage endpoint")
+	azblobContainer   = flag.String("azblob-container", "", "Azure Blob Storage container")
 )
 
 func main() {
@@ -50,11 +50,11 @@ func main() {
 	switch *remote {
 		case "azure":
 			cache = &cachers.WithUpstream{
-				Upstream: &abs.CacheUpstream{
-					AccountName: *absAccountName,
-					AccountKey:  *absAccountKey,
-					Endpoint:    *absEndpoint,
-					Container:   *absContainer,
+				Upstream: &azblob.CacheUpstream{
+					AccountName: *azblobAccountName,
+					AccountKey:  *azblobAccountKey,
+					Endpoint:    *azblobEndpoint,
+					Container:   *azblobContainer,
 				},
 				Local: dc,
 			}
