@@ -40,3 +40,13 @@ $ GOCACHEPROG="$HOME/go/bin/go-cacher --verbose" go install std
 Defaulting to cache dir /home/bradfitz/.cache/go-cacher ...
 cacher: closing; 808 gets (808 hits, 0 misses, 0 errors); 0 puts (0 errors)
 ```
+
+## S3 Support
+We support S3 backend for caching.
+You can connect to S3 backend by setting the following parameters:
+- `GOCACHE_S3_BUCKET` - Name of S3 bucket
+- `GOCACHE_AWS_REGION` - AWS Region of bucket
+- `GOCACHE_AWS_ACCESS_KEY` + `GOCACHE_AWS_SECRET_KEY` / `GOCACHE_AWS_PROFILE` - Direct credentials or creds profile to use.
+- `GOCACHE_CACHE_KEY` - (Optional, default `v1`) Unique key
+
+The cache would be stored to `s3://<bucket>/cache/<cache_key>/<architecture>/<os>/<go-version>`
