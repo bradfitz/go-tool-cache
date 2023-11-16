@@ -38,7 +38,7 @@ func NewS3Cache(bucketName string, cfg *aws.Config, cacheKey string, disk *DiskC
 	os := runtime.GOOS
 	// get current version of Go
 	ver := strings.ReplaceAll(strings.ReplaceAll(runtime.Version(), " ", "-"), ":", "-")
-	prefix := fmt.Sprintf("%s/%s/%s/%s", cacheKey, arc, os, ver)
+	prefix := fmt.Sprintf("cache/%s/%s/%s/%s", cacheKey, arc, os, ver)
 	log.Printf("S3Cache: configured to s3://%s/%s", bucketName, prefix)
 	return &S3Cache{
 		Bucket:    bucketName,
