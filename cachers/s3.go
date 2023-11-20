@@ -9,7 +9,8 @@ import (
 	"io"
 	"log"
 	"runtime"
-	"strings"
+	"sync"
+	"time"
 
 	"github.com/aws/smithy-go"
 
@@ -28,7 +29,23 @@ type S3Cache struct {
 	// verbose optionally specifies whether to log verbose messages.
 	verbose bool
 
-	s3Client *s3.Client
+	s3Client              *s3.Client
+	bytesDownloaded       int64
+	bytesUploaded         int64
+	downloadCount         int64
+	uploadCount           int64
+	avgBytesDownloadSpeed float64
+	avgBytesUploadSpeed   float64
+	uploadStatsChan       chan Stats
+	FinishedUploadStats   chan bool
+	done                  chan bool
+	downloadStatsChan     chan Stats
+	close                 sync.Once
+}
+
+type Stats struct {
+	Bytes int64
+	Speed float64
 }
 
 func NewS3Cache(bucketName string, cfg *aws.Config, cacheKey string, disk *DiskCache, verbose bool) *S3Cache {
@@ -36,20 +53,23 @@ func NewS3Cache(bucketName string, cfg *aws.Config, cacheKey string, disk *DiskC
 	arc := runtime.GOARCH
 	// get current operating system
 	os := runtime.GOOS
-	// get current version of Go
-	ver := strings.ReplaceAll(strings.ReplaceAll(runtime.Version(), " ", "-"), ":", "-")
-	prefix := fmt.Sprintf("cache/%s/%s/%s/%s", cacheKey, arc, os, ver)
+	prefix := fmt.Sprintf("cache/%s/%s/%s", cacheKey, arc, os)
 	log.Printf("S3Cache: configured to s3://%s/%s", bucketName, prefix)
-	return &S3Cache{
-		Bucket:    bucketName,
-		cfg:       cfg,
-		diskCache: disk,
-		prefix:    prefix,
-		verbose:   verbose,
+	cache := &S3Cache{
+		Bucket:            bucketName,
+		cfg:               cfg,
+		diskCache:         disk,
+		prefix:            prefix,
+		verbose:           verbose,
+		uploadStatsChan:   make(chan Stats),
+		downloadStatsChan: make(chan Stats, 100),
+		done:              make(chan bool),
 	}
+	cache.StartStatsGathering()
+	return cache
 }
 
-func (c *S3Cache) client(ctx context.Context) (*s3.Client, error) {
+func (c *S3Cache) client() (*s3.Client, error) {
 	if c.s3Client != nil {
 		return c.s3Client, nil
 	}
@@ -73,7 +93,7 @@ func (c *S3Cache) Get(ctx context.Context, actionID string) (outputID, diskPath 
 	if err == nil && outputID != "" {
 		return outputID, diskPath, nil
 	}
-	client, err := c.client(ctx)
+	client, err := c.client()
 	if err != nil {
 		if c.verbose {
 			log.Printf("error getting S3 client: %v", err)
@@ -112,6 +132,7 @@ func (c *S3Cache) Get(ctx context.Context, actionID string) (outputID, diskPath 
 	var putBody io.Reader
 	if av.Size == 0 {
 		putBody = bytes.NewReader(nil)
+		diskPath, err = c.diskCache.Put(ctx, actionID, outputID, av.Size, putBody)
 	} else {
 		outputKey := c.outputKey(outputID)
 		outputResult, getOutputErr := client.GetObject(ctx, &s3.GetObjectInput{
@@ -127,13 +148,32 @@ func (c *S3Cache) Get(ctx context.Context, actionID string) (outputID, diskPath 
 			}
 			return "", "", fmt.Errorf("unexpected S3 get for %s:  %v", outputKey, getOutputErr)
 		}
-		defer outputResult.Body.Close()
-
-		putBody = outputResult.Body
+		downloadFunc := func() error {
+			defer outputResult.Body.Close()
+			putBody = outputResult.Body
+			diskPath, err = c.diskCache.Put(ctx, actionID, outputID, av.Size, putBody)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+		if c.verbose {
+			speed, err := DoAndMeasureSpeed(av.Size, downloadFunc)
+			if err == nil {
+				c.downloadStatsChan <- Stats{
+					Bytes: outputResult.ContentLength,
+					Speed: speed,
+				}
+			} else {
+				log.Printf("error downloading %s: %v", outputKey, err)
+			}
+		} else {
+			err = downloadFunc()
+		}
 	}
-	diskPath, err = c.diskCache.Put(ctx, actionID, outputID, av.Size, putBody)
 	return outputID, diskPath, err
 }
+
 func (c *S3Cache) actionKey(actionID string) string {
 	return fmt.Sprintf("%s/actions/%s", c.prefix, actionID)
 }
@@ -162,7 +202,7 @@ func (c *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 		return "", err
 	}
 
-	client, err := c.client(ctx)
+	client, err := c.client()
 	if err != nil {
 		return "", err
 	}
@@ -180,13 +220,85 @@ func (c *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 		})
 	}
 	if size > 0 && err == nil {
-		outputKey := c.outputKey(outputID)
-		_, err = client.PutObject(ctx, &s3.PutObjectInput{
+		c.uploadOutput(ctx, outputID, client, readerForS3, size)
+	}
+	return
+}
+
+func (c *S3Cache) uploadOutput(ctx context.Context, outputID string, client *s3.Client, readerForS3 bytes.Buffer, size int64) {
+	outputKey := c.outputKey(outputID)
+	putObjectFunc := func() error {
+		_, err := client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket:        &c.Bucket,
 			Key:           &outputKey,
 			Body:          &readerForS3,
 			ContentLength: size,
 		})
+		return err
 	}
-	return
+	if c.verbose {
+		speed, err := DoAndMeasureSpeed(size, putObjectFunc)
+		if err == nil {
+			c.uploadStatsChan <- Stats{
+				Bytes: size,
+				Speed: speed,
+			}
+		}
+	} else {
+		_ = putObjectFunc()
+	}
+}
+
+func (c *S3Cache) BytesDownloaded() int64 {
+	return c.bytesDownloaded
+}
+
+func (c *S3Cache) BytesUploaded() int64 {
+	return c.bytesUploaded
+}
+
+func (c *S3Cache) AvgBytesDownloadSpeed() float64 {
+	return c.avgBytesDownloadSpeed
+}
+
+func (c *S3Cache) AvgBytesUploadSpeed() float64 {
+	return c.avgBytesUploadSpeed
+}
+
+func newAverage(oldAverage float64, count int64, newValue float64) float64 {
+	return (oldAverage*float64(count) + newValue) / float64(count+1)
+}
+
+func DoAndMeasureSpeed(dataSize int64, functionOnData func() error) (float64, error) {
+	start := time.Now()
+	err := functionOnData()
+	elapsed := time.Since(start)
+	speed := float64(dataSize) / elapsed.Seconds()
+	return speed, err
+}
+
+func (c *S3Cache) StartStatsGathering() {
+	go func() {
+		for s := range c.uploadStatsChan {
+			c.bytesUploaded += s.Bytes
+			c.avgBytesUploadSpeed = newAverage(c.avgBytesUploadSpeed, c.uploadCount, s.Speed)
+			c.uploadCount++
+		}
+		c.done <- true
+	}()
+	go func() {
+		for s := range c.downloadStatsChan {
+			c.bytesDownloaded += s.Bytes
+			c.avgBytesDownloadSpeed = newAverage(c.avgBytesDownloadSpeed, c.downloadCount, s.Speed)
+			c.downloadCount++
+		}
+		c.done <- true
+	}()
+}
+
+func (c *S3Cache) Close() {
+	close(c.downloadStatsChan)
+	close(c.uploadStatsChan)
+	<-c.done
+	<-c.done
 }

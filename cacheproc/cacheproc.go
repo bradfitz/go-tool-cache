@@ -51,12 +51,17 @@ type Process struct {
 	// shutting down.
 	Close func() error
 
-	Gets      atomic.Int64
-	GetHits   atomic.Int64
-	GetMisses atomic.Int64
-	GetErrors atomic.Int64
-	Puts      atomic.Int64
-	PutErrors atomic.Int64
+	Gets                  atomic.Int64
+	GetHits               atomic.Int64
+	GetMisses             atomic.Int64
+	GetErrors             atomic.Int64
+	Puts                  atomic.Int64
+	PutErrors             atomic.Int64
+	RemoteCacheEnabled    bool
+	BytesDownloaded       func() int64
+	BytesUploaded         func() int64
+	AvgBytesDownloadSpeed func() float64
+	AvgBytesUploadSpeed   func() float64
 }
 
 func (p *Process) Run() error {
