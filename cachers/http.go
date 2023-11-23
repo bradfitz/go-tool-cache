@@ -16,13 +16,10 @@ type ActionValue struct {
 	Size     int64  `json:"size"`
 }
 
-type HTTPClient struct {
+// HTTPCache is a RemoteCache that talks to a cacher server over HTTP.
+type HTTPCache struct {
 	// BaseURL is the base URL of the cacher server, like "http://localhost:31364".
 	BaseURL string
-
-	// Disk is where to write the output files to local disk, as required by the
-	// cache protocol.
-	Disk *DiskCache
 
 	// HTTPClient optionally specifies the http.Client to use.
 	// If nil, http.DefaultClient is used.
@@ -32,82 +29,59 @@ type HTTPClient struct {
 	Verbose bool
 }
 
-func (c *HTTPClient) httpClient() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return http.DefaultClient
+func (c *HTTPCache) Start() error {
+	log.Printf("[%s]\tconfigured to %s", c.Kind(), c.BaseURL)
+	return nil
 }
 
-func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
-	outputID, diskPath, err = c.Disk.Get(ctx, actionID)
-	if err == nil && outputID != "" {
-		return outputID, diskPath, nil
-	}
+func (c *HTTPCache) Close() error {
+	return nil
+}
 
+func (c *HTTPCache) Kind() string {
+	return "http"
+}
+
+func (c *HTTPCache) Get(ctx context.Context, actionID string) (outputID string, size int64, output io.ReadCloser, err error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/action/"+actionID, nil)
-
 	res, err := c.httpClient().Do(req)
 	if err != nil {
-		return "", "", err
+		return "", 0, nil, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode == http.StatusNotFound {
-		return "", "", nil
+		return "", 0, nil, nil
 	}
 	if res.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("unexpected GET /action/%s status %v", actionID, res.Status)
+		return "", 0, nil, fmt.Errorf("unexpected GET /action/%s status %v", actionID, res.Status)
 	}
 	var av ActionValue
 	if err := json.NewDecoder(res.Body).Decode(&av); err != nil {
-		return "", "", err
+		return "", 0, nil, err
 	}
 	outputID = av.OutputID
-
-	// If not on disk, download it to disk.
-	var putBody io.Reader
 	if av.Size == 0 {
-		putBody = bytes.NewReader(nil)
-	} else {
-		req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
-		res, err = c.httpClient().Do(req)
-		if err != nil {
-			return "", "", err
-		}
-		defer res.Body.Close()
-		if res.StatusCode == http.StatusNotFound {
-			return "", "", nil
-		}
-		if res.StatusCode != http.StatusOK {
-			return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
-		}
-		if res.ContentLength == -1 {
-			return "", "", fmt.Errorf("no Content-Length from server")
-		}
-		putBody = res.Body
+		return outputID, av.Size, io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	diskPath, err = c.Disk.Put(ctx, actionID, outputID, av.Size, putBody)
-	return outputID, diskPath, err
+	req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
+	res, err = c.httpClient().Do(req)
+	if err != nil {
+		return "", 0, nil, err
+	}
+	if res.StatusCode == http.StatusNotFound {
+		return "", 0, nil, nil
+	}
+	if res.StatusCode != http.StatusOK {
+		return "", 0, nil, fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
+	}
+	if res.ContentLength == -1 {
+		return "", 0, nil, fmt.Errorf("no Content-Length from server")
+	}
+	return outputID, av.Size, res.Body, nil
+
 }
 
-func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, _ error) {
-	// Write to disk locally as we write it remotely, as we need to guarantee
-	// it's on disk locally for the caller.
-	pr, pw := io.Pipe()
-	diskPutCh := make(chan any, 1)
-	go func() {
-		var putBody io.Reader = pr
-		if size == 0 {
-			putBody = bytes.NewReader(nil)
-		}
-		diskPath, err := c.Disk.Put(ctx, actionID, outputID, size, putBody)
-		if err != nil {
-			diskPutCh <- err
-		} else {
-			diskPutCh <- diskPath
-		}
-	}()
-
+func (c *HTTPCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (err error) {
 	var putBody io.Reader
 	if size == 0 {
 		// Special case the empty file so NewRequest sets "Content-Length: 0",
@@ -115,25 +89,28 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		// from the type.
 		putBody = bytes.NewReader(nil)
 	} else {
-		putBody = io.TeeReader(body, pw)
+		putBody = body
 	}
 	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, putBody)
 	req.ContentLength = size
 	res, err := c.httpClient().Do(req)
-	pw.Close()
 	if err != nil {
 		log.Printf("error PUT /%s/%s: %v", actionID, outputID, err)
-		return "", err
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusNoContent {
 		all, _ := io.ReadAll(io.LimitReader(res.Body, 4<<10))
-		return "", fmt.Errorf("unexpected PUT /%s/%s status %v: %s", actionID, outputID, res.Status, all)
+		return fmt.Errorf("unexpected PUT /%s/%s status %v: %s", actionID, outputID, res.Status, all)
 	}
-	v := <-diskPutCh
-	if err, ok := v.(error); ok {
-		log.Printf("HTTPClient.Put local disk error: %v", err)
-		return "", err
+	return nil
+}
+
+var _ RemoteCache = &HTTPCache{}
+
+func (c *HTTPCache) httpClient() *http.Client {
+	if c.HTTPClient != nil {
+		return c.HTTPClient
 	}
-	return v.(string), nil
+	return http.DefaultClient
 }

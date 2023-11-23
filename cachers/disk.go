@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// indexEntry is the metadata that DiskCache stores on disk for an ActionID.
+// indexEntry is the metadata that SimpleDiskCache stores on disk for an ActionID.
 type indexEntry struct {
 	Version   int    `json:"v"`
 	OutputID  string `json:"o"`
@@ -21,20 +21,43 @@ type indexEntry struct {
 	TimeNanos int64  `json:"t"`
 }
 
-type DiskCache struct {
-	Dir     string
-	Verbose bool
+// SimpleDiskCache is a LocalCache that stores data on disk.
+type SimpleDiskCache struct {
+	dir     string
+	verbose bool
 }
 
-func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
-	actionFile := filepath.Join(dc.Dir, fmt.Sprintf("a-%s", actionID))
+func (dc *SimpleDiskCache) Kind() string {
+	return "disk"
+}
+
+func NewSimpleDiskCache(verbose bool, dir string) *SimpleDiskCache {
+	return &SimpleDiskCache{
+		dir:     dir,
+		verbose: verbose,
+	}
+}
+
+var _ LocalCache = &SimpleDiskCache{}
+
+func (dc *SimpleDiskCache) Start() error {
+	log.Printf("[%s]\tlocal cache in  %s", dc.Kind(), dc.dir)
+	return nil
+}
+
+func (dc *SimpleDiskCache) Close() error {
+	return nil
+}
+
+func (dc *SimpleDiskCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
+	actionFile := filepath.Join(dc.dir, fmt.Sprintf("a-%s", actionID))
 	ij, err := os.ReadFile(actionFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			err = nil
-			if dc.Verbose {
-				log.Printf("disk miss: %v", actionID)
-			}
+			// if dc.verbose {
+			// 	log.Printf("disk miss: %v", actionID)
+			// }
 		}
 		return "", "", err
 	}
@@ -47,25 +70,11 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 		// Protect against malicious non-hex OutputID on disk
 		return "", "", nil
 	}
-	return ie.OutputID, filepath.Join(dc.Dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
+	return ie.OutputID, filepath.Join(dc.dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
 }
 
-func (dc *DiskCache) OutputFilename(objectID string) string {
-	if len(objectID) < 4 || len(objectID) > 1000 {
-		return ""
-	}
-	for i := range objectID {
-		b := objectID[i]
-		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
-			continue
-		}
-		return ""
-	}
-	return filepath.Join(dc.Dir, fmt.Sprintf("o-%s", objectID))
-}
-
-func (dc *DiskCache) Put(ctx context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
-	file := filepath.Join(dc.Dir, fmt.Sprintf("o-%s", objectID))
+func (dc *SimpleDiskCache) Put(ctx context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
+	file := filepath.Join(dc.dir, fmt.Sprintf("o-%s", objectID))
 
 	// Special case empty files; they're both common and easier to do race-free.
 	if size == 0 {
@@ -93,7 +102,7 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, objectID string, size in
 	if err != nil {
 		return "", err
 	}
-	actionFile := filepath.Join(dc.Dir, fmt.Sprintf("a-%s", actionID))
+	actionFile := filepath.Join(dc.dir, fmt.Sprintf("a-%s", actionID))
 	if _, err := writeAtomic(actionFile, bytes.NewReader(ij)); err != nil {
 		return "", err
 	}

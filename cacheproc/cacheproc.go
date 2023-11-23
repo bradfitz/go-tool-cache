@@ -18,7 +18,8 @@ import (
 	"log"
 	"os"
 	"sync"
-	"sync/atomic"
+
+	"github.com/bradfitz/go-tool-cache/cachers"
 
 	"github.com/bradfitz/go-tool-cache/wire"
 )
@@ -26,42 +27,13 @@ import (
 // Process implements the cmd/go JSON protocol over stdin & stdout via three
 // funcs that callers can optionally implement.
 type Process struct {
-	// Get optionally specifies a func to look up something from the cache. If
-	// nil, all gets are treated as cache misses.touch
-	//
-	// The actionID is a lowercase hex string of unspecified format or length.
-	//
-	// The returned outputID must be the same outputID provided to Put earlier;
-	// it will be a lowercase hex string of unspecified hash function or length.
-	//
-	// On cache miss, return all zero values (no error). On cache hit, diskPath
-	// must be the absolute path to a regular file; its size and modtime are
-	// returned to cmd/go.
-	//
-	// If the returned diskPath doesn't exist, it's treated as a cache miss.
-	Get func(ctx context.Context, actionID string) (outputID, diskPath string, _ error)
+	cache cachers.LocalCache
+}
 
-	// Put optionally specifies a func to add something to the cache.
-	// The actionID and objectID is a lowercase hex string of unspecified format or length.
-	// On success, diskPath must be the absolute path to a regular file.
-	// If nil, cmd/go may write to disk elsewhere as needed.
-	Put func(ctx context.Context, actionID, objectID string, size int64, r io.Reader) (diskPath string, _ error)
-
-	// Close optionally specifies a func to run when the cmd/go tool is
-	// shutting down.
-	Close func() error
-
-	Gets                  atomic.Int64
-	GetHits               atomic.Int64
-	GetMisses             atomic.Int64
-	GetErrors             atomic.Int64
-	Puts                  atomic.Int64
-	PutErrors             atomic.Int64
-	RemoteCacheEnabled    bool
-	BytesDownloaded       func() int64
-	BytesUploaded         func() int64
-	AvgBytesDownloadSpeed func() float64
-	AvgBytesUploadSpeed   func() float64
+func NewCacheProc(cache cachers.LocalCache) *Process {
+	return &Process{
+		cache: cache,
+	}
 }
 
 func (p *Process) Run() error {
@@ -70,17 +42,10 @@ func (p *Process) Run() error {
 
 	bw := bufio.NewWriter(os.Stdout)
 	je := json.NewEncoder(bw)
-
-	var caps []wire.Cmd
-	if p.Get != nil {
-		caps = append(caps, "get")
+	if err := p.cache.Start(); err != nil {
+		return err
 	}
-	if p.Put != nil {
-		caps = append(caps, "put")
-	}
-	if p.Close != nil {
-		caps = append(caps, "close")
-	}
+	caps := []wire.Cmd{"get", "put", "close"}
 	je.Encode(&wire.Response{KnownCommands: caps})
 	if err := bw.Flush(); err != nil {
 		return err
@@ -130,10 +95,7 @@ func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wir
 	default:
 		return errors.New("unknown command")
 	case "close":
-		if p.Close != nil {
-			return p.Close()
-		}
-		return nil
+		return p.cache.Close()
 	case "get":
 		return p.handleGet(ctx, req, res)
 	case "put":
@@ -142,21 +104,7 @@ func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wir
 }
 
 func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
-	p.Gets.Add(1)
-	defer func() {
-		if retErr != nil {
-			p.GetErrors.Add(1)
-		} else if res.Miss {
-			p.GetMisses.Add(1)
-		} else {
-			p.GetHits.Add(1)
-		}
-	}()
-	if p.Get == nil {
-		res.Miss = true
-		return nil
-	}
-	outputID, diskPath, err := p.Get(ctx, fmt.Sprintf("%x", req.ActionID))
+	outputID, diskPath, err := p.cache.Get(ctx, fmt.Sprintf("%x", req.ActionID))
 	if err != nil {
 		return err
 	}
@@ -190,24 +138,16 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 
 func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
 	actionID, objectID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.ObjectID)
-	p.Puts.Add(1)
 	defer func() {
 		if retErr != nil {
-			p.PutErrors.Add(1)
 			log.Printf("put(action %s, obj %s, %v bytes): %v", actionID, objectID, req.BodySize, retErr)
 		}
 	}()
-	if p.Put == nil {
-		if req.Body != nil {
-			io.Copy(io.Discard, req.Body)
-		}
-		return nil
-	}
-	var body io.Reader = req.Body
+	var body = req.Body
 	if body == nil {
 		body = bytes.NewReader(nil)
 	}
-	diskPath, err := p.Put(ctx, actionID, objectID, req.BodySize, body)
+	diskPath, err := p.cache.Put(ctx, actionID, objectID, req.BodySize, body)
 	if err != nil {
 		return err
 	}

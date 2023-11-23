@@ -8,10 +8,11 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -62,7 +63,7 @@ func getAwsConfigFromEnv() (*aws.Config, error) {
 	return nil, nil
 }
 
-func maybeS3Cache(dc *cachers.DiskCache) (*cachers.S3Cache, error) {
+func maybeS3Cache() (cachers.RemoteCache, error) {
 	awsConfig, err := getAwsConfigFromEnv()
 	if err != nil {
 		return nil, err
@@ -76,9 +77,19 @@ func maybeS3Cache(dc *cachers.DiskCache) (*cachers.S3Cache, error) {
 	if cacheKey == "" {
 		cacheKey = defaultCacheKey
 	}
-
-	s3Cache := cachers.NewS3Cache(bucket, awsConfig, cacheKey, dc, *verbose)
+	s3Client := s3.NewFromConfig(*awsConfig)
+	s3Cache := cachers.NewS3Cache(s3Client, bucket, cacheKey, *verbose)
 	return s3Cache, nil
+}
+
+func getFinalCacher(local cachers.LocalCache, remote cachers.RemoteCache, verbose bool) cachers.LocalCache {
+	if remote != nil {
+		return cachers.NewCombinedCache(local, remote, verbose)
+	}
+	if verbose {
+		return cachers.NewLocalCacheStates(local)
+	}
+	return local
 }
 
 func main() {
@@ -92,102 +103,16 @@ func main() {
 		d = filepath.Join(d, "go-cacher")
 		dir = d
 	}
-	log.Printf("cache dir %v ...", dir)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Fatal(err)
 	}
-
-	dc := &cachers.DiskCache{Dir: dir}
-	zeroIntFunc := func() int64 {
-		return 0
-	}
-	zeroFloatFunc := func() float64 {
-		return 0
-	}
-	var p *cacheproc.Process
-	p = &cacheproc.Process{
-		Close: func() error {
-			if *verbose {
-				log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%d errors)",
-					p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), p.PutErrors.Load())
-				if p.RemoteCacheEnabled {
-					log.Printf("%s downloaded (%s/s); %s uploaded (%s/s)",
-						formatBytes(float64(p.BytesDownloaded())),
-						formatBytes(p.AvgBytesDownloadSpeed()),
-						formatBytes(float64(p.BytesUploaded())),
-						formatBytes(p.AvgBytesUploadSpeed()),
-					)
-				}
-			}
-			return nil
-		},
-		Get:                   dc.Get,
-		Put:                   dc.Put,
-		BytesDownloaded:       zeroIntFunc,
-		BytesUploaded:         zeroIntFunc,
-		AvgBytesDownloadSpeed: zeroFloatFunc,
-		AvgBytesUploadSpeed:   zeroFloatFunc,
-	}
-
-	if *serverBase != "" {
-		hc := &cachers.HTTPClient{
-			BaseURL: *serverBase,
-			Disk:    dc,
-			Verbose: *verbose,
-		}
-		p.Get = hc.Get
-		p.Put = hc.Put
-	}
-
-	s3Cache, err := maybeS3Cache(dc)
+	var localCache cachers.LocalCache = cachers.NewSimpleDiskCache(*verbose, dir)
+	s3Cache, err := maybeS3Cache()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if s3Cache != nil {
-		p.Get = s3Cache.Get
-		p.Put = s3Cache.Put
-		p.BytesDownloaded = s3Cache.BytesDownloaded
-		p.BytesUploaded = s3Cache.BytesUploaded
-		p.AvgBytesDownloadSpeed = s3Cache.AvgBytesDownloadSpeed
-		p.AvgBytesUploadSpeed = s3Cache.AvgBytesUploadSpeed
-		p.RemoteCacheEnabled = true
-		originalClose := p.Close
-		p.Close = func() error {
-			s3Cache.Close()
-			return originalClose()
-		}
-	}
-
-	if err := p.Run(); err != nil {
+	proc := cacheproc.NewCacheProc(getFinalCacher(localCache, s3Cache, *verbose))
+	if err := proc.Run(); err != nil {
 		log.Fatal(err)
-	}
-}
-
-func formatBytes(size float64) string {
-	const (
-		b = 1 << (10 * iota)
-		kb
-		mb
-		gb
-		tb
-		pb
-		eb
-	)
-
-	switch {
-	case size < kb:
-		return fmt.Sprintf("%.2f B", size)
-	case size < mb:
-		return fmt.Sprintf("%.2f KB", size/float64(kb))
-	case size < gb:
-		return fmt.Sprintf("%.2f MB", size/float64(mb))
-	case size < tb:
-		return fmt.Sprintf("%.2f GB", size/float64(gb))
-	case size < pb:
-		return fmt.Sprintf("%.2f TB", size/float64(tb))
-	case size < eb:
-		return fmt.Sprintf("%.2f PB", size/float64(pb))
-	default:
-		return fmt.Sprintf("%.2f EB", size/float64(eb))
 	}
 }

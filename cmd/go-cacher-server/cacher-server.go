@@ -23,6 +23,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -56,7 +57,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	dc := &cachers.DiskCache{Dir: *dir}
+	dc := cachers.NewSimpleDiskCache(*verbose, *dir)
 
 	srv := &server{
 		cache:   dc,
@@ -68,7 +69,7 @@ func main() {
 }
 
 type server struct {
-	cache   *cachers.DiskCache // TODO: add interface for things other than disk cache? when needed.
+	cache   *cachers.SimpleDiskCache // TODO: add interface for things other than disk cache? when needed.
 	verbose bool
 	latency time.Duration
 }
@@ -160,7 +161,7 @@ func (s *server) handleGetOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeFile(w, r, s.cache.OutputFilename(outputID))
+	http.ServeFile(w, r, OutputFilename(*dir, outputID))
 }
 
 func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
@@ -184,4 +185,18 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func OutputFilename(dir, objectID string) string {
+	if len(objectID) < 4 || len(objectID) > 1000 {
+		return ""
+	}
+	for i := range objectID {
+		b := objectID[i]
+		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
+			continue
+		}
+		return ""
+	}
+	return filepath.Join(dir, fmt.Sprintf("o-%s", objectID))
 }
