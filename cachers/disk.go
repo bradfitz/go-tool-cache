@@ -45,10 +45,6 @@ func (dc *SimpleDiskCache) Start() error {
 	return nil
 }
 
-func (dc *SimpleDiskCache) Close() error {
-	return nil
-}
-
 func (dc *SimpleDiskCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
 	actionFile := filepath.Join(dc.dir, fmt.Sprintf("a-%s", actionID))
 	ij, err := os.ReadFile(actionFile)
@@ -107,6 +103,10 @@ func (dc *SimpleDiskCache) Put(ctx context.Context, actionID, objectID string, s
 		return "", err
 	}
 	return file, nil
+}
+
+func (dc *SimpleDiskCache) Close() error {
+	return nil
 }
 
 func writeAtomic(dest string, r io.Reader) (int64, error) {

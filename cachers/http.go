@@ -18,19 +18,26 @@ type ActionValue struct {
 
 // HTTPCache is a RemoteCache that talks to a cacher server over HTTP.
 type HTTPCache struct {
-	// BaseURL is the base URL of the cacher server, like "http://localhost:31364".
-	BaseURL string
+	// baseURL is the base URL of the cacher server, like "http://localhost:31364".
+	baseURL string
 
-	// HTTPClient optionally specifies the http.Client to use.
+	// client optionally specifies the http.Client to use.
 	// If nil, http.DefaultClient is used.
-	HTTPClient *http.Client
+	client *http.Client
 
-	// Verbose optionally specifies whether to log verbose messages.
-	Verbose bool
+	// verbose optionally specifies whether to log verbose messages.
+	verbose bool
+}
+
+func NewHttpCache(baseURL string, verbose bool) *HTTPCache {
+	return &HTTPCache{
+		baseURL: baseURL,
+		verbose: verbose,
+	}
 }
 
 func (c *HTTPCache) Start() error {
-	log.Printf("[%s]\tconfigured to %s", c.Kind(), c.BaseURL)
+	log.Printf("[%s]\tconfigured to %s", c.Kind(), c.baseURL)
 	return nil
 }
 
@@ -43,7 +50,7 @@ func (c *HTTPCache) Kind() string {
 }
 
 func (c *HTTPCache) Get(ctx context.Context, actionID string) (outputID string, size int64, output io.ReadCloser, err error) {
-	req, _ := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/action/"+actionID, nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/action/"+actionID, nil)
 	res, err := c.httpClient().Do(req)
 	if err != nil {
 		return "", 0, nil, err
@@ -63,7 +70,7 @@ func (c *HTTPCache) Get(ctx context.Context, actionID string) (outputID string, 
 	if av.Size == 0 {
 		return outputID, av.Size, io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
+	req, _ = http.NewRequestWithContext(ctx, "GET", c.baseURL+"/output/"+outputID, nil)
 	res, err = c.httpClient().Do(req)
 	if err != nil {
 		return "", 0, nil, err
@@ -91,7 +98,7 @@ func (c *HTTPCache) Put(ctx context.Context, actionID, outputID string, size int
 	} else {
 		putBody = body
 	}
-	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, putBody)
+	req, _ := http.NewRequestWithContext(ctx, "PUT", c.baseURL+"/"+actionID+"/"+outputID, putBody)
 	req.ContentLength = size
 	res, err := c.httpClient().Do(req)
 	if err != nil {
@@ -109,8 +116,8 @@ func (c *HTTPCache) Put(ctx context.Context, actionID, outputID string, size int
 var _ RemoteCache = &HTTPCache{}
 
 func (c *HTTPCache) httpClient() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
+	if c.client != nil {
+		return c.client
 	}
 	return http.DefaultClient
 }

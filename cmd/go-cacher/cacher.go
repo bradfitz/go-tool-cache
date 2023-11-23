@@ -25,20 +25,36 @@ import (
 
 const defaultCacheKey = "v1"
 
+// All the following env variable names are optional
+const (
+	// path to local disk directory. defaults to os.UserCacheDir()/go-cacher
+	envVarDiskCacheDir = "GOCACHE_DISK_DIR"
+
+	// S3 cache
+	envVarS3CacheRegion        = "GOCACHE_AWS_REGION"
+	envVarS3AwsAccessKey       = "GOCACHE_AWS_ACCESS_KEY"
+	envVarS3AwsSecretAccessKey = "GOCACHE_AWS_SECRET_ACCESS_KEY"
+	envVarS3AwsCredsProfile    = "GOCACHE_AWS_CREDS_PROFILE"
+	envVarS3BucketName         = "GOCACHE_S3_BUCKET"
+	envVarS3CacheKey           = "GOCACHE_CACHE_KEY"
+
+	// HTTP cache - optional cache server HTTP prefix (scheme and authority only);
+	envVarHttpCacheServerBase = "GOCACHE_HTTP_SERVER_BASE"
+)
+
 var (
-	serverBase = flag.String("cache-server", "", "optional cache server HTTP prefix (scheme and authority only); should be low latency. empty means to not use one.")
-	verbose    = flag.Bool("verbose", false, "be verbose")
+	verbose = flag.Bool("verbose", false, "be verbose")
 )
 
 func getAwsConfigFromEnv() (*aws.Config, error) {
 	// read from env
-	awsRegion, awsRegionOk := os.LookupEnv("GOCACHE_AWS_REGION")
-	if !awsRegionOk {
+	awsRegion := os.Getenv(envVarS3CacheRegion)
+	if awsRegion != "" {
 		return nil, nil
 	}
-	accessKey, accessKeyOk := os.LookupEnv("GOCACHE_AWS_ACCESS_KEY")
-	secretAccessKey, secretKeyOk := os.LookupEnv("GOCACHE_AWS_SECRET_ACCESS_KEY")
-	if accessKeyOk && secretKeyOk {
+	accessKey := os.Getenv(envVarS3AwsAccessKey)
+	secretAccessKey := os.Getenv(envVarS3AwsSecretAccessKey)
+	if accessKey != "" && secretAccessKey != "" {
 		cfg, err := config.LoadDefaultConfig(context.TODO(),
 			config.WithRegion(awsRegion),
 			config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
@@ -52,8 +68,8 @@ func getAwsConfigFromEnv() (*aws.Config, error) {
 		}
 		return &cfg, nil
 	}
-	credsProfile, credsProfileOk := os.LookupEnv("GOCACHE_CREDS_PROFILE")
-	if credsProfileOk {
+	credsProfile := os.Getenv(envVarS3AwsCredsProfile)
+	if credsProfile != "" {
 		cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsRegion), config.WithSharedConfigProfile(credsProfile))
 		if err != nil {
 			return nil, err
@@ -68,12 +84,12 @@ func maybeS3Cache() (cachers.RemoteCache, error) {
 	if err != nil {
 		return nil, err
 	}
-	bucket, ok := os.LookupEnv("GOCACHE_S3_BUCKET")
-	if !ok || awsConfig == nil {
+	bucket := os.Getenv(envVarS3BucketName)
+	if bucket == "" || awsConfig == nil {
 		// We need at least name of bucket and valid aws config
 		return nil, nil
 	}
-	cacheKey := os.Getenv("GOCACHE_CACHE_KEY")
+	cacheKey := os.Getenv(envVarS3CacheKey)
 	if cacheKey == "" {
 		cacheKey = defaultCacheKey
 	}
@@ -82,7 +98,17 @@ func maybeS3Cache() (cachers.RemoteCache, error) {
 	return s3Cache, nil
 }
 
-func getFinalCacher(local cachers.LocalCache, remote cachers.RemoteCache, verbose bool) cachers.LocalCache {
+func getCache(local cachers.LocalCache, verbose bool) cachers.LocalCache {
+	remote, err := maybeS3Cache()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if remote == nil {
+		remote, err = maybeHttpCache()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	if remote != nil {
 		return cachers.NewCombinedCache(local, remote, verbose)
 	}
@@ -92,9 +118,17 @@ func getFinalCacher(local cachers.LocalCache, remote cachers.RemoteCache, verbos
 	return local
 }
 
+func maybeHttpCache() (cachers.RemoteCache, error) {
+	serverBase := os.Getenv(envVarHttpCacheServerBase)
+	if serverBase == "" {
+		return nil, nil
+	}
+	return cachers.NewHttpCache(serverBase, *verbose), nil
+}
+
 func main() {
 	flag.Parse()
-	dir := os.Getenv("GOCACHE_DISK_DIR")
+	dir := os.Getenv(envVarDiskCacheDir)
 	if dir == "" {
 		d, err := os.UserCacheDir()
 		if err != nil {
@@ -107,11 +141,7 @@ func main() {
 		log.Fatal(err)
 	}
 	var localCache cachers.LocalCache = cachers.NewSimpleDiskCache(*verbose, dir)
-	s3Cache, err := maybeS3Cache()
-	if err != nil {
-		log.Fatal(err)
-	}
-	proc := cacheproc.NewCacheProc(getFinalCacher(localCache, s3Cache, *verbose))
+	proc := cacheproc.NewCacheProc(getCache(localCache, *verbose))
 	if err := proc.Run(); err != nil {
 		log.Fatal(err)
 	}

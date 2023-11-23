@@ -19,9 +19,7 @@ type CombinedCache struct {
 	getsMetrics *timeKeeper
 }
 
-func (l *CombinedCache) Kind() string {
-	return "combined"
-}
+var _ LocalCache = &CombinedCache{}
 
 func NewCombinedCache(localCache LocalCache, remoteCache RemoteCache, verbose bool) LocalCache {
 	cache := &CombinedCache{
@@ -39,6 +37,10 @@ func NewCombinedCache(localCache LocalCache, remoteCache RemoteCache, verbose bo
 	return cache
 }
 
+func (l *CombinedCache) Kind() string {
+	return "combined"
+}
+
 func (l *CombinedCache) Start() error {
 	err := l.localCache.Start()
 	if err != nil {
@@ -51,23 +53,6 @@ func (l *CombinedCache) Start() error {
 	l.putsMetrics.Start()
 	l.getsMetrics.Start()
 	return nil
-}
-
-func (l *CombinedCache) Close() error {
-	err := l.localCache.Close()
-	if err != nil {
-		err = fmt.Errorf("local cache stop failed: %w", err)
-	}
-	err = l.remoteCache.Close()
-	if err != nil {
-		err = errors.Join(fmt.Errorf("remote cache stop failed: %w", err))
-	}
-	l.putsMetrics.Stop()
-	l.getsMetrics.Stop()
-	if l.verbose {
-		log.Printf("[%s]\tDownloads: %s, Uploads %s", l.remoteCache.Kind(), l.getsMetrics.Summary(), l.putsMetrics.Summary())
-	}
-	return err
 }
 
 func (l *CombinedCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
@@ -94,7 +79,8 @@ func (l *CombinedCache) Get(ctx context.Context, actionID string) (outputID, dis
 
 func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (string, error) {
 	pr, pw := io.Pipe()
-	diskPutCh := make(chan any, 1)
+	diskPathCh := make(chan string, 1)
+	errCh := make(chan error, 1)
 	go func() {
 		var putBody io.Reader = pr
 		if size == 0 {
@@ -102,9 +88,9 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 		}
 		diskPath, err := l.localCache.Put(ctx, actionID, outputID, size, putBody)
 		if err != nil {
-			diskPutCh <- err
+			errCh <- err
 		} else {
-			diskPutCh <- diskPath
+			diskPathCh <- diskPath
 		}
 	}()
 
@@ -124,38 +110,28 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 		return "", e
 	})
 	pw.Close()
-	v := <-diskPutCh
-	if err, ok := v.(error); ok {
-		log.Printf("HTTPCache.Put local disk error: %v", err)
+	select {
+	case err := <-errCh:
+		log.Printf("[%s]\terror: %v", l.localCache.Kind(), err)
 		return "", err
+	case diskPath := <-diskPathCh:
+		return diskPath, nil
 	}
-	return v.(string), nil
 }
 
-// TODO: DELETEME
-// func (l *CombinedCache) putOld(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, err error) {
-// 	var localError, remoteError error
-// 	var bytesReaderForDisk io.Reader
-// 	var bytesBufferRemote bytes.Buffer
-// 	if size == 0 {
-// 		bytesReaderForDisk = bytes.NewReader(nil)
-// 		bytesBufferRemote = bytes.Buffer{}
-// 	} else {
-// 		bytesReaderForDisk = io.TeeReader(body, &bytesBufferRemote)
-// 	}
-// 	// TODO or-shachar: Can we stream the data in parallel to both caches?
-// 	diskPath, localError = l.localCache.Put(ctx, actionID, outputID, size, bytesReaderForDisk)
-// 	if localError != nil {
-// 		return "", localError
-// 	}
-// 	_, remoteError = l.putsMetrics.DoWithMeasure(size, func() (string, error) {
-// 		e := l.remoteCache.Put(ctx, actionID, outputID, size, &bytesBufferRemote)
-// 		return "", e
-// 	})
-// 	if remoteError != nil {
-// 		return "", remoteError
-// 	}
-// 	return diskPath, nil
-// }
-
-var _ LocalCache = &CombinedCache{}
+func (l *CombinedCache) Close() error {
+	err := l.localCache.Close()
+	if err != nil {
+		err = fmt.Errorf("local cache stop failed: %w", err)
+	}
+	err = l.remoteCache.Close()
+	if err != nil {
+		err = errors.Join(fmt.Errorf("remote cache stop failed: %w", err))
+	}
+	l.putsMetrics.Stop()
+	l.getsMetrics.Stop()
+	if l.verbose {
+		log.Printf("[%s]\tDownloads: %s, Uploads %s", l.remoteCache.Kind(), l.getsMetrics.Summary(), l.putsMetrics.Summary())
+	}
+	return err
+}

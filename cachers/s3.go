@@ -33,16 +33,14 @@ type S3Cache struct {
 	s3Client s3Client
 }
 
+var _ RemoteCache = &S3Cache{}
+
 func (s *S3Cache) Kind() string {
 	return "s3"
 }
 
 func (s *S3Cache) Start() error {
 	log.Printf("[%s]\tconfigured to s3://%s/%s", s.Kind(), s.bucket, s.prefix)
-	return nil
-}
-
-func (s *S3Cache) Close() error {
 	return nil
 }
 
@@ -91,7 +89,9 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 	return
 }
 
-var _ RemoteCache = &S3Cache{}
+func (s *S3Cache) Close() error {
+	return nil
+}
 
 func NewS3Cache(client s3Client, bucketName string, cacheKey string, verbose bool) *S3Cache {
 	// get current architecture
