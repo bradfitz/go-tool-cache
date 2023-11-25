@@ -46,14 +46,24 @@ var (
 	verbose = flag.Bool("verbose", false, "be verbose")
 )
 
-func getAwsConfigFromEnv(ctx context.Context) (*aws.Config, error) {
+type Env interface {
+	Get(key string) string
+}
+
+type osEnv struct{}
+
+func (osEnv) Get(key string) string {
+	return os.Getenv(key)
+}
+
+func getAwsConfigFromEnv(ctx context.Context, env Env) (*aws.Config, error) {
 	// read from env
-	awsRegion := os.Getenv(envVarS3CacheRegion)
+	awsRegion := env.Get(envVarS3CacheRegion)
 	if awsRegion == "" {
 		return nil, nil
 	}
-	accessKey := os.Getenv(envVarS3AwsAccessKey)
-	secretAccessKey := os.Getenv(envVarS3AwsSecretAccessKey)
+	accessKey := env.Get(envVarS3AwsAccessKey)
+	secretAccessKey := env.Get(envVarS3AwsSecretAccessKey)
 	if accessKey != "" && secretAccessKey != "" {
 		cfg, err := config.LoadDefaultConfig(ctx,
 			config.WithRegion(awsRegion),
@@ -68,9 +78,9 @@ func getAwsConfigFromEnv(ctx context.Context) (*aws.Config, error) {
 		}
 		return &cfg, nil
 	}
-	credsProfile := os.Getenv(envVarS3AwsCredsProfile)
+	credsProfile := env.Get(envVarS3AwsCredsProfile)
 	if credsProfile != "" {
-		cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsRegion), config.WithSharedConfigProfile(credsProfile))
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsRegion), config.WithSharedConfigProfile(credsProfile))
 		if err != nil {
 			return nil, err
 		}
@@ -79,17 +89,17 @@ func getAwsConfigFromEnv(ctx context.Context) (*aws.Config, error) {
 	return nil, nil
 }
 
-func maybeS3Cache(ctx context.Context) (cachers.RemoteCache, error) {
-	awsConfig, err := getAwsConfigFromEnv(ctx)
+func maybeS3Cache(ctx context.Context, env Env) (cachers.RemoteCache, error) {
+	awsConfig, err := getAwsConfigFromEnv(ctx, env)
 	if err != nil {
 		return nil, err
 	}
-	bucket := os.Getenv(envVarS3BucketName)
+	bucket := env.Get(envVarS3BucketName)
 	if bucket == "" || awsConfig == nil {
 		// We need at least name of bucket and valid aws config
 		return nil, nil
 	}
-	cacheKey := os.Getenv(envVarS3CacheKey)
+	cacheKey := env.Get(envVarS3CacheKey)
 	if cacheKey == "" {
 		cacheKey = defaultCacheKey
 	}
@@ -98,17 +108,21 @@ func maybeS3Cache(ctx context.Context) (cachers.RemoteCache, error) {
 	return s3Cache, nil
 }
 
-func getCache(ctx context.Context, local cachers.LocalCache, verbose bool) cachers.LocalCache {
-	remote, err := maybeS3Cache(ctx)
+func getCache(ctx context.Context, env Env, verbose bool) cachers.LocalCache {
+	dir := getDir(env)
+	var local cachers.LocalCache = cachers.NewSimpleDiskCache(verbose, dir)
+
+	remote, err := maybeS3Cache(ctx, env)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if remote == nil {
-		remote, err = maybeHttpCache()
+		remote, err = maybeHttpCache(env)
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
+
 	if remote != nil {
 		return cachers.NewCombinedCache(local, remote, verbose)
 	}
@@ -118,17 +132,16 @@ func getCache(ctx context.Context, local cachers.LocalCache, verbose bool) cache
 	return local
 }
 
-func maybeHttpCache() (cachers.RemoteCache, error) {
-	serverBase := os.Getenv(envVarHttpCacheServerBase)
+func maybeHttpCache(env Env) (cachers.RemoteCache, error) {
+	serverBase := env.Get(envVarHttpCacheServerBase)
 	if serverBase == "" {
 		return nil, nil
 	}
 	return cachers.NewHttpCache(serverBase, *verbose), nil
 }
 
-func main() {
-	flag.Parse()
-	dir := os.Getenv(envVarDiskCacheDir)
+func getDir(env Env) string {
+	dir := env.Get(envVarDiskCacheDir)
 	if dir == "" {
 		d, err := os.UserCacheDir()
 		if err != nil {
@@ -137,14 +150,18 @@ func main() {
 		d = filepath.Join(d, "go-cacher")
 		dir = d
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Fatal(err)
-	}
+	return dir
+}
 
-	var localCache cachers.LocalCache = cachers.NewSimpleDiskCache(*verbose, dir)
+func main() {
+	flag.Parse()
+	env := &osEnv{}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	proc := cacheproc.NewCacheProc(getCache(ctx, localCache, *verbose))
+
+	cache := getCache(ctx, env, *verbose)
+	proc := cacheproc.NewCacheProc(cache)
 	if err := proc.Run(ctx); err != nil {
 		log.Fatal(err)
 	}

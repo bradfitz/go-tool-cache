@@ -95,7 +95,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/output/"):
 		s.handleGetOutput(w, r)
 	case r.URL.Path == "/":
-		io.WriteString(w, "hi")
+		_, _ = io.WriteString(w, "hi")
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -150,7 +150,7 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(&cachers.ActionValue{
+	_ = json.NewEncoder(w).Encode(&cachers.ActionValue{
 		OutputID: outputID,
 		Size:     fi.Size(),
 	})

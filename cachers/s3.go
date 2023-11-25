@@ -40,7 +40,7 @@ func (s *S3Cache) Kind() string {
 	return "s3"
 }
 
-func (s *S3Cache) Start(ctx context.Context) error {
+func (s *S3Cache) Start(context.Context) error {
 	log.Printf("[%s]\tconfigured to s3://%s/%s", s.Kind(), s.bucket, s.prefix)
 	return nil
 }

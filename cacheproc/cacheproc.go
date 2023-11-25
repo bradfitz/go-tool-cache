@@ -25,9 +25,12 @@ import (
 	"github.com/bradfitz/go-tool-cache/wire"
 )
 
+type cacherCtxKey string
+
 var (
 	ErrUnknownCommand = errors.New("unknown command")
 	ErrNoOutputID     = errors.New("no outputID")
+	requestIDKey      = cacherCtxKey("requestID")
 )
 
 // Process implements the cmd/go JSON protocol over stdin & stdout via three
@@ -89,7 +92,7 @@ func (p *Process) Run(ctx context.Context) error {
 		}
 		wg.Go(func() error {
 			res := &wire.Response{ID: req.ID}
-			ctx := context.WithValue(ctx, "requestID", &req)
+			ctx := context.WithValue(ctx, requestIDKey, &req)
 			if err := p.handleRequest(ctx, &req, res); err != nil {
 				res.Err = err.Error()
 			}
@@ -99,8 +102,12 @@ func (p *Process) Run(ctx context.Context) error {
 			_ = bw.Flush()
 			return nil
 		})
+		select {
+		case <-ctx.Done():
+			return wg.Wait()
+		default:
+		}
 	}
-	return wg.Wait()
 }
 
 func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wire.Response) error {

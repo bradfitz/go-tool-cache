@@ -29,7 +29,7 @@ type LocalCacheWithCounts struct {
 }
 
 func (l *LocalCacheWithCounts) Kind() string {
-	return l.Kind()
+	return l.cache.Kind()
 }
 
 type RemoteCacheWithCounts struct {

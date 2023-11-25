@@ -40,12 +40,12 @@ func NewSimpleDiskCache(verbose bool, dir string) *SimpleDiskCache {
 
 var _ LocalCache = &SimpleDiskCache{}
 
-func (dc *SimpleDiskCache) Start(ctx context.Context) error {
+func (dc *SimpleDiskCache) Start(context.Context) error {
 	log.Printf("[%s]\tlocal cache in  %s", dc.Kind(), dc.dir)
-	return nil
+	return os.MkdirAll(dc.dir, 0755)
 }
 
-func (dc *SimpleDiskCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
+func (dc *SimpleDiskCache) Get(_ context.Context, actionID string) (outputID, diskPath string, err error) {
 	actionFile := filepath.Join(dc.dir, fmt.Sprintf("a-%s", actionID))
 	ij, err := os.ReadFile(actionFile)
 	if err != nil {
@@ -66,7 +66,7 @@ func (dc *SimpleDiskCache) Get(ctx context.Context, actionID string) (outputID, 
 	return ie.OutputID, filepath.Join(dc.dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
 }
 
-func (dc *SimpleDiskCache) Put(ctx context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
+func (dc *SimpleDiskCache) Put(_ context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
 	file := filepath.Join(dc.dir, fmt.Sprintf("o-%s", objectID))
 
 	// Special case empty files; they're both common and easier to do race-free.
@@ -75,7 +75,7 @@ func (dc *SimpleDiskCache) Put(ctx context.Context, actionID, objectID string, s
 		if err != nil {
 			return "", err
 		}
-		zf.Close()
+		_ = zf.Close()
 	} else {
 		wrote, err := writeAtomic(file, body)
 		if err != nil {

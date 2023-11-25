@@ -73,7 +73,7 @@ func (c *timeKeeper) DoWithMeasure(bytesCount int64, f func() (string, error)) (
 // formatBytes formats a number of bytes into a human-readable string.
 func formatBytes(size float64) string {
 	const (
-		b = 1 << (10 * iota)
+		_ = 1 << (10 * iota)
 		kb
 		mb
 		gb

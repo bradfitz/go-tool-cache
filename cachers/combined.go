@@ -108,7 +108,7 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 		e := l.remoteCache.Put(ctx, actionID, outputID, size, putBody)
 		return "", e
 	})
-	pw.Close()
+	_ = pw.Close()
 	if err := wg.Wait(); err != nil {
 		log.Printf("[%s]\terror: %v", l.localCache.Kind(), err)
 		return "", err
