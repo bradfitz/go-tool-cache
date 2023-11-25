@@ -7,7 +7,7 @@ import (
 
 // Cache is the interface implemented by all caches.
 type Cache interface {
-	Start() error
+	Start(ctx context.Context) error
 	Close() error
 	Kind() string
 }

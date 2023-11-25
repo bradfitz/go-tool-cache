@@ -20,14 +20,22 @@ import (
 	"sync"
 
 	"github.com/bradfitz/go-tool-cache/cachers"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/bradfitz/go-tool-cache/wire"
+)
+
+var (
+	ErrUnknownCommand = errors.New("unknown command")
+	ErrNoOutputID     = errors.New("no outputID")
 )
 
 // Process implements the cmd/go JSON protocol over stdin & stdout via three
 // funcs that callers can optionally implement.
 type Process struct {
-	cache cachers.LocalCache
+	cache    cachers.LocalCache
+	closer   sync.Once
+	errClose error
 }
 
 func NewCacheProc(cache cachers.LocalCache) *Process {
@@ -36,26 +44,29 @@ func NewCacheProc(cache cachers.LocalCache) *Process {
 	}
 }
 
-func (p *Process) Run() error {
+func (p *Process) Run(ctx context.Context) error {
 	br := bufio.NewReader(os.Stdin)
 	jd := json.NewDecoder(br)
 
 	bw := bufio.NewWriter(os.Stdout)
 	je := json.NewEncoder(bw)
-	if err := p.cache.Start(); err != nil {
+	caps := []wire.Cmd{"get", "put", "close"}
+	if err := je.Encode(&wire.Response{KnownCommands: caps}); err != nil {
 		return err
 	}
-	caps := []wire.Cmd{"get", "put", "close"}
-	je.Encode(&wire.Response{KnownCommands: caps})
 	if err := bw.Flush(); err != nil {
 		return err
 	}
 
 	var wmu sync.Mutex // guards writing responses
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+	wg, ctx := errgroup.WithContext(ctx)
+	if err := p.cache.Start(ctx); err != nil {
+		return err
+	}
+	defer func() {
+		_ = p.close()
+	}()
 	for {
 		var req wire.Request
 		if err := jd.Decode(&req); err != nil {
@@ -76,26 +87,28 @@ func (p *Process) Run() error {
 			}
 			req.Body = bytes.NewReader(bodyb)
 		}
-		go func() {
+		wg.Go(func() error {
 			res := &wire.Response{ID: req.ID}
-			ctx := ctx // TODO: include req ID as a context.Value for tracing?
+			ctx := context.WithValue(ctx, "requestID", &req)
 			if err := p.handleRequest(ctx, &req, res); err != nil {
 				res.Err = err.Error()
 			}
 			wmu.Lock()
 			defer wmu.Unlock()
-			je.Encode(res)
-			bw.Flush()
-		}()
+			_ = je.Encode(res)
+			_ = bw.Flush()
+			return nil
+		})
 	}
+	return wg.Wait()
 }
 
 func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wire.Response) error {
 	switch req.Command {
 	default:
-		return errors.New("unknown command")
+		return ErrUnknownCommand
 	case "close":
-		return p.cache.Close()
+		return p.close()
 	case "get":
 		return p.handleGet(ctx, req, res)
 	case "put":
@@ -113,11 +126,11 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 		return nil
 	}
 	if outputID == "" {
-		return errors.New("no outputID")
+		return ErrNoOutputID
 	}
 	res.OutputID, err = hex.DecodeString(outputID)
 	if err != nil {
-		return fmt.Errorf("invalid OutputID: %v", err)
+		return fmt.Errorf("invalid OutputID: %w", err)
 	}
 	fi, err := os.Stat(diskPath)
 	if err != nil {
@@ -160,4 +173,14 @@ func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Re
 	}
 	res.DiskPath = diskPath
 	return nil
+}
+
+func (p *Process) close() error {
+	p.closer.Do(func() {
+		p.errClose = p.cache.Close()
+		if p.errClose != nil {
+			log.Printf("cache stop failed: %v", p.errClose)
+		}
+	})
+	return p.errClose
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime"
 
 	"github.com/aws/smithy-go"
@@ -39,7 +40,7 @@ func (s *S3Cache) Kind() string {
 	return "s3"
 }
 
-func (s *S3Cache) Start() error {
+func (s *S3Cache) Start(ctx context.Context) error {
 	log.Printf("[%s]\tconfigured to s3://%s/%s", s.Kind(), s.bucket, s.prefix)
 	return nil
 }
@@ -94,11 +95,17 @@ func (s *S3Cache) Close() error {
 }
 
 func NewS3Cache(client s3Client, bucketName string, cacheKey string, verbose bool) *S3Cache {
-	// get current architecture
-	arc := runtime.GOARCH
-	// get current operating system
-	os := runtime.GOOS
-	prefix := fmt.Sprintf("cache/%s/%s/%s", cacheKey, arc, os)
+	// get target architecture
+	goarch := os.Getenv("GOARCH")
+	if goarch == "" {
+		goarch = runtime.GOARCH
+	}
+	// get target operating system
+	goos := os.Getenv("GOOS")
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	prefix := fmt.Sprintf("cache/%s/%s/%s", cacheKey, goarch, goos)
 	cache := &S3Cache{
 		s3Client: client,
 		bucket:   bucketName,

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // CombinedCache is a LocalCache that wraps a LocalCache and a RemoteCache.
@@ -41,22 +43,23 @@ func (l *CombinedCache) Kind() string {
 	return "combined"
 }
 
-func (l *CombinedCache) Start() error {
-	err := l.localCache.Start()
+func (l *CombinedCache) Start(ctx context.Context) error {
+	err := l.localCache.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("local cache start failed: %w", err)
 	}
-	err = l.remoteCache.Start()
+	err = l.remoteCache.Start(ctx)
 	if err != nil {
+		_ = l.localCache.Close()
 		return fmt.Errorf("remote cache start failed: %w", err)
 	}
-	l.putsMetrics.Start()
-	l.getsMetrics.Start()
+	l.putsMetrics.Start(ctx)
+	l.getsMetrics.Start(ctx)
 	return nil
 }
 
-func (l *CombinedCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
-	outputID, diskPath, err = l.localCache.Get(ctx, actionID)
+func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, string, error) {
+	outputID, diskPath, err := l.localCache.Get(ctx, actionID)
 	if err == nil && outputID != "" {
 		return outputID, diskPath, nil
 	}
@@ -77,22 +80,18 @@ func (l *CombinedCache) Get(ctx context.Context, actionID string) (outputID, dis
 	return outputID, diskPath, nil
 }
 
-func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (string, error) {
+func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, err error) {
 	pr, pw := io.Pipe()
-	diskPathCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-	go func() {
+	wg, _ := errgroup.WithContext(ctx)
+	wg.Go(func() error {
 		var putBody io.Reader = pr
 		if size == 0 {
 			putBody = bytes.NewReader(nil)
 		}
-		diskPath, err := l.localCache.Put(ctx, actionID, outputID, size, putBody)
-		if err != nil {
-			errCh <- err
-		} else {
-			diskPathCh <- diskPath
-		}
-	}()
+		var err2 error
+		diskPath, err2 = l.localCache.Put(ctx, actionID, outputID, size, putBody)
+		return err2
+	})
 
 	var putBody io.Reader
 	if size == 0 {
@@ -110,28 +109,30 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 		return "", e
 	})
 	pw.Close()
-	select {
-	case err := <-errCh:
+	if err := wg.Wait(); err != nil {
 		log.Printf("[%s]\terror: %v", l.localCache.Kind(), err)
 		return "", err
-	case diskPath := <-diskPathCh:
-		return diskPath, nil
 	}
+	return diskPath, nil
+
 }
 
 func (l *CombinedCache) Close() error {
-	err := l.localCache.Close()
-	if err != nil {
-		err = fmt.Errorf("local cache stop failed: %w", err)
+	var errAll error
+	if err := l.localCache.Close(); err != nil {
+		errAll = errors.Join(fmt.Errorf("local cache stop failed: %w", err), errAll)
 	}
-	err = l.remoteCache.Close()
-	if err != nil {
-		err = errors.Join(fmt.Errorf("remote cache stop failed: %w", err))
+	if err := l.remoteCache.Close(); err != nil {
+		errAll = errors.Join(fmt.Errorf("remote cache stop failed: %w", err), errAll)
 	}
-	l.putsMetrics.Stop()
-	l.getsMetrics.Stop()
+	if err := l.putsMetrics.Stop(); err != nil {
+		errAll = errors.Join(fmt.Errorf("puts metrics stop failed: %w", err), errAll)
+	}
+	if err := l.getsMetrics.Stop(); err != nil {
+		errAll = errors.Join(fmt.Errorf("gets metrics stop failed: %w", err), errAll)
+	}
 	if l.verbose {
 		log.Printf("[%s]\tDownloads: %s, Uploads %s", l.remoteCache.Kind(), l.getsMetrics.Summary(), l.putsMetrics.Summary())
 	}
-	return err
+	return errAll
 }

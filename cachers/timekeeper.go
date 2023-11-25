@@ -1,9 +1,11 @@
 package cachers
 
 import (
+	"context"
 	"fmt"
-	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // timeKeeper can be used to measure time and bytes of operations
@@ -13,7 +15,7 @@ type timeKeeper struct {
 	TotalBytes        int64
 	AvgBytesPerSecond float64
 	metricsChan       chan metric
-	wg                sync.WaitGroup
+	wg                *errgroup.Group
 }
 
 // metric holds data of single op event: size in bytes and duration
@@ -24,26 +26,26 @@ type metric struct {
 
 func newTimeKeeper() *timeKeeper {
 	return &timeKeeper{
-		metricsChan: make(chan metric, 100),
+		metricsChan: make(chan metric, 1024),
 	}
 }
 
-func (c *timeKeeper) Start() {
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
+func (c *timeKeeper) Start(ctx context.Context) {
+	c.wg, _ = errgroup.WithContext(ctx)
+	c.wg.Go(func() error {
 		for m := range c.metricsChan {
 			c.TotalBytes += m.bytes
 			speed := float64(m.bytes) / m.duration.Seconds()
 			c.AvgBytesPerSecond = newAverage(c.AvgBytesPerSecond, c.Count, speed)
 			c.Count++
 		}
-	}()
+		return nil
+	})
 }
 
-func (c *timeKeeper) Stop() {
+func (c *timeKeeper) Stop() error {
 	close(c.metricsChan)
-	c.wg.Wait()
+	return c.wg.Wait()
 }
 
 func (c *timeKeeper) Summary() string {

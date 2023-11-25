@@ -40,7 +40,7 @@ func NewSimpleDiskCache(verbose bool, dir string) *SimpleDiskCache {
 
 var _ LocalCache = &SimpleDiskCache{}
 
-func (dc *SimpleDiskCache) Start() error {
+func (dc *SimpleDiskCache) Start(ctx context.Context) error {
 	log.Printf("[%s]\tlocal cache in  %s", dc.Kind(), dc.dir)
 	return nil
 }
@@ -51,9 +51,6 @@ func (dc *SimpleDiskCache) Get(ctx context.Context, actionID string) (outputID, 
 	if err != nil {
 		if os.IsNotExist(err) {
 			err = nil
-			// if dc.verbose {
-			// 	log.Printf("disk miss: %v", actionID)
-			// }
 		}
 		return "", "", err
 	}
@@ -74,7 +71,7 @@ func (dc *SimpleDiskCache) Put(ctx context.Context, actionID, objectID string, s
 
 	// Special case empty files; they're both common and easier to do race-free.
 	if size == 0 {
-		zf, err := os.OpenFile(file, os.O_CREATE|os.O_RDWR, 0644)
+		zf, err := os.OpenFile(file, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0644)
 		if err != nil {
 			return "", err
 		}
@@ -109,23 +106,36 @@ func (dc *SimpleDiskCache) Close() error {
 	return nil
 }
 
-func writeAtomic(dest string, r io.Reader) (int64, error) {
+func writeTempFile(dest string, r io.Reader) (string, int64, error) {
 	tf, err := os.CreateTemp(filepath.Dir(dest), filepath.Base(dest)+".*")
 	if err != nil {
-		return 0, err
+		return "", 0, err
 	}
+	fileName := tf.Name()
+	defer func() {
+		_ = tf.Close()
+		if err != nil {
+			_ = os.Remove(fileName)
+		}
+	}()
 	size, err := io.Copy(tf, r)
 	if err != nil {
-		tf.Close()
-		os.Remove(tf.Name())
+		return "", 0, err
+	}
+	return fileName, size, nil
+}
+
+func writeAtomic(dest string, r io.Reader) (int64, error) {
+	tempFile, size, err := writeTempFile(dest, r)
+	if err != nil {
 		return 0, err
 	}
-	if err := tf.Close(); err != nil {
-		os.Remove(tf.Name())
-		return 0, err
-	}
-	if err := os.Rename(tf.Name(), dest); err != nil {
-		os.Remove(tf.Name())
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tempFile)
+		}
+	}()
+	if err = os.Rename(tempFile, dest); err != nil {
 		return 0, err
 	}
 	return size, nil

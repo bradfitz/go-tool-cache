@@ -46,16 +46,16 @@ var (
 	verbose = flag.Bool("verbose", false, "be verbose")
 )
 
-func getAwsConfigFromEnv() (*aws.Config, error) {
+func getAwsConfigFromEnv(ctx context.Context) (*aws.Config, error) {
 	// read from env
 	awsRegion := os.Getenv(envVarS3CacheRegion)
-	if awsRegion != "" {
+	if awsRegion == "" {
 		return nil, nil
 	}
 	accessKey := os.Getenv(envVarS3AwsAccessKey)
 	secretAccessKey := os.Getenv(envVarS3AwsSecretAccessKey)
 	if accessKey != "" && secretAccessKey != "" {
-		cfg, err := config.LoadDefaultConfig(context.TODO(),
+		cfg, err := config.LoadDefaultConfig(ctx,
 			config.WithRegion(awsRegion),
 			config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
 				Value: aws.Credentials{
@@ -79,8 +79,8 @@ func getAwsConfigFromEnv() (*aws.Config, error) {
 	return nil, nil
 }
 
-func maybeS3Cache() (cachers.RemoteCache, error) {
-	awsConfig, err := getAwsConfigFromEnv()
+func maybeS3Cache(ctx context.Context) (cachers.RemoteCache, error) {
+	awsConfig, err := getAwsConfigFromEnv(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -98,8 +98,8 @@ func maybeS3Cache() (cachers.RemoteCache, error) {
 	return s3Cache, nil
 }
 
-func getCache(local cachers.LocalCache, verbose bool) cachers.LocalCache {
-	remote, err := maybeS3Cache()
+func getCache(ctx context.Context, local cachers.LocalCache, verbose bool) cachers.LocalCache {
+	remote, err := maybeS3Cache(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -140,9 +140,12 @@ func main() {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Fatal(err)
 	}
+
 	var localCache cachers.LocalCache = cachers.NewSimpleDiskCache(*verbose, dir)
-	proc := cacheproc.NewCacheProc(getCache(localCache, *verbose))
-	if err := proc.Run(); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	proc := cacheproc.NewCacheProc(getCache(ctx, localCache, *verbose))
+	if err := proc.Run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -41,8 +41,8 @@ func (r *RemoteCacheWithCounts) Kind() string {
 	return r.cache.Kind()
 }
 
-func (r *RemoteCacheWithCounts) Start() error {
-	return r.cache.Start()
+func (r *RemoteCacheWithCounts) Start(ctx context.Context) error {
+	return r.cache.Start(ctx)
 }
 
 func (r *RemoteCacheWithCounts) Close() error {
@@ -75,8 +75,8 @@ func (r *RemoteCacheWithCounts) Put(ctx context.Context, actionID, outputID stri
 	return
 }
 
-func (l *LocalCacheWithCounts) Start() error {
-	return l.cache.Start()
+func (l *LocalCacheWithCounts) Start(ctx context.Context) error {
+	return l.cache.Start(ctx)
 }
 
 func (l *LocalCacheWithCounts) Close() error {

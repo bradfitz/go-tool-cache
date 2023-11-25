@@ -75,7 +75,9 @@ type server struct {
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	time.Sleep(s.latency)
+	if s.latency > 0 {
+		time.Sleep(s.latency)
+	}
 	if s.verbose {
 		log.Printf("%s %s", r.Method, r.RequestURI)
 	}
