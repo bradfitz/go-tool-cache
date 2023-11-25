@@ -69,6 +69,7 @@ func (p *Process) Run(ctx context.Context) error {
 	}
 	defer func() {
 		_ = p.close()
+		_ = wg.Wait()
 	}()
 	for {
 		var req wire.Request
@@ -102,11 +103,6 @@ func (p *Process) Run(ctx context.Context) error {
 			_ = bw.Flush()
 			return nil
 		})
-		select {
-		case <-ctx.Done():
-			return wg.Wait()
-		default:
-		}
 	}
 }
 
