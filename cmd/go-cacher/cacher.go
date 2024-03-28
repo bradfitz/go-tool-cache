@@ -94,9 +94,13 @@ func maybeS3Cache(ctx context.Context, env Env) (cachers.RemoteCache, error) {
 	if err != nil {
 		return nil, err
 	}
+	if awsConfig == nil {
+		log.Print("S3 cache disabled; missing AWS config")
+		return nil, nil
+	}
 	bucket := env.Get(envVarS3BucketName)
-	if bucket == "" || awsConfig == nil {
-		// We need at least name of bucket and valid aws config
+	if bucket == "" {
+		log.Print("S3 cache disabled; missing bucket name from ", envVarS3BucketName)
 		return nil, nil
 	}
 	cacheKey := env.Get(envVarS3CacheKey)
