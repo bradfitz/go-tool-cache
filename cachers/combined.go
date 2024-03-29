@@ -32,9 +32,9 @@ func NewCombinedCache(localCache LocalCache, remoteCache RemoteCache, verbose bo
 		getsMetrics: newTimeKeeper(),
 	}
 	if verbose {
-		cache.localCache = NewLocalCacheStates(localCache)
+		cache.localCache = NewLocalCacheStats(localCache)
 		cache.remoteCache = NewRemoteCacheStats(remoteCache)
-		return NewLocalCacheStates(cache)
+		return NewLocalCacheStats(cache)
 	}
 	return cache
 }
@@ -59,6 +59,9 @@ func (l *CombinedCache) Start(ctx context.Context) error {
 }
 
 func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, string, error) {
+	if l.verbose {
+		log.Printf("[%s]\tGet(%q)", l.Kind(), actionID)
+	}
 	outputID, diskPath, err := l.localCache.Get(ctx, actionID)
 	if err == nil && outputID != "" {
 		return outputID, diskPath, nil
@@ -81,6 +84,9 @@ func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, strin
 }
 
 func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, err error) {
+	if l.verbose {
+		log.Printf("[%s]\tPut(%q, %q, %d)", l.Kind(), actionID, outputID, size)
+	}
 	pr, pw := io.Pipe()
 	wg, _ := errgroup.WithContext(ctx)
 	wg.Go(func() error {
@@ -118,6 +124,9 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 }
 
 func (l *CombinedCache) Close() error {
+	if l.verbose {
+		log.Printf("[%s]\tClose()", l.Kind())
+	}
 	var errAll error
 	if err := l.localCache.Close(); err != nil {
 		errAll = errors.Join(fmt.Errorf("local cache stop failed: %w", err), errAll)

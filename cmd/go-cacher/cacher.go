@@ -92,6 +92,7 @@ func getAwsConfigFromEnv(ctx context.Context, env Env) (*aws.Config, error) {
 func maybeS3Cache(ctx context.Context, env Env) (cachers.RemoteCache, error) {
 	awsConfig, err := getAwsConfigFromEnv(ctx, env)
 	if err != nil {
+		log.Print("S3 cache disabled; failed to load AWS config: ", err)
 		return nil, err
 	}
 	if awsConfig == nil {
@@ -109,6 +110,7 @@ func maybeS3Cache(ctx context.Context, env Env) (cachers.RemoteCache, error) {
 	}
 	s3Client := s3.NewFromConfig(*awsConfig)
 	s3Cache := cachers.NewS3Cache(s3Client, bucket, cacheKey, *verbose)
+	log.Print("S3 cache enabled; bucket=", bucket, " cacheKey=", cacheKey)
 	return s3Cache, nil
 }
 
@@ -121,6 +123,7 @@ func getCache(ctx context.Context, env Env, verbose bool) cachers.LocalCache {
 		log.Fatal(err)
 	}
 	if remote == nil {
+		log.Print("S3 cache failed; falling back to HTTP cache")
 		remote, err = maybeHttpCache(env)
 		if err != nil {
 			log.Fatal(err)
@@ -131,7 +134,7 @@ func getCache(ctx context.Context, env Env, verbose bool) cachers.LocalCache {
 		return cachers.NewCombinedCache(local, remote, verbose)
 	}
 	if verbose {
-		return cachers.NewLocalCacheStates(local)
+		return cachers.NewLocalCacheStats(local)
 	}
 	return local
 }
@@ -164,6 +167,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	log.Printf("starting cache")
 	cache := getCache(ctx, env, *verbose)
 	proc := cacheproc.NewCacheProc(cache)
 	if err := proc.Run(ctx); err != nil {

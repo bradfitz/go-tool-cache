@@ -46,6 +46,9 @@ func (s *S3Cache) Start(context.Context) error {
 }
 
 func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, size int64, output io.ReadCloser, err error) {
+	if s.verbose {
+		log.Printf("[%s]\tGet(%q)", s.Kind(), actionID)
+	}
 	actionKey := s.actionKey(actionID)
 	outputResult, getOutputErr := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.bucket,
@@ -69,6 +72,9 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, si
 }
 
 func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (err error) {
+	if s.verbose {
+		log.Printf("[%s]\tPut(%q, %q, %d bytes)", s.Kind(), actionID, outputID, size)
+	}
 	if size == 0 {
 		body = bytes.NewReader(nil)
 	}
@@ -86,6 +92,9 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 	})
 	if err != nil && s.verbose {
 		log.Printf("error S3 put for %s:  %v", actionKey, err)
+	}
+	if s.verbose {
+		log.Printf("[%s]\tPut(%q, %q, %d bytes) done", s.Kind(), actionID, outputID, size)
 	}
 	return
 }

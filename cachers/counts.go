@@ -109,7 +109,7 @@ func (l *LocalCacheWithCounts) Put(ctx context.Context, actionID, outputID strin
 	return
 }
 
-func NewLocalCacheStates(cache LocalCache) *LocalCacheWithCounts {
+func NewLocalCacheStats(cache LocalCache) *LocalCacheWithCounts {
 	return &LocalCacheWithCounts{
 		cache: cache,
 	}
