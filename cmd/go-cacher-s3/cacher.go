@@ -48,6 +48,9 @@ func main() {
 		clientLogMode = aws.LogRetries | aws.LogRequest
 	}
 	awsConfig, err := config.LoadDefaultConfig(context.TODO(), config.WithClientLogMode(clientLogMode))
+	if flagVerbose != nil && *flagVerbose {
+		log.Printf("AWS config: %#v", awsConfig)
+	}
 	if err != nil {
 		log.Fatal("S3 cache disabled; failed to load AWS config: ", err)
 	}
