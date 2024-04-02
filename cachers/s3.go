@@ -59,9 +59,6 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, si
 		// handle object not found
 		return "", 0, nil, nil
 	} else if getOutputErr != nil {
-		if s.verbose {
-			log.Printf("error S3 get for %s:  %v", actionKey, getOutputErr)
-		}
 		return "", 0, nil, fmt.Errorf("unexpected S3 get for %s:  %v", actionKey, getOutputErr)
 	}
 	contentSize := outputResult.ContentLength
@@ -69,7 +66,7 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, si
 	if !ok || outputID == "" {
 		return "", 0, nil, fmt.Errorf("outputId not found in metadata")
 	}
-	return outputID, contentSize, outputResult.Body, nil
+	return outputID, *contentSize, outputResult.Body, nil
 }
 
 func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (err error) {
@@ -79,7 +76,7 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 	if size == 0 {
 		body = bytes.NewReader(nil)
 	}
-	// TODO: temporarily read it all into memory
+	// The AWS SDK seems to fail to ReadAll the whole Reader sometimes, which leads to SignatueDoesNotMatch errors (and presumably truncated data??), so we read the whole thing into memory. Normally this is memory-inefficient, but since the SDK needs the whole body to compute the signature (namely length), it should be fine. (And hopefully it's not copyying the whole thing again.)
 	buf, err := io.ReadAll(body)
 	if err != nil {
 		return fmt.Errorf("error reading body: %w", err)
@@ -93,7 +90,7 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 		Bucket:        &s.bucket,
 		Key:           &actionKey,
 		Body:          body,
-		ContentLength: size,
+		ContentLength: &size,
 		Metadata: map[string]string{
 			outputIDMetadataKey: outputID,
 		},

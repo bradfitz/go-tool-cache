@@ -6,3 +6,4 @@ go-cacher-server
 go.work.sum
 go.work
 .vscode/** 
+tmp/**
