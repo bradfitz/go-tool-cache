@@ -15,13 +15,13 @@ jobs:
             --name container \
             --driver=docker-container \
             --use
-          cd golang-cacheprog
           docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
           docker buildx build \
             --cache-from=ghcr.io/${{ github.repository }}/golang-cacheprog-s3:_cache \
             --cache-to=ghcr.io/${{ github.repository }}/golang-cacheprog-s3:_cache \
             -t ghcr.io/${{ github.repository }}/golang-cacheprog-s3 \
             --push \
+            --target=golang-cacheprog-s3 \
             -f Dockerfile .
 
     outputs:
