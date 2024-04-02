@@ -11,7 +11,7 @@ RUN rm -rf /gocacheprog
 FROM golang-cacheprog as golang-cacheprog-s3
 ADD . /workdir
 # need go.work because we're a fork
-RUN go work init && go work use . && go install ./cmd/go-cacher-s3
+RUN cd /workdir && go work init && go work use . && go install ./cmd/go-cacher-s3
 
 # TODO: not sure this affects the EXEC
 ENV GOCACHEPROG="go-cacher-s3 --verbose"
