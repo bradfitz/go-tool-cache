@@ -10,6 +10,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -26,11 +27,12 @@ var userCacheDir, _ = os.UserCacheDir()
 var defaultLocalCacheDir = filepath.Join(userCacheDir, "go-cacher")
 
 var (
-	flagVerbose       = flag.Bool("verbose", false, "be verbose")
-	flagDebug         = flag.Bool("debug", false, "dump a lot of debug info")
-	flagCacheKey      = flag.String("cache-key", defaultCacheKey, "cache key")
-	flagLocalCacheDir = flag.String("local-cache-dir", defaultLocalCacheDir, "local cache directory")
-	bucket            string
+	flagVerbose                = flag.Bool("verbose", false, "be verbose")
+	flagDebug                  = flag.Bool("debug", false, "dump a lot of debug info")
+	flagCacheKey               = flag.String("cache-key", defaultCacheKey, "cache key")
+	flagLocalCacheDir          = flag.String("local-cache-dir", defaultLocalCacheDir, "local cache directory")
+	flagSkipZeroByteRemotePuts = flag.Bool("skip-zero-byte-remote-puts", false, "skip zero-byte remote puts")
+	bucket                     string
 )
 
 func main() {
@@ -52,10 +54,12 @@ func main() {
 	if err != nil {
 		log.Fatal("S3 cache disabled; failed to load AWS config: ", err)
 	}
+	s3Cacher := cachers.NewS3Cache(s3.NewFromConfig(awsConfig), bucket, *flagCacheKey, *flagVerbose)
+	s3Cacher.SkipZeroBytePuts = *flagSkipZeroByteRemotePuts
 	proc := cacheproc.NewCacheProc(
 		cachers.NewCombinedCache(
 			cachers.NewSimpleDiskCache(*flagVerbose, *flagLocalCacheDir),
-			cachers.NewS3Cache(s3.NewFromConfig(awsConfig), bucket, *flagCacheKey, *flagVerbose),
+			s3Cacher,
 			*flagVerbose,
 		),
 	)

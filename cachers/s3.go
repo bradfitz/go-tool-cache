@@ -31,8 +31,9 @@ type S3Cache struct {
 	bucket string
 	prefix string
 	// verbose optionally specifies whether to log verbose messages.
-	verbose  bool
-	s3Client s3Client
+	verbose          bool
+	s3Client         s3Client
+	SkipZeroBytePuts bool
 }
 
 var _ RemoteCache = &S3Cache{}
@@ -70,11 +71,18 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, si
 }
 
 func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (err error) {
+
+	if size == 0 {
+		if s.SkipZeroBytePuts {
+			if s.verbose {
+				log.Printf("[%s]\tPut(%q, %q, %d bytes): skip", s.Kind(), actionID, outputID, size)
+			}
+			return nil
+		}
+		body = bytes.NewReader(nil)
+	}
 	if s.verbose {
 		log.Printf("[%s]\tPut(%q, %q, %d bytes)", s.Kind(), actionID, outputID, size)
-	}
-	if size == 0 {
-		body = bytes.NewReader(nil)
 	}
 	// The AWS SDK seems to fail to ReadAll the whole Reader sometimes, which leads to SignatueDoesNotMatch errors (and presumably truncated data??), so we read the whole thing into memory. Normally this is memory-inefficient, but since the SDK needs the whole body to compute the signature (namely length), it should be fine. (And hopefully it's not copyying the whole thing again.)
 	buf, err := io.ReadAll(body)
