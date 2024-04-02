@@ -8,7 +8,7 @@ RUN cp -r /gocacheprog/* /usr/local/go/
 RUN go version | grep cacheprog
 RUN rm -rf /gocacheprog
 
-FROM golang-cacheprog as golang-cacheprog-s3
+FROM golang-cacheprog as go-cacher-s3
 ADD . /workdir
 # need go.work because we're a fork
 RUN cd /workdir && go work init && go work use . && go install ./cmd/go-cacher-s3

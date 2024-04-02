@@ -17,12 +17,12 @@ jobs:
             --use
           docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
           docker buildx build \
-            --cache-from=ghcr.io/${{ github.repository }}/golang-cacheprog-s3:_cache \
-            --cache-to=ghcr.io/${{ github.repository }}/golang-cacheprog-s3:_cache \
-            -t ghcr.io/${{ github.repository }}/golang-cacheprog-s3 \
+            --cache-from=ghcr.io/${{ github.repository }}:_cache \
+            --cache-to=ghcr.io/${{ github.repository }}:_cache \
+            -t ghcr.io/${{ github.repository }}/go-cacher-s3 \
             --push \
-            --target=golang-cacheprog-s3 \
+            --target=go-cacher-s3 \
             -f Dockerfile .
 
     outputs:
-      image: ghcr.io/${{ github.repository }}/golang-cacheprog-s3
+      image: ghcr.io/${{ github.repository }}/go-cacher-s3
