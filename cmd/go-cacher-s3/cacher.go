@@ -22,7 +22,8 @@ import (
 
 const defaultCacheKey = "v1"
 
-var defaultLocalCacheDir, _ = os.UserCacheDir()
+var userCacheDir, _ = os.UserCacheDir()
+var defaultLocalCacheDir = filepath.Join(userCacheDir, "go-cacher")
 
 var (
 	flagVerbose       = flag.Bool("verbose", false, "be verbose")
