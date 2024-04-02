@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"strings"
 
 	"github.com/aws/smithy-go"
 
@@ -78,6 +79,15 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 	if size == 0 {
 		body = bytes.NewReader(nil)
 	}
+	// TODO: temporarily read it all into memory
+	buf, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("error reading body: %w", err)
+	}
+	if int64(len(buf)) != size {
+		return fmt.Errorf("size mismatch: expected %d, got %d: %q", size, len(buf), buf)
+	}
+	body = bytes.NewReader(buf)
 	actionKey := s.actionKey(actionID)
 	_, err = s.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        &s.bucket,
@@ -88,10 +98,11 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 			outputIDMetadataKey: outputID,
 		},
 	}, func(options *s3.Options) {
-		options.RetryMaxAttempts = 1 // We cannot perform seek in Body
+		options.RetryMaxAttempts = 0 // We cannot perform seek in Body
 	})
 	if err != nil && s.verbose {
-		log.Printf("error S3 put for %s:  %v", actionKey, err)
+		log.Printf("[%s]\tPut(%q, %q, %d bytes) error: %s", s.Kind(), actionID, outputID, size, err)
+		return err
 	}
 	if s.verbose {
 		log.Printf("[%s]\tPut(%q, %q, %d bytes) done", s.Kind(), actionID, outputID, size)
@@ -129,7 +140,14 @@ func isNotFoundError(err error) bool {
 		var ae smithy.APIError
 		if errors.As(err, &ae) {
 			code := ae.ErrorCode()
-			return code == "AccessDenied" || code == "NoSuchKey"
+			if code == "NoSuchKey" {
+				return true
+			}
+			if code == "AccessDenied" {
+				// technically if sig doesn't match, it is unknown whether found or not
+				return !strings.Contains(ae.Error(), "SignatureDoesNotMatch")
+			}
+			return false
 		}
 	}
 	return false

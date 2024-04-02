@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 
+	"github.com/hashicorp/go-multierror"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -83,44 +84,46 @@ func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, strin
 	return outputID, diskPath, nil
 }
 
-func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, err error) {
+func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (string, error) {
 	if l.verbose {
 		log.Printf("[%s]\tPut(%q, %q, %d)", l.Kind(), actionID, outputID, size)
 	}
-	pr, pw := io.Pipe()
-	wg, _ := errgroup.WithContext(ctx)
-	wg.Go(func() error {
-		var putBody io.Reader = pr
-		if size == 0 {
-			putBody = bytes.NewReader(nil)
-		}
-		var err2 error
-		diskPath, err2 = l.localCache.Put(ctx, actionID, outputID, size, putBody)
-		return err2
-	})
-
-	var putBody io.Reader
+	// special case for empty files, nead empty reader
+	// TODO: not sure why/when this would happen
+	// TODO: seems like for disk and s3 at least, Put(..., 0, nil) should work automatically
 	if size == 0 {
-		// Special case the empty file so NewRequest sets "Content-Length: 0",
-		// as opposed to thinking we didn't set it and not being able to sniff its size
-		// from the type.
-		putBody = bytes.NewReader(nil)
-	} else {
-
-		putBody = io.TeeReader(body, pw)
+		path, err := l.localCache.Put(ctx, actionID, outputID, size, bytes.NewReader(nil))
+		multierror.Append(err, l.remoteCache.Put(ctx, actionID, outputID, size, bytes.NewReader(nil)))
+		return path, err
 	}
-	// tolerate remote write errors
-	_, _ = l.putsMetrics.DoWithMeasure(size, func() (string, error) {
-		e := l.remoteCache.Put(ctx, actionID, outputID, size, putBody)
-		return "", e
+
+	pr, pw := io.Pipe()
+	tr := io.TeeReader(body, pw)
+	wg, wgCtx := errgroup.WithContext(ctx)
+	wg.Go(func() error {
+		_, err := l.putsMetrics.DoWithMeasure(size, func() (string, error) {
+			err := l.remoteCache.Put(wgCtx, actionID, outputID, size, pr)
+			// TODO: don't know if we should close the reader here, or Put should
+			if err != nil {
+				pr.CloseWithError(err)
+			}
+			return "", err
+		})
+		return err
 	})
-	_ = pw.Close()
-	if err := wg.Wait(); err != nil {
-		log.Printf("[%s]\terror: %v", l.localCache.Kind(), err)
-		return "", err
-	}
-	return diskPath, nil
 
+	// TODO: restore metrics
+	diskPath, err := l.localCache.Put(ctx, actionID, outputID, size, tr)
+	if err != nil {
+		return diskPath, err
+	}
+	pw.Close()
+	if remoteErr := wg.Wait(); remoteErr != nil {
+		// only log errors on remote
+		// TODO: maybe a mode that *does* fail if remote fails?
+		log.Printf("[%s]\terror: %v", l.remoteCache.Kind(), remoteErr)
+	}
+	return diskPath, err
 }
 
 func (l *CombinedCache) Close() error {

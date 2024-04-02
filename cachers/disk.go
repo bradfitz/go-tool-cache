@@ -46,6 +46,9 @@ func (dc *SimpleDiskCache) Start(context.Context) error {
 }
 
 func (dc *SimpleDiskCache) Get(_ context.Context, actionID string) (outputID, diskPath string, err error) {
+	if dc.verbose {
+		log.Printf("[%s]\tGet(%q)", dc.Kind(), actionID)
+	}
 	actionFile := filepath.Join(dc.dir, fmt.Sprintf("a-%s", actionID))
 	ij, err := os.ReadFile(actionFile)
 	if err != nil {
@@ -67,6 +70,9 @@ func (dc *SimpleDiskCache) Get(_ context.Context, actionID string) (outputID, di
 }
 
 func (dc *SimpleDiskCache) Put(_ context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
+	if dc.verbose {
+		log.Printf("[%s]\tPut(%q, %q, %d bytes)", dc.Kind(), actionID, objectID, size)
+	}
 	file := filepath.Join(dc.dir, fmt.Sprintf("o-%s", objectID))
 
 	// Special case empty files; they're both common and easier to do race-free.

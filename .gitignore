@@ -1,2 +1,8 @@
 *~
 bin/
+go-cacher
+go-cacher-s3
+go-cacher-server
+go.work.sum
+go.work
+.vscode/** 
