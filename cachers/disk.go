@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -23,33 +23,27 @@ type indexEntry struct {
 
 // SimpleDiskCache is a LocalCache that stores data on disk.
 type SimpleDiskCache struct {
-	dir     string
-	verbose bool
+	dir string
+	log *slog.Logger
 }
 
-func (dc *SimpleDiskCache) Kind() string {
-	return "disk"
-}
-
-func NewSimpleDiskCache(verbose bool, dir string) *SimpleDiskCache {
+func NewSimpleDiskCache(dir string) *SimpleDiskCache {
 	return &SimpleDiskCache{
-		dir:     dir,
-		verbose: verbose,
+		dir: dir,
+		log: slog.With("kind", "disk"),
 	}
 }
 
 var _ LocalCache = &SimpleDiskCache{}
 
-func (dc *SimpleDiskCache) Start(context.Context) error {
-	log.Printf("[%s]\tlocal cache in  %s", dc.Kind(), dc.dir)
-	return os.MkdirAll(dc.dir, 0755)
+func (c *SimpleDiskCache) Start(context.Context) error {
+	c.log.Info("start", "dir", c.dir)
+	return os.MkdirAll(c.dir, 0755)
 }
 
-func (dc *SimpleDiskCache) Get(_ context.Context, actionID string) (outputID, diskPath string, err error) {
-	if dc.verbose {
-		log.Printf("[%s]\tGet(%q)", dc.Kind(), actionID)
-	}
-	actionFile := filepath.Join(dc.dir, fmt.Sprintf("a-%s", actionID))
+func (c *SimpleDiskCache) Get(_ context.Context, actionID string) (outputID, diskPath string, err error) {
+	c.log.Debug("get", "actionID", actionID)
+	actionFile := filepath.Join(c.dir, fmt.Sprintf("a-%s", actionID))
 	ij, err := os.ReadFile(actionFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -59,21 +53,19 @@ func (dc *SimpleDiskCache) Get(_ context.Context, actionID string) (outputID, di
 	}
 	var ie indexEntry
 	if err := json.Unmarshal(ij, &ie); err != nil {
-		log.Printf("Warning: JSON error for action %q: %v", actionID, err)
+		c.log.Error("json error", "actionID", actionID, "err", err)
 		return "", "", nil
 	}
 	if _, err := hex.DecodeString(ie.OutputID); err != nil {
 		// Protect against malicious non-hex OutputID on disk
 		return "", "", nil
 	}
-	return ie.OutputID, filepath.Join(dc.dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
+	return ie.OutputID, filepath.Join(c.dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
 }
 
-func (dc *SimpleDiskCache) Put(_ context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
-	if dc.verbose {
-		log.Printf("[%s]\tPut(%q, %q, %d bytes)", dc.Kind(), actionID, objectID, size)
-	}
-	file := filepath.Join(dc.dir, fmt.Sprintf("o-%s", objectID))
+func (c *SimpleDiskCache) Put(_ context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
+	c.log.Debug("put", "actionID", actionID, "objectID", objectID, "size", size)
+	file := filepath.Join(c.dir, fmt.Sprintf("o-%s", objectID))
 
 	// Special case empty files; they're both common and easier to do race-free.
 	if size == 0 {
@@ -101,14 +93,15 @@ func (dc *SimpleDiskCache) Put(_ context.Context, actionID, objectID string, siz
 	if err != nil {
 		return "", err
 	}
-	actionFile := filepath.Join(dc.dir, fmt.Sprintf("a-%s", actionID))
+	actionFile := filepath.Join(c.dir, fmt.Sprintf("a-%s", actionID))
 	if _, err := writeAtomic(actionFile, bytes.NewReader(ij)); err != nil {
 		return "", err
 	}
 	return file, nil
 }
 
-func (dc *SimpleDiskCache) Close() error {
+func (c *SimpleDiskCache) Close() error {
+	c.log.Info("close")
 	return nil
 }
 

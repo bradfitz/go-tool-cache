@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 
 	"github.com/hashicorp/go-multierror"
 	"golang.org/x/sync/errgroup"
@@ -15,7 +15,7 @@ import (
 // CombinedCache is a LocalCache that wraps a LocalCache and a RemoteCache.
 // It also keeps times for the remote cache Download/Uploads
 type CombinedCache struct {
-	verbose     bool
+	log         *slog.Logger
 	localCache  LocalCache
 	remoteCache RemoteCache
 	putsMetrics *timeKeeper
@@ -24,24 +24,18 @@ type CombinedCache struct {
 
 var _ LocalCache = &CombinedCache{}
 
-func NewCombinedCache(localCache LocalCache, remoteCache RemoteCache, verbose bool) LocalCache {
+func NewCombinedCache(localCache LocalCache, remoteCache RemoteCache) LocalCache {
 	cache := &CombinedCache{
-		verbose:     verbose,
+		log:         slog.With("kind", "combined"),
 		localCache:  localCache,
 		remoteCache: remoteCache,
 		putsMetrics: newTimeKeeper(),
 		getsMetrics: newTimeKeeper(),
 	}
-	if verbose {
-		cache.localCache = NewLocalCacheStats(localCache)
-		cache.remoteCache = NewRemoteCacheStats(remoteCache)
-		return NewLocalCacheStats(cache)
-	}
-	return cache
-}
-
-func (l *CombinedCache) Kind() string {
-	return "combined"
+	// TODO: this used to be guarded behind a verbose flag. For perf, maybe we should still do that
+	cache.localCache = NewLocalCacheStats(localCache)
+	cache.remoteCache = NewRemoteCacheStats(remoteCache)
+	return NewLocalCacheStats(cache)
 }
 
 func (l *CombinedCache) Start(ctx context.Context) error {
@@ -60,9 +54,7 @@ func (l *CombinedCache) Start(ctx context.Context) error {
 }
 
 func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, string, error) {
-	if l.verbose {
-		log.Printf("[%s]\tGet(%q)", l.Kind(), actionID)
-	}
+	l.log.Info("get", "actionID", actionID)
 	outputID, diskPath, err := l.localCache.Get(ctx, actionID)
 	if err == nil && outputID != "" {
 		return outputID, diskPath, nil
@@ -85,9 +77,7 @@ func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, strin
 }
 
 func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (string, error) {
-	if l.verbose {
-		log.Printf("[%s]\tPut(%q, %q, %d)", l.Kind(), actionID, outputID, size)
-	}
+	l.log.Info("Put", "actionID", actionID, "outputID", outputID, "size", size)
 	// special case for empty files, nead empty reader
 	// TODO: not sure why/when this would happen
 	// TODO: seems like for disk and s3 at least, Put(..., 0, nil) should work automatically
@@ -121,15 +111,13 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 	if remoteErr := wg.Wait(); remoteErr != nil {
 		// only log errors on remote
 		// TODO: maybe a mode that *does* fail if remote fails?
-		log.Printf("[%s]\terror: %v", l.remoteCache.Kind(), remoteErr)
+		l.log.Error(fmt.Sprintf("error: %v", remoteErr))
 	}
 	return diskPath, err
 }
 
 func (l *CombinedCache) Close() error {
-	if l.verbose {
-		log.Printf("[%s]\tClose()", l.Kind())
-	}
+	l.log.Info("Close()")
 	var errAll error
 	if err := l.localCache.Close(); err != nil {
 		errAll = errors.Join(fmt.Errorf("local cache stop failed: %w", err), errAll)
@@ -143,8 +131,7 @@ func (l *CombinedCache) Close() error {
 	if err := l.getsMetrics.Stop(); err != nil {
 		errAll = errors.Join(fmt.Errorf("gets metrics stop failed: %w", err), errAll)
 	}
-	if l.verbose {
-		log.Printf("[%s]\tDownloads: %s, Uploads %s", l.remoteCache.Kind(), l.getsMetrics.Summary(), l.putsMetrics.Summary())
-	}
+	// TODO: pull out the metrics into log KV
+	l.log.Info(fmt.Sprintf("Downloads: %s, Uploads %s", l.getsMetrics.Summary(), l.putsMetrics.Summary()))
 	return errAll
 }

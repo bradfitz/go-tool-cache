@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"sync/atomic"
 )
 
@@ -28,17 +27,9 @@ type LocalCacheWithCounts struct {
 	cache LocalCache
 }
 
-func (l *LocalCacheWithCounts) Kind() string {
-	return l.cache.Kind()
-}
-
 type RemoteCacheWithCounts struct {
 	Counts
 	cache RemoteCache
-}
-
-func (r *RemoteCacheWithCounts) Kind() string {
-	return r.cache.Kind()
 }
 
 func (r *RemoteCacheWithCounts) Start(ctx context.Context) error {
@@ -46,7 +37,6 @@ func (r *RemoteCacheWithCounts) Start(ctx context.Context) error {
 }
 
 func (r *RemoteCacheWithCounts) Close() error {
-	log.Printf("[%s]\t%s", r.cache.Kind(), r.Summary())
 	return r.cache.Close()
 }
 
@@ -80,7 +70,6 @@ func (l *LocalCacheWithCounts) Start(ctx context.Context) error {
 }
 
 func (l *LocalCacheWithCounts) Close() error {
-	log.Printf("[%s]\t%s", l.cache.Kind(), l.Summary())
 	return l.cache.Close()
 }
 

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"runtime"
 	"strings"
@@ -28,29 +28,22 @@ type s3Client interface {
 
 // S3Cache is a remote cache that is backed by S3 bucket
 type S3Cache struct {
-	bucket string
-	prefix string
-	// verbose optionally specifies whether to log verbose messages.
-	verbose          bool
+	bucket           string
+	prefix           string
+	log              *slog.Logger
 	s3Client         s3Client
 	SkipZeroBytePuts bool
 }
 
 var _ RemoteCache = &S3Cache{}
 
-func (s *S3Cache) Kind() string {
-	return "s3"
-}
-
 func (s *S3Cache) Start(context.Context) error {
-	log.Printf("[%s]\tconfigured to s3://%s/%s", s.Kind(), s.bucket, s.prefix)
+	s.log.Info("start", "bucket", s.bucket, "prefix", s.prefix)
 	return nil
 }
 
 func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, size int64, output io.ReadCloser, err error) {
-	if s.verbose {
-		log.Printf("[%s]\tGet(%q)", s.Kind(), actionID)
-	}
+	s.log.Debug("get", "actionID", actionID)
 	actionKey := s.actionKey(actionID)
 	outputResult, getOutputErr := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.bucket,
@@ -71,19 +64,14 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, si
 }
 
 func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (err error) {
-
 	if size == 0 {
 		if s.SkipZeroBytePuts {
-			if s.verbose {
-				log.Printf("[%s]\tPut(%q, %q, %d bytes): skip", s.Kind(), actionID, outputID, size)
-			}
+			s.log.Debug("put (skip)", "actionID", actionID, "outputID", outputID, "size", size)
 			return nil
 		}
 		body = bytes.NewReader(nil)
 	}
-	if s.verbose {
-		log.Printf("[%s]\tPut(%q, %q, %d bytes)", s.Kind(), actionID, outputID, size)
-	}
+	s.log.Debug("put", "actionID", actionID, "outputID", outputID, "size", size)
 	// The AWS SDK seems to fail to ReadAll the whole Reader sometimes, which leads to SignatueDoesNotMatch errors (and presumably truncated data??), so we read the whole thing into memory. Normally this is memory-inefficient, but since the SDK needs the whole body to compute the signature (namely length), it should be fine. (And hopefully it's not copyying the whole thing again.)
 	buf, err := io.ReadAll(body)
 	if err != nil {
@@ -105,21 +93,18 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 	}, func(options *s3.Options) {
 		options.RetryMaxAttempts = 0 // We cannot perform seek in Body
 	})
-	if err != nil && s.verbose {
-		log.Printf("[%s]\tPut(%q, %q, %d bytes) error: %s", s.Kind(), actionID, outputID, size, err)
+	if err != nil {
 		return err
-	}
-	if s.verbose {
-		log.Printf("[%s]\tPut(%q, %q, %d bytes) done", s.Kind(), actionID, outputID, size)
 	}
 	return
 }
 
 func (s *S3Cache) Close() error {
+	s.log.Info("close")
 	return nil
 }
 
-func NewS3Cache(client s3Client, bucketName string, cacheKey string, verbose bool) *S3Cache {
+func NewS3Cache(client s3Client, bucketName string, cacheKey string) *S3Cache {
 	// get target architecture
 	goarch := os.Getenv("GOARCH")
 	if goarch == "" {
@@ -135,7 +120,7 @@ func NewS3Cache(client s3Client, bucketName string, cacheKey string, verbose boo
 		s3Client: client,
 		bucket:   bucketName,
 		prefix:   prefix,
-		verbose:  verbose,
+		log:      slog.With("kind", "s3"),
 	}
 	return cache
 }

@@ -14,4 +14,4 @@ ADD . /workdir
 RUN cd /workdir && go work init && go work use . && go install ./cmd/go-cacher-s3
 
 # TODO: not sure this affects the EXEC
-ENV GOCACHEPROG="go-cacher-s3 --verbose"
+ENV GOCACHEPROG="go-cacher-s3 -v=1"

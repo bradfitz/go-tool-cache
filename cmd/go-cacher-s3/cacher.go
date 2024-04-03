@@ -8,7 +8,9 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -27,8 +29,7 @@ var userCacheDir, _ = os.UserCacheDir()
 var defaultLocalCacheDir = filepath.Join(userCacheDir, "go-cacher")
 
 var (
-	flagVerbose                = flag.Bool("verbose", false, "be verbose")
-	flagDebug                  = flag.Bool("debug", false, "dump a lot of debug info")
+	flagVerbose                = flag.Int("v", 0, "logging verbosity; 0=error, 1=warn, 2=info, 3=debug")
 	flagCacheKey               = flag.String("cache-key", defaultCacheKey, "cache key")
 	flagLocalCacheDir          = flag.String("local-cache-dir", defaultLocalCacheDir, "local cache directory")
 	flagSkipZeroByteRemotePuts = flag.Bool("skip-zero-byte-remote-puts", false, "skip zero-byte remote puts")
@@ -45,22 +46,26 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	logLevel := slog.Level(*flagVerbose*-4 + 8)
+	slog.Info(fmt.Sprintf("Log level: %d", logLevel))
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+
 	log.Printf("starting cache")
 	var clientLogMode aws.ClientLogMode
-	if flagDebug != nil && *flagDebug {
+	if logLevel >= slog.LevelDebug {
 		clientLogMode = aws.LogRetries | aws.LogRequest
 	}
 	awsConfig, err := config.LoadDefaultConfig(context.TODO(), config.WithClientLogMode(clientLogMode))
 	if err != nil {
 		log.Fatal("S3 cache disabled; failed to load AWS config: ", err)
 	}
-	s3Cacher := cachers.NewS3Cache(s3.NewFromConfig(awsConfig), bucket, *flagCacheKey, *flagVerbose)
+	s3Cacher := cachers.NewS3Cache(s3.NewFromConfig(awsConfig), bucket, *flagCacheKey)
 	s3Cacher.SkipZeroBytePuts = *flagSkipZeroByteRemotePuts
 	proc := cacheproc.NewCacheProc(
 		cachers.NewCombinedCache(
-			cachers.NewSimpleDiskCache(*flagVerbose, *flagLocalCacheDir),
+			cachers.NewSimpleDiskCache(*flagLocalCacheDir),
 			s3Cacher,
-			*flagVerbose,
 		),
 	)
 	if err := proc.Run(ctx); err != nil {
