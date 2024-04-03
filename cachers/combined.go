@@ -16,8 +16,8 @@ import (
 // It also keeps times for the remote cache Download/Uploads
 type CombinedCache struct {
 	log         *slog.Logger
-	localCache  LocalCache
-	remoteCache RemoteCache
+	localCache  *LocalCacheWithCounts
+	remoteCache *RemoteCacheWithCounts
 	putsMetrics *timeKeeper
 	getsMetrics *timeKeeper
 }
@@ -25,17 +25,14 @@ type CombinedCache struct {
 var _ LocalCache = &CombinedCache{}
 
 func NewCombinedCache(localCache LocalCache, remoteCache RemoteCache) LocalCache {
-	cache := &CombinedCache{
-		log:         slog.With("kind", "combined"),
-		localCache:  localCache,
-		remoteCache: remoteCache,
+	return NewLocalCacheStats(&CombinedCache{
+		log: slog.Default().WithGroup("combined"),
+		// TODO: instead of making wrappers, just integrate Counts with the real things
+		localCache:  NewLocalCacheStats(localCache),
+		remoteCache: NewRemoteCacheStats(remoteCache),
 		putsMetrics: newTimeKeeper(),
 		getsMetrics: newTimeKeeper(),
-	}
-	// TODO: this used to be guarded behind a verbose flag. For perf, maybe we should still do that
-	cache.localCache = NewLocalCacheStats(localCache)
-	cache.remoteCache = NewRemoteCacheStats(remoteCache)
-	return NewLocalCacheStats(cache)
+	})
 }
 
 func (l *CombinedCache) Start(ctx context.Context) error {
@@ -54,7 +51,7 @@ func (l *CombinedCache) Start(ctx context.Context) error {
 }
 
 func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, string, error) {
-	l.log.Info("get", "actionID", actionID)
+	l.log.Debug("get", "actionID", actionID)
 	outputID, diskPath, err := l.localCache.Get(ctx, actionID)
 	if err == nil && outputID != "" {
 		return outputID, diskPath, nil
@@ -77,7 +74,7 @@ func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, strin
 }
 
 func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (string, error) {
-	l.log.Info("Put", "actionID", actionID, "outputID", outputID, "size", size)
+	l.log.Debug("put", "actionID", actionID, "outputID", outputID, "size", size)
 	// special case for empty files, nead empty reader
 	// TODO: not sure why/when this would happen
 	// TODO: seems like for disk and s3 at least, Put(..., 0, nil) should work automatically
@@ -117,7 +114,7 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 }
 
 func (l *CombinedCache) Close() error {
-	l.log.Info("Close()")
+	l.log.Info("close")
 	var errAll error
 	if err := l.localCache.Close(); err != nil {
 		errAll = errors.Join(fmt.Errorf("local cache stop failed: %w", err), errAll)

@@ -9,13 +9,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/logging"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 
@@ -36,6 +39,85 @@ var (
 	bucket                     string
 )
 
+// logHandler implements slog.Handler to print logs nicely
+// mostly this was an exercise to use slog, probably not the best choice here TBH
+type logHandler struct {
+	Out    io.Writer
+	Level  slog.Level
+	attrs  []slog.Attr
+	groups []string
+}
+
+func (h *logHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= h.Level
+}
+
+func (h *logHandler) Handle(_ context.Context, r slog.Record) error {
+	s := r.Level.String()[:1]
+	if len(h.groups) > 0 {
+		s += " " + strings.Join(h.groups, ".") + ":"
+	}
+	s += " " + r.Message
+	attrs := h.attrs
+	r.Attrs(func(a slog.Attr) bool {
+		attrs = append(attrs, a)
+		return true
+	})
+	for i, a := range attrs {
+		if i == 0 {
+			s += " {"
+		}
+		s += fmt.Sprintf("%s=%q", a.Key, a.Value)
+		if i < len(attrs)-1 {
+			s += " "
+		} else {
+			s += "}"
+		}
+	}
+	s += "\n"
+	_, err := h.Out.Write([]byte(s))
+	return err
+}
+
+func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &logHandler{
+		Out:    h.Out,
+		Level:  h.Level,
+		attrs:  append(h.attrs, attrs...),
+		groups: h.groups,
+	}
+}
+
+func (h *logHandler) WithGroup(name string) slog.Handler {
+	if h.groups == nil {
+		h.groups = []string{}
+	}
+	return &logHandler{
+		Out:    h.Out,
+		Level:  h.Level,
+		attrs:  h.attrs,
+		groups: append(h.groups, name),
+	}
+}
+
+// Logf allows us to also implement AWS's logging.Logger
+func (h *logHandler) Logf(cls logging.Classification, format string, args ...interface{}) {
+	var l slog.Level
+	switch cls {
+	case logging.Debug:
+		l = slog.LevelDebug
+	case logging.Warn:
+		l = slog.LevelWarn
+	default:
+		l = slog.LevelDebug
+	}
+
+	h.Handle(context.Background(), slog.Record{
+		Level:   l,
+		Message: fmt.Sprintf(format, args...),
+	})
+}
+
 func main() {
 	flag.Parse()
 	if len(flag.Args()) != 1 {
@@ -47,16 +129,20 @@ func main() {
 	defer cancel()
 
 	logLevel := slog.Level(*flagVerbose*-4 + 8)
-	slog.Info(fmt.Sprintf("Log level: %d", logLevel))
+	h := &logHandler{
+		Level: logLevel,
+		Out:   os.Stderr,
+	}
 
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
+	slog.SetDefault(slog.New(h))
 
-	log.Printf("starting cache")
+	slog.Info(fmt.Sprintf("Log level: %s", logLevel))
+	slog.Info("starting cache")
 	var clientLogMode aws.ClientLogMode
 	if logLevel >= slog.LevelDebug {
 		clientLogMode = aws.LogRetries | aws.LogRequest
 	}
-	awsConfig, err := config.LoadDefaultConfig(context.TODO(), config.WithClientLogMode(clientLogMode))
+	awsConfig, err := config.LoadDefaultConfig(context.TODO(), config.WithClientLogMode(clientLogMode), config.WithLogger(h))
 	if err != nil {
 		log.Fatal("S3 cache disabled; failed to load AWS config: ", err)
 	}

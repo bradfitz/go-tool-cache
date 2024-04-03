@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync/atomic"
 )
 
@@ -37,6 +38,7 @@ func (r *RemoteCacheWithCounts) Start(ctx context.Context) error {
 }
 
 func (r *RemoteCacheWithCounts) Close() error {
+	slog.Default().WithGroup("remote").Info("close", "summary", r.Summary())
 	return r.cache.Close()
 }
 
@@ -70,6 +72,7 @@ func (l *LocalCacheWithCounts) Start(ctx context.Context) error {
 }
 
 func (l *LocalCacheWithCounts) Close() error {
+	slog.Default().WithGroup("local").Info("close", "summary", l.Summary())
 	return l.cache.Close()
 }
 

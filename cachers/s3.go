@@ -120,7 +120,7 @@ func NewS3Cache(client s3Client, bucketName string, cacheKey string) *S3Cache {
 		s3Client: client,
 		bucket:   bucketName,
 		prefix:   prefix,
-		log:      slog.With("kind", "s3"),
+		log:      slog.Default().WithGroup("s3"),
 	}
 	return cache
 }

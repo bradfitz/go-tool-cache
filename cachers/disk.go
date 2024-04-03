@@ -30,7 +30,7 @@ type SimpleDiskCache struct {
 func NewSimpleDiskCache(dir string) *SimpleDiskCache {
 	return &SimpleDiskCache{
 		dir: dir,
-		log: slog.With("kind", "disk"),
+		log: slog.Default().WithGroup("disk"),
 	}
 }
 
