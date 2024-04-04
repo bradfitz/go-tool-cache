@@ -91,7 +91,8 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 			outputIDMetadataKey: outputID,
 		},
 	}, func(options *s3.Options) {
-		options.RetryMaxAttempts = 0 // We cannot perform seek in Body
+		// TODO: should this really be 1? does that mean retry up to once? or make the call only once? (i.e. no retries)
+		options.RetryMaxAttempts = 1 // We cannot perform seek in Body
 	})
 	if err != nil {
 		return err
@@ -115,6 +116,7 @@ func NewS3Cache(client s3Client, bucketName string, cacheKey string) *S3Cache {
 	if goos == "" {
 		goos = runtime.GOOS
 	}
+	// TOOD: I don't love how "cache" is in here
 	prefix := fmt.Sprintf("cache/%s/%s/%s", cacheKey, goarch, goos)
 	cache := &S3Cache{
 		s3Client: client,

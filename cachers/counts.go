@@ -31,14 +31,24 @@ type LocalCacheWithCounts struct {
 type RemoteCacheWithCounts struct {
 	Counts
 	cache RemoteCache
+	Name  string
 }
 
 func (r *RemoteCacheWithCounts) Start(ctx context.Context) error {
+	name := r.Name
+	if name == "" {
+		name = "remote"
+	}
+	slog.Default().WithGroup(name).Info("start")
 	return r.cache.Start(ctx)
 }
 
 func (r *RemoteCacheWithCounts) Close() error {
-	slog.Default().WithGroup("remote").Info("close", "summary", r.Summary())
+	name := r.Name
+	if name == "" {
+		name = "remote"
+	}
+	slog.Default().WithGroup(name).Info("close", "summary", r.Summary())
 	return r.cache.Close()
 }
 

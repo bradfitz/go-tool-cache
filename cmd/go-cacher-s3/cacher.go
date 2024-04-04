@@ -32,11 +32,12 @@ var userCacheDir, _ = os.UserCacheDir()
 var defaultLocalCacheDir = filepath.Join(userCacheDir, "go-cacher")
 
 var (
-	flagVerbose                = flag.Int("v", 0, "logging verbosity; 0=error, 1=warn, 2=info, 3=debug")
-	flagCacheKey               = flag.String("cache-key", defaultCacheKey, "cache key")
-	flagLocalCacheDir          = flag.String("local-cache-dir", defaultLocalCacheDir, "local cache directory")
-	flagSkipZeroByteRemotePuts = flag.Bool("skip-zero-byte-remote-puts", false, "skip zero-byte remote puts")
-	bucket                     string
+	flagVerbose       = flag.Int("v", 0, "logging verbosity; 0=error, 1=warn, 2=info, 3=debug, 4=trace")
+	flagCacheKey      = flag.String("cache-key", defaultCacheKey, "cache key")
+	flagLocalCacheDir = flag.String("local-cache-dir", defaultLocalCacheDir, "local cache directory")
+	bucket            string
+	flagQueueLen      = flag.Int("queue-len", 0, "length of the queue for async s3 cache (0=synchronous)")
+	flagWorkers       = flag.Int("workers", 1, "number of workers for async s3 cache (1=synchronous)")
 )
 
 // logHandler implements slog.Handler to print logs nicely
@@ -118,6 +119,8 @@ func (h *logHandler) Logf(cls logging.Classification, format string, args ...int
 	})
 }
 
+var levelTrace = slog.Level(slog.LevelDebug - 4)
+
 func main() {
 	flag.Parse()
 	if len(flag.Args()) != 1 {
@@ -139,19 +142,22 @@ func main() {
 	slog.Info(fmt.Sprintf("Log level: %s", logLevel))
 	slog.Info("starting cache")
 	var clientLogMode aws.ClientLogMode
-	if logLevel >= slog.LevelDebug {
+	if logLevel <= levelTrace {
 		clientLogMode = aws.LogRetries | aws.LogRequest
 	}
 	awsConfig, err := config.LoadDefaultConfig(context.TODO(), config.WithClientLogMode(clientLogMode), config.WithLogger(h))
 	if err != nil {
 		log.Fatal("S3 cache disabled; failed to load AWS config: ", err)
 	}
-	s3Cacher := cachers.NewS3Cache(s3.NewFromConfig(awsConfig), bucket, *flagCacheKey)
-	s3Cacher.SkipZeroBytePuts = *flagSkipZeroByteRemotePuts
+	// TODO: maybe an option to use the async s3 cache vs the sync one?
 	proc := cacheproc.NewCacheProc(
-		cachers.NewCombinedCache(
+		cachers.NewDiskAsyncS3Cache(
 			cachers.NewSimpleDiskCache(*flagLocalCacheDir),
-			s3Cacher,
+			s3.NewFromConfig(awsConfig),
+			bucket,
+			*flagCacheKey,
+			*flagQueueLen,
+			*flagWorkers,
 		),
 	)
 	if err := proc.Run(ctx); err != nil {
