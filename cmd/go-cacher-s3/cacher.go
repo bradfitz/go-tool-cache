@@ -161,6 +161,7 @@ func main() {
 		),
 	)
 	if err := proc.Run(ctx); err != nil {
-		log.Fatal(err)
+		slog.Error(err.Error())
+		os.Exit(1)
 	}
 }

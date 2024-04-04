@@ -66,6 +66,27 @@ func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
 		return fmt.Errorf("remote cache start failed: %w", err)
 	}
 
+	c.log.Info("probing remote cache")
+	probeStr := "_probe"
+	err = c.remoteGetCache.Put(ctx, probeStr, probeStr, int64(len([]byte(probeStr))), bytes.NewReader([]byte(probeStr)))
+	if err != nil {
+		c.localCache.Close()
+		c.remoteGetCache.Close()
+		return fmt.Errorf("remote cache probe put failed: %w", err)
+	}
+	_, sz, _, err := c.remoteGetCache.Get(ctx, probeStr)
+	if err != nil {
+		c.localCache.Close()
+		c.remoteGetCache.Close()
+		return fmt.Errorf("remote cache probe get failed: %w", err)
+	}
+	if sz != int64(len([]byte(probeStr))) {
+		c.localCache.Close()
+		c.remoteGetCache.Close()
+		return fmt.Errorf("remote cache probe get size mismatch: expected %d, got %d", len([]byte(probeStr)), sz)
+	}
+	c.log.Info("probe success")
+
 	c.remoteWG.Add(c.nWorkers)
 	for i := 0; i < c.nWorkers; i++ {
 		go func() {

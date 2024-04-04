@@ -90,9 +90,6 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 		Metadata: map[string]string{
 			outputIDMetadataKey: outputID,
 		},
-	}, func(options *s3.Options) {
-		// TODO: should this really be 1? does that mean retry up to once? or make the call only once? (i.e. no retries)
-		options.RetryMaxAttempts = 1 // We cannot perform seek in Body
 	})
 	if err != nil {
 		return err
