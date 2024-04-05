@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/logging"
@@ -26,14 +27,14 @@ import (
 	"github.com/bradfitz/go-tool-cache/cachers"
 )
 
-const defaultCacheKey = "v1"
+const defaultS3Prefix = "go-cache"
 
 var userCacheDir, _ = os.UserCacheDir()
 var defaultLocalCacheDir = filepath.Join(userCacheDir, "go-cacher")
 
 var (
 	flagVerbose       = flag.Int("v", 0, "logging verbosity; 0=error, 1=warn, 2=info, 3=debug, 4=trace")
-	flagCacheKey      = flag.String("cache-key", defaultCacheKey, "cache key")
+	flagS3Prefix      = flag.String("s3-prefix", defaultS3Prefix, "s3 prefix")
 	flagLocalCacheDir = flag.String("local-cache-dir", defaultLocalCacheDir, "local cache directory")
 	bucket            string
 	flagQueueLen      = flag.Int("queue-len", 0, "length of the queue for async s3 cache (0=synchronous)")
@@ -150,18 +151,40 @@ func main() {
 		log.Fatal("S3 cache disabled; failed to load AWS config: ", err)
 	}
 	// TODO: maybe an option to use the async s3 cache vs the sync one?
-	proc := cacheproc.NewCacheProc(
-		cachers.NewDiskAsyncS3Cache(
-			cachers.NewSimpleDiskCache(*flagLocalCacheDir),
-			s3.NewFromConfig(awsConfig),
-			bucket,
-			*flagCacheKey,
-			*flagQueueLen,
-			*flagWorkers,
-		),
+	diskCacher := cachers.NewDiskCache(*flagLocalCacheDir)
+	cacher := cachers.NewDiskAsyncS3Cache(
+		diskCacher,
+		s3.NewFromConfig(awsConfig),
+		bucket,
+		*flagS3Prefix,
+		*flagQueueLen,
+		*flagWorkers,
 	)
+	proc := cacheproc.NewCacheProc(cacher)
 	if err := proc.Run(ctx); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+	if logLevel <= slog.LevelInfo {
+		fmt.Fprintln(os.Stderr, "disk stats: \n"+diskCacher.Counts.Summary())
+		fmt.Fprintln(os.Stderr, "s3 stats: \n"+cacher.Counts.Summary())
+		// bytes/ms -> MB/s
+		const scale = 1_000_000 / 1_000
+		printHistogram(os.Stderr, "S3 Get MB/s", cacher.HistS3GetBytesPerMS, scale)
+		printHistogram(os.Stderr, "S3 Put MB/s", cacher.HistS3PutBytesPerMS, scale)
+	}
+}
+
+// yoinked from https://github.com/hashicorp/raft-wal/blob/main/bench/main.go#L118
+func printHistogram(f io.Writer, name string, h *hdrhistogram.Histogram, scale float64) {
+	fmt.Fprintf(f, "\n==> %s\n", name)
+	fmt.Fprintf(f, "  count    mean     p50     p99   p99.9     max\n")
+	fmt.Fprintf(f, " %6d  %6.0f  %6f  %6f  %6f  %6f\n",
+		h.TotalCount(),
+		h.Mean()/float64(scale),
+		float64(h.ValueAtPercentile(50))/scale,
+		float64(h.ValueAtPercentile(99))/scale,
+		float64(h.ValueAtPercentile(99.9))/scale,
+		float64(h.Max())/scale,
+	)
 }

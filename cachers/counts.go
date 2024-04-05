@@ -10,6 +10,7 @@ import (
 
 // Counts keeps counts cache events
 type Counts struct {
+	// TODO: not sure why these need to be atomic
 	gets      atomic.Int64
 	hits      atomic.Int64
 	misses    atomic.Int64
@@ -26,55 +27,6 @@ func (c *Counts) Summary() string {
 type LocalCacheWithCounts struct {
 	Counts
 	cache LocalCache
-}
-
-type RemoteCacheWithCounts struct {
-	Counts
-	cache RemoteCache
-	Name  string
-}
-
-func (r *RemoteCacheWithCounts) Start(ctx context.Context) error {
-	name := r.Name
-	if name == "" {
-		name = "remote"
-	}
-	slog.Default().WithGroup(name).Info("start")
-	return r.cache.Start(ctx)
-}
-
-func (r *RemoteCacheWithCounts) Close() error {
-	name := r.Name
-	if name == "" {
-		name = "remote"
-	}
-	slog.Default().WithGroup(name).Info("close", "summary", r.Summary())
-	return r.cache.Close()
-}
-
-func (r *RemoteCacheWithCounts) Get(ctx context.Context, actionID string) (outputID string, size int64, output io.ReadCloser, err error) {
-	r.gets.Add(1)
-	outputID, size, output, err = r.cache.Get(ctx, actionID)
-	if err != nil {
-		r.getErrors.Add(1)
-		return
-	}
-	if outputID == "" {
-		r.misses.Add(1)
-		return
-	}
-	r.hits.Add(1)
-	return
-}
-
-func (r *RemoteCacheWithCounts) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (err error) {
-	err = r.cache.Put(ctx, actionID, outputID, size, body)
-	if err != nil {
-		r.putErrors.Add(1)
-		return
-	}
-	r.puts.Add(1)
-	return
 }
 
 func (l *LocalCacheWithCounts) Start(ctx context.Context) error {
@@ -117,11 +69,4 @@ func NewLocalCacheStats(cache LocalCache) *LocalCacheWithCounts {
 	}
 }
 
-func NewRemoteCacheStats(cache RemoteCache) *RemoteCacheWithCounts {
-	return &RemoteCacheWithCounts{
-		cache: cache,
-	}
-}
-
 var _ LocalCache = &LocalCacheWithCounts{}
-var _ RemoteCache = &RemoteCacheWithCounts{}

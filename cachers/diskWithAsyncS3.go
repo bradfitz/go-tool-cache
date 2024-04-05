@@ -10,7 +10,9 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 )
@@ -23,19 +25,20 @@ type putWork struct {
 }
 
 type DiskAsyncS3Cache struct {
-	log         *slog.Logger
-	localCache  *LocalCacheWithCounts
-	s3Client    s3Client
-	bucketName  string
-	s3Prefix    string
-	remoteWork  chan putWork
-	remoteWG    *sync.WaitGroup
-	putsMetrics *timeKeeper
-	getsMetrics *timeKeeper
-	nWorkers    int
+	Counts
+	log                 *slog.Logger
+	diskCache           *DiskCache
+	s3Client            s3Client
+	bucketName          string
+	s3Prefix            string
+	remoteWork          chan putWork
+	remoteWG            *sync.WaitGroup
+	HistS3GetMS         *hdrhistogram.Histogram
+	HistS3PutMS         *hdrhistogram.Histogram
+	HistS3GetBytesPerMS *hdrhistogram.Histogram
+	HistS3PutBytesPerMS *hdrhistogram.Histogram
+	nWorkers            int
 }
-
-var _ LocalCache = &DiskAsyncS3Cache{}
 
 const (
 	outputIDMetadataKey = "outputid"
@@ -46,8 +49,8 @@ type s3Client interface {
 	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 }
 
-func NewDiskAsyncS3Cache(localCache LocalCache, client s3Client, bucketName string, s3Prefix string, queueLen int, nWorkers int) LocalCache {
-	return NewLocalCacheStats(&DiskAsyncS3Cache{
+func NewDiskAsyncS3Cache(diskCache *DiskCache, client s3Client, bucketName string, s3Prefix string, queueLen int, nWorkers int) *DiskAsyncS3Cache {
+	return &DiskAsyncS3Cache{
 		log:        slog.Default().WithGroup("DiskAsyncS3"),
 		remoteWork: make(chan putWork, queueLen),
 		remoteWG:   &sync.WaitGroup{},
@@ -58,14 +61,18 @@ func NewDiskAsyncS3Cache(localCache LocalCache, client s3Client, bucketName stri
 		s3Prefix: s3Prefix,
 		// note: we initialize remoteWG in Start
 		// TODO: instead of making wrappers, just integrate Counts with the real things
-		localCache:  NewLocalCacheStats(localCache),
-		putsMetrics: newTimeKeeper(),
-		getsMetrics: newTimeKeeper(),
-	})
+		diskCache: diskCache,
+		// TODO: tune; these are guesses
+		HistS3GetMS: hdrhistogram.New(1, 1_000_000_000, 3),
+		HistS3PutMS: hdrhistogram.New(1, 1_000_000_000, 3),
+		// 1 GB/s would be a lot
+		HistS3GetBytesPerMS: hdrhistogram.New(1, 1_000_000_000, 3),
+		HistS3PutBytesPerMS: hdrhistogram.New(1, 1_000_000_000, 3),
+	}
 }
 
 func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
-	err := c.localCache.Start(ctx)
+	err := c.diskCache.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("local cache start failed: %w", err)
 	}
@@ -74,16 +81,16 @@ func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
 	probeStr := "_probe"
 	err = c.s3Put(ctx, probeStr, probeStr, int64(len([]byte(probeStr))), bytes.NewReader([]byte(probeStr)))
 	if err != nil {
-		c.localCache.Close()
+		c.diskCache.Close()
 		return fmt.Errorf("remote cache probe put failed: %w", err)
 	}
 	_, sz, _, err := c.s3Get(ctx, probeStr)
 	if err != nil {
-		c.localCache.Close()
+		c.diskCache.Close()
 		return fmt.Errorf("remote cache probe get failed: %w", err)
 	}
 	if sz != int64(len([]byte(probeStr))) {
-		c.localCache.Close()
+		c.diskCache.Close()
 		return fmt.Errorf("remote cache probe get size mismatch: expected %d, got %d", len([]byte(probeStr)), sz)
 	}
 	c.log.Info("probe success")
@@ -96,7 +103,7 @@ func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
 				select {
 				case w, ok := <-c.remoteWork:
 					if !ok {
-						c.log.Debug("s3 worker done by closed work channel")
+						c.log.Info("s3 worker done by closed work channel")
 						return
 					}
 					c.log.Debug("s3 put", "actionID", w.actionID, "outputID", w.outputID, "size", w.size, "diskPath", w.diskPath)
@@ -107,6 +114,7 @@ func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
 						f, err := os.Open(w.diskPath)
 						// TODO: currently we just log errors, but maybe we want a mode that fails
 						if err != nil {
+							// TODO: not sure if this shouuld be counted in Counts; those are for s3
 							c.log.Error("opening file for remote", "path", w.diskPath, "err", err)
 							continue
 						}
@@ -116,28 +124,28 @@ func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
 					// TODO: not 100% on the lifetime of this context; is it until everything is started? or until Close? we may want a separate Context for workers so that they can be stopped before all work is done (i.e., on Close)
 					err := c.s3Put(ctx, w.actionID, w.outputID, w.size, r)
 					if err != nil {
-						c.log.Error("putting to remote", "actionID", w.actionID, "outputID", w.outputID, "err", err)
+						c.log.Info("putting to remote", "actionID", w.actionID, "outputID", w.outputID, "err", err)
 						continue
 					}
 				case <-ctx.Done():
-					c.log.Debug("s3 worker done by ctx.Done")
+					c.log.Info("s3 worker done by ctx.Done")
 					return
 				}
 			}
 		}()
 	}
 
-	c.putsMetrics.Start(ctx)
-	c.getsMetrics.Start(ctx)
 	return nil
 }
 
 func (c *DiskAsyncS3Cache) s3Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) error {
+	c.Counts.puts.Add(1)
 	if size == 0 {
 		body = bytes.NewReader(nil)
 	}
 	c.log.Debug("s3 put", "actionID", actionID, "outputID", outputID, "size", size)
 	actionKey := c.actionKey(actionID)
+	start := time.Now()
 	_, err := c.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        &c.bucketName,
 		Key:           &actionKey,
@@ -147,33 +155,51 @@ func (c *DiskAsyncS3Cache) s3Put(ctx context.Context, actionID, outputID string,
 			outputIDMetadataKey: outputID,
 		},
 	})
-	return err
+	dur := time.Since(start)
+	if err != nil {
+		c.Counts.putErrors.Add(1)
+		return err
+	}
+	// TODO: I'm assuming these are safe from multiple goroutines
+	c.HistS3PutMS.RecordValue(dur.Milliseconds())
+	c.HistS3PutBytesPerMS.RecordValue(size / dur.Milliseconds())
+	c.Counts.puts.Add(1)
+	return nil
 }
 
 func (c *DiskAsyncS3Cache) s3Get(ctx context.Context, actionID string) (outputID string, size int64, output io.ReadCloser, err error) {
 	c.log.Debug("s3 get", "actionID", actionID)
+	c.Counts.gets.Add(1)
 	actionKey := c.actionKey(actionID)
+	start := time.Now()
 	outputResult, getOutputErr := c.s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &c.bucketName,
 		Key:    &actionKey,
 	})
+	dur := time.Since(start)
 	if isS3NotFoundError(getOutputErr) {
+		c.Counts.misses.Add(1)
 		// TODO: count miss
 		return "", 0, nil, nil
 	} else if getOutputErr != nil {
+		c.Counts.getErrors.Add(1)
 		return "", 0, nil, fmt.Errorf("unexpected S3 get for %s:  %v", actionKey, getOutputErr)
 	}
 	contentSize := outputResult.ContentLength
 	outputID, ok := outputResult.Metadata[outputIDMetadataKey]
 	if !ok || outputID == "" {
+		c.Counts.getErrors.Add(1)
 		return "", 0, nil, fmt.Errorf("outputId not found in metadata")
 	}
+	c.HistS3GetMS.RecordValue(dur.Milliseconds())
+	c.HistS3GetBytesPerMS.RecordValue(size / dur.Milliseconds())
+	c.Counts.hits.Add(1)
 	return outputID, *contentSize, outputResult.Body, nil
 }
 
 func (c *DiskAsyncS3Cache) Get(ctx context.Context, actionID string) (string, string, error) {
 	c.log.Debug("get", "actionID", actionID)
-	outputID, diskPath, err := c.localCache.Get(ctx, actionID)
+	outputID, diskPath, err := c.diskCache.Get(ctx, actionID)
 	if err == nil && outputID != "" {
 		return outputID, diskPath, nil
 	}
@@ -181,13 +207,11 @@ func (c *DiskAsyncS3Cache) Get(ctx context.Context, actionID string) (string, st
 	if err != nil {
 		return "", "", err
 	}
+	// TODO: document when/why this happens
 	if outputID == "" {
 		return "", "", nil
 	}
-	diskPath, err = c.getsMetrics.DoWithMeasure(size, func() (string, error) {
-		defer output.Close()
-		return c.localCache.Put(ctx, actionID, outputID, size, output)
-	})
+	diskPath, err = c.diskCache.Put(ctx, actionID, outputID, size, output)
 	if err != nil {
 		return "", "", err
 	}
@@ -203,7 +227,7 @@ func (c *DiskAsyncS3Cache) Put(ctx context.Context, actionID, outputID string, s
 	}
 
 	// TODO: restore metrics
-	diskPath, err := c.localCache.Put(ctx, actionID, outputID, size, body)
+	diskPath, err := c.diskCache.Put(ctx, actionID, outputID, size, body)
 	if err != nil {
 		return "", fmt.Errorf("local cache put failed: %w", err)
 	}
@@ -219,20 +243,13 @@ func (c *DiskAsyncS3Cache) Put(ctx context.Context, actionID, outputID string, s
 func (c *DiskAsyncS3Cache) Close() error {
 	c.log.Info("close")
 	var errAll error
-	if err := c.localCache.Close(); err != nil {
+	if err := c.diskCache.Close(); err != nil {
 		errAll = errors.Join(fmt.Errorf("local cache stop failed: %w", err), errAll)
 	}
 	// TODO: this means we wait till all the remote workers finish; we may want to just abandon the rest of the work (or offer a mode)
 	close(c.remoteWork)
+	c.log.Info("waiting for s3 workers to finish")
 	c.remoteWG.Wait()
-	if err := c.putsMetrics.Stop(); err != nil {
-		errAll = errors.Join(fmt.Errorf("puts metrics stop failed: %w", err), errAll)
-	}
-	if err := c.getsMetrics.Stop(); err != nil {
-		errAll = errors.Join(fmt.Errorf("gets metrics stop failed: %w", err), errAll)
-	}
-	// TODO: pull out the metrics into log KV
-	c.log.Info(fmt.Sprintf("Downloads: %s, Uploads %s", c.getsMetrics.Summary(), c.putsMetrics.Summary()))
 	return errAll
 }
 
