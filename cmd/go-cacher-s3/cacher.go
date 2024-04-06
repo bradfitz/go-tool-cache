@@ -178,8 +178,8 @@ func main() {
 // yoinked from https://github.com/hashicorp/raft-wal/blob/main/bench/main.go#L118
 func printHistogram(f io.Writer, name string, h *hdrhistogram.Histogram, scale float64) {
 	fmt.Fprintf(f, "\n==> %s\n", name)
-	fmt.Fprintf(f, "  count    mean     p50     p99   p99.9     max\n")
-	fmt.Fprintf(f, " %6d  %6.0f  %6f  %6f  %6f  %6f\n",
+	fmt.Fprintf(f, "\tcount\tmean\tp50\tp99\tp99.9\tmax\n")
+	fmt.Fprintf(f, "\t%6d\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\n",
 		h.TotalCount(),
 		h.Mean()/float64(scale),
 		float64(h.ValueAtPercentile(50))/scale,

@@ -166,7 +166,7 @@ func (c *DiskAsyncS3Cache) s3Put(ctx context.Context, actionID, outputID string,
 	return nil
 }
 
-func (c *DiskAsyncS3Cache) s3Get(ctx context.Context, actionID string) (outputID string, size int64, output io.ReadCloser, err error) {
+func (c *DiskAsyncS3Cache) s3Get(ctx context.Context, actionID string) (string, int64, io.ReadCloser, error) {
 	c.log.Debug("s3 get", "actionID", actionID)
 	c.Counts.gets.Add(1)
 	actionKey := c.actionKey(actionID)
@@ -184,16 +184,17 @@ func (c *DiskAsyncS3Cache) s3Get(ctx context.Context, actionID string) (outputID
 		c.Counts.getErrors.Add(1)
 		return "", 0, nil, fmt.Errorf("unexpected S3 get for %s:  %v", actionKey, getOutputErr)
 	}
-	contentSize := outputResult.ContentLength
+	size := *outputResult.ContentLength
 	outputID, ok := outputResult.Metadata[outputIDMetadataKey]
 	if !ok || outputID == "" {
 		c.Counts.getErrors.Add(1)
 		return "", 0, nil, fmt.Errorf("outputId not found in metadata")
 	}
 	c.HistS3GetMS.RecordValue(dur.Milliseconds())
+	c.log.Debug(fmt.Sprintf("bytes per ms: %d bytes / %d ms = %d B/ms", size, dur.Milliseconds(), size/dur.Milliseconds()))
 	c.HistS3GetBytesPerMS.RecordValue(size / dur.Milliseconds())
 	c.Counts.hits.Add(1)
-	return outputID, *contentSize, outputResult.Body, nil
+	return outputID, size, outputResult.Body, nil
 }
 
 func (c *DiskAsyncS3Cache) Get(ctx context.Context, actionID string) (string, string, error) {
