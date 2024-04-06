@@ -163,7 +163,6 @@ func (c *DiskAsyncS3Cache) s3Put(ctx context.Context, actionID, outputID string,
 	// TODO: I'm assuming these are safe from multiple goroutines
 	c.HistS3PutMS.RecordValue(dur.Milliseconds())
 	c.HistS3PutBytesPerMS.RecordValue(size / dur.Milliseconds())
-	c.Counts.puts.Add(1)
 	return nil
 }
 
