@@ -83,7 +83,7 @@ func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
 	}
 
 	c.log.Info("probing remote cache")
-	probeStr := "_probe"
+	probeStr := c.s3Prefix + "/_probe"
 	err = c.s3Put(ctx, probeStr, probeStr, int64(len([]byte(probeStr))), bytes.NewReader([]byte(probeStr)))
 	if err != nil {
 		c.diskCache.Close()
