@@ -40,6 +40,7 @@ var (
 	bucket            string
 	flagQueueLen      = flag.Int("queue-len", 0, "length of the queue for async s3 cache (0=synchronous)")
 	flagWorkers       = flag.Int("workers", 1, "number of workers for async s3 cache (1=synchronous)")
+	flagMetCSV        = flag.String("metrics-csv", "", "write s3 Get/Put metrics to a CSV file (empty=disabled)")
 )
 
 // logHandler implements slog.Handler to print logs nicely
@@ -166,21 +167,36 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
+	// bytes/ms -> MB/s
+	const scale = 1_000_000 / 1_000
 	if logLevel <= slog.LevelInfo {
 		fmt.Fprintln(os.Stderr, "disk stats: \n"+diskCacher.Counts.Summary())
 		fmt.Fprintln(os.Stderr, "s3 stats: \n"+cacher.Counts.Summary())
-		// bytes/ms -> MB/s
-		const scale = 1_000_000 / 1_000
-		printHistogram(os.Stderr, "S3 Get MB/s", cacher.HistS3GetBytesPerMS, cacher.SumS3Get.Load(), scale)
-		printHistogram(os.Stderr, "S3 Put MB/s", cacher.HistS3PutBytesPerMS, cacher.SumS3Put.Load(), scale)
+		fmt.Fprintln(os.Stderr, "S3 Get MB/s")
+		fmt.Fprintf(os.Stderr, "count\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
+		printHistogramRow(os.Stderr, cacher.HistS3GetBytesPerMS, cacher.SumS3Get.Load(), scale)
+		fmt.Fprintln(os.Stderr, "S3 Put MB/s")
+		fmt.Fprintf(os.Stderr, "count\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
+		printHistogramRow(os.Stderr, cacher.HistS3PutBytesPerMS, cacher.SumS3Put.Load(), scale)
+	}
+	if *flagMetCSV != "" {
+		f, err := os.Create(*flagMetCSV)
+		fmt.Fprintf(f, "count\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
+		if err != nil {
+			slog.Error(fmt.Sprintf("failed to create metrics file: %v", err))
+		} else {
+			defer f.Close()
+			fmt.Fprintf(f, "S3 Get MB/s\t")
+			printHistogramRow(f, cacher.HistS3GetBytesPerMS, cacher.SumS3Get.Load(), scale)
+			fmt.Fprintf(f, "S3 Put MB/s\t")
+			printHistogramRow(f, cacher.HistS3PutBytesPerMS, cacher.SumS3Put.Load(), scale)
+		}
+
 	}
 }
 
-// yoinked from https://github.com/hashicorp/raft-wal/blob/main/bench/main.go#L118
-func printHistogram(f io.Writer, name string, h *hdrhistogram.Histogram, totalDur time.Duration, scale float64) {
-	fmt.Fprintf(f, "\n==> %s\n", name)
-	fmt.Fprintf(f, "\tcount\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
-	fmt.Fprintf(f, "\t%6d\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\n",
+func printHistogramRow(f io.Writer, h *hdrhistogram.Histogram, totalDur time.Duration, scale float64) {
+	fmt.Fprintf(f, "%6d\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\n",
 		h.TotalCount(),
 		h.Mean()/float64(scale),
 		float64(h.ValueAtPercentile(50))/scale,
