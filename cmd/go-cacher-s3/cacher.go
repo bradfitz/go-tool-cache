@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -170,21 +171,23 @@ func main() {
 		fmt.Fprintln(os.Stderr, "s3 stats: \n"+cacher.Counts.Summary())
 		// bytes/ms -> MB/s
 		const scale = 1_000_000 / 1_000
-		printHistogram(os.Stderr, "S3 Get MB/s", cacher.HistS3GetBytesPerMS, scale)
-		printHistogram(os.Stderr, "S3 Put MB/s", cacher.HistS3PutBytesPerMS, scale)
+		printHistogram(os.Stderr, "S3 Get MB/s", cacher.HistS3GetBytesPerMS, cacher.SumS3Get.Load(), scale)
+		printHistogram(os.Stderr, "S3 Put MB/s", cacher.HistS3PutBytesPerMS, cacher.SumS3Put.Load(), scale)
 	}
 }
 
 // yoinked from https://github.com/hashicorp/raft-wal/blob/main/bench/main.go#L118
-func printHistogram(f io.Writer, name string, h *hdrhistogram.Histogram, scale float64) {
+func printHistogram(f io.Writer, name string, h *hdrhistogram.Histogram, totalDur time.Duration, scale float64) {
 	fmt.Fprintf(f, "\n==> %s\n", name)
-	fmt.Fprintf(f, "\tcount\tmean\tp50\tp99\tp99.9\tmax\n")
-	fmt.Fprintf(f, "\t%6d\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\n",
+	fmt.Fprintf(f, "\tcount\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
+	fmt.Fprintf(f, "\t%6d\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\n",
 		h.TotalCount(),
 		h.Mean()/float64(scale),
 		float64(h.ValueAtPercentile(50))/scale,
 		float64(h.ValueAtPercentile(99))/scale,
 		float64(h.ValueAtPercentile(99.9))/scale,
 		float64(h.Max())/scale,
+		// TODO: might be a better way to integrate this into the histogram. The histograms have a lot of outliers at 0 bytes, so we need to calculate an average from the total bytes. Maybe our byte counts should be the whole S3 request, not just our data, but I'm not sure how to calculate that.
+		totalDur.Seconds()*scale/float64(h.TotalCount()),
 	)
 }
