@@ -12,10 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
-	"go.uber.org/atomic"
 )
 
 type putWork struct {
@@ -27,22 +25,14 @@ type putWork struct {
 
 type DiskAsyncS3Cache struct {
 	Counts
-	log         *slog.Logger
-	diskCache   *DiskCache
-	s3Client    s3Client
-	bucketName  string
-	s3Prefix    string
-	remoteWork  chan putWork
-	remoteWG    *sync.WaitGroup
-	HistS3GetMS *hdrhistogram.Histogram
-	// total time spent in S3 gets
-	SumS3Get    atomic.Duration
-	HistS3PutMS *hdrhistogram.Histogram
-	// total time spent in S3 puts
-	SumS3Put            atomic.Duration
-	HistS3GetBytesPerMS *hdrhistogram.Histogram
-	HistS3PutBytesPerMS *hdrhistogram.Histogram
-	nWorkers            int
+	log        *slog.Logger
+	diskCache  *DiskCache
+	s3Client   s3Client
+	bucketName string
+	s3Prefix   string
+	remoteWork chan putWork
+	remoteWG   *sync.WaitGroup
+	nWorkers   int
 }
 
 const (
@@ -67,12 +57,6 @@ func NewDiskAsyncS3Cache(diskCache *DiskCache, client s3Client, bucketName strin
 		// note: we initialize remoteWG in Start
 		// TODO: instead of making wrappers, just integrate Counts with the real things
 		diskCache: diskCache,
-		// TODO: tune; these are guesses
-		HistS3GetMS: hdrhistogram.New(1, 1_000_000_000, 3),
-		HistS3PutMS: hdrhistogram.New(1, 1_000_000_000, 3),
-		// 1 GB/s would be a lot
-		HistS3GetBytesPerMS: hdrhistogram.New(1, 1_000_000_000, 3),
-		HistS3PutBytesPerMS: hdrhistogram.New(1, 1_000_000_000, 3),
 	}
 }
 
@@ -165,10 +149,8 @@ func (c *DiskAsyncS3Cache) s3Put(ctx context.Context, actionID, outputID string,
 		c.Counts.putErrors.Add(1)
 		return err
 	}
-	// TODO: I'm assuming these are safe from multiple goroutines
-	c.HistS3PutMS.RecordValue(dur.Milliseconds())
-	c.HistS3PutBytesPerMS.RecordValue(size / dur.Milliseconds())
-	c.SumS3Put.Add(dur)
+	c.totalPutBytes.Add(size)
+	c.totalPutDur.Add(dur)
 	return nil
 }
 
@@ -196,10 +178,9 @@ func (c *DiskAsyncS3Cache) s3Get(ctx context.Context, actionID string) (string, 
 		c.Counts.getErrors.Add(1)
 		return "", 0, nil, fmt.Errorf("outputId not found in metadata")
 	}
-	c.HistS3GetMS.RecordValue(dur.Milliseconds())
 	c.log.Debug(fmt.Sprintf("bytes per ms: %d bytes / %d ms = %d B/ms", size, dur.Milliseconds(), size/dur.Milliseconds()))
-	c.HistS3GetBytesPerMS.RecordValue(size / dur.Milliseconds())
-	c.SumS3Get.Add(dur)
+	c.totalGetBytes.Add(size)
+	c.totalGetDur.Add(dur)
 	c.Counts.hits.Add(1)
 	return outputID, size, outputResult.Body, nil
 }

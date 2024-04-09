@@ -15,9 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go/logging"
@@ -167,43 +165,18 @@ func main() {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
-	// bytes/ms -> MB/s
-	const scale = 1_000_000 / 1_000
 	if logLevel <= slog.LevelInfo {
 		fmt.Fprintln(os.Stderr, "disk stats: \n"+diskCacher.Counts.Summary())
 		fmt.Fprintln(os.Stderr, "s3 stats: \n"+cacher.Counts.Summary())
-		fmt.Fprintln(os.Stderr, "S3 Get MB/s")
-		fmt.Fprintf(os.Stderr, "count\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
-		printHistogramRow(os.Stderr, cacher.HistS3GetBytesPerMS, cacher.SumS3Get.Load(), scale)
-		fmt.Fprintln(os.Stderr, "S3 Put MB/s")
-		fmt.Fprintf(os.Stderr, "count\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
-		printHistogramRow(os.Stderr, cacher.HistS3PutBytesPerMS, cacher.SumS3Put.Load(), scale)
 	}
 	if *flagMetCSV != "" {
 		f, err := os.Create(*flagMetCSV)
-		fmt.Fprintf(f, "count\tmean\tp50\tp99\tp99.9\tmax\tthroughput\n")
 		if err != nil {
 			slog.Error(fmt.Sprintf("failed to create metrics file: %v", err))
 		} else {
 			defer f.Close()
-			fmt.Fprintf(f, "S3 Get MB/s\t")
-			printHistogramRow(f, cacher.HistS3GetBytesPerMS, cacher.SumS3Get.Load(), scale)
-			fmt.Fprintf(f, "S3 Put MB/s\t")
-			printHistogramRow(f, cacher.HistS3PutBytesPerMS, cacher.SumS3Put.Load(), scale)
+			cacher.Counts.CSV(f, true)
 		}
 
 	}
-}
-
-func printHistogramRow(f io.Writer, h *hdrhistogram.Histogram, totalDur time.Duration, scale float64) {
-	fmt.Fprintf(f, "%6d\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\t%6.2f\n",
-		h.TotalCount(),
-		h.Mean()/float64(scale),
-		float64(h.ValueAtPercentile(50))/scale,
-		float64(h.ValueAtPercentile(99))/scale,
-		float64(h.ValueAtPercentile(99.9))/scale,
-		float64(h.Max())/scale,
-		// TODO: might be a better way to integrate this into the histogram. The histograms have a lot of outliers at 0 bytes, so we need to calculate an average from the total bytes. Maybe our byte counts should be the whole S3 request, not just our data, but I'm not sure how to calculate that.
-		totalDur.Seconds()*scale/float64(h.TotalCount()),
-	)
 }
