@@ -26,13 +26,17 @@ type putWork struct {
 type DiskAsyncS3Cache struct {
 	Counts
 	log        *slog.Logger
-	diskCache  *DiskCache
+	diskCache  LocalCache
 	s3Client   s3Client
 	bucketName string
 	s3Prefix   string
 	remoteWork chan putWork
 	remoteWG   *sync.WaitGroup
 	nWorkers   int
+}
+
+func (c *DiskAsyncS3Cache) GetCounts() *Counts {
+	return &c.Counts
 }
 
 const (
@@ -44,7 +48,7 @@ type s3Client interface {
 	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 }
 
-func NewDiskAsyncS3Cache(diskCache *DiskCache, client s3Client, bucketName string, s3Prefix string, queueLen int, nWorkers int) *DiskAsyncS3Cache {
+func NewDiskAsyncS3Cache(diskCache LocalCache, client s3Client, bucketName string, s3Prefix string, queueLen int, nWorkers int) LocalCache {
 	return &DiskAsyncS3Cache{
 		log:        slog.Default().WithGroup("DiskAsyncS3"),
 		remoteWork: make(chan putWork, queueLen),
@@ -55,7 +59,7 @@ func NewDiskAsyncS3Cache(diskCache *DiskCache, client s3Client, bucketName strin
 		// NOTE: previous incarnations contained the GOARCH and GOOS in the cache key, but I'm pretty sure they need not be separate
 		s3Prefix: s3Prefix,
 		// note: we initialize remoteWG in Start
-		// TODO: instead of making wrappers, just integrate Counts with the real things
+		// TODO: instead of making wrappers, just integrate GetCounts with the real things
 		diskCache: diskCache,
 	}
 }
@@ -103,7 +107,7 @@ func (c *DiskAsyncS3Cache) Start(ctx context.Context) error {
 						f, err := os.Open(w.diskPath)
 						// TODO: currently we just log errors, but maybe we want a mode that fails
 						if err != nil {
-							// TODO: not sure if this shouuld be counted in Counts; those are for s3
+							// TODO: not sure if this shouuld be counted in GetCounts; those are for s3
 							c.log.Error("opening file for remote", "path", w.diskPath, "err", err)
 							continue
 						}

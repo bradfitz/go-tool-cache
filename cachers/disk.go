@@ -28,14 +28,16 @@ type DiskCache struct {
 	log *slog.Logger
 }
 
-func NewDiskCache(dir string) *DiskCache {
+func (c *DiskCache) GetCounts() *Counts {
+	return &c.Counts
+}
+
+func NewDiskCache(dir string) LocalCache {
 	return &DiskCache{
 		dir: dir,
 		log: slog.Default().WithGroup("disk"),
 	}
 }
-
-var _ LocalCache = &DiskCache{}
 
 func (c *DiskCache) Start(context.Context) error {
 	c.log.Info("start", "dir", c.dir)

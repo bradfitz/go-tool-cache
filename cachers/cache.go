@@ -17,4 +17,5 @@ type LocalCache interface {
 	Cache
 	Get(ctx context.Context, actionID string) (outputID, diskPath string, err error)
 	Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, err error)
+	GetCounts() *Counts
 }

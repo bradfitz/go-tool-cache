@@ -83,6 +83,10 @@ type LocalCacheWithCounts struct {
 	cache LocalCache
 }
 
+func (l *LocalCacheWithCounts) GetCounts() *Counts {
+	return &l.Counts
+}
+
 func (l *LocalCacheWithCounts) Start(ctx context.Context) error {
 	return l.cache.Start(ctx)
 }
