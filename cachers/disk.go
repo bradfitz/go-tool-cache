@@ -50,22 +50,22 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 	return ie.OutputID, filepath.Join(dc.Dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
 }
 
-func (dc *DiskCache) OutputFilename(objectID string) string {
-	if len(objectID) < 4 || len(objectID) > 1000 {
+func (dc *DiskCache) OutputFilename(outputID string) string {
+	if len(outputID) < 4 || len(outputID) > 1000 {
 		return ""
 	}
-	for i := range objectID {
-		b := objectID[i]
+	for i := range outputID {
+		b := outputID[i]
 		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
 			continue
 		}
 		return ""
 	}
-	return filepath.Join(dc.Dir, fmt.Sprintf("o-%s", objectID))
+	return filepath.Join(dc.Dir, fmt.Sprintf("o-%s", outputID))
 }
 
-func (dc *DiskCache) Put(ctx context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
-	file := filepath.Join(dc.Dir, fmt.Sprintf("o-%s", objectID))
+func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, _ error) {
+	file := filepath.Join(dc.Dir, fmt.Sprintf("o-%s", outputID))
 
 	// Special case empty files; they're both common and easier to do race-free.
 	if size == 0 {
@@ -86,7 +86,7 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, objectID string, size in
 
 	ij, err := json.Marshal(indexEntry{
 		Version:   1,
-		OutputID:  objectID,
+		OutputID:  outputID,
 		Size:      size,
 		TimeNanos: time.Now().UnixNano(),
 	})
