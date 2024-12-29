@@ -7,7 +7,10 @@
 // the cache interface.
 package wire
 
-import "io"
+import (
+	"io"
+	"time"
+)
 
 // Cmd is a command that can be issued to a child process.
 //
@@ -38,8 +41,8 @@ type Request struct {
 	// ActionID is non-nil for get and puts.
 	ActionID []byte `json:",omitempty"` // or nil if not used
 
-	// ObjectID is set for Type "put" and "output-file".
-	ObjectID []byte `json:",omitempty"` // or nil if not used
+	// OutputID is set for Type "put" and "output-file".
+	OutputID []byte `json:",omitempty"` // or nil if not used
 
 	// Body is the body for "put" requests. It's sent after the JSON object
 	// as a base64-encoded JSON string when BodySize is non-zero.
@@ -76,10 +79,10 @@ type Response struct {
 
 	// For Get requests.
 
-	Miss      bool   `json:",omitempty"` // cache miss
-	OutputID  []byte `json:",omitempty"`
-	Size      int64  `json:",omitempty"`
-	TimeNanos int64  `json:",omitempty"` // TODO(bradfitz): document
+	Miss     bool       `json:",omitempty"` // cache miss
+	OutputID []byte     `json:",omitempty"`
+	Size     int64      `json:",omitempty"`
+	Time     *time.Time `json:",omitempty"` // when the object was put in the cache (optional; used for cache expiration)
 
 	// DiskPath is the absolute path on disk of the ObjectID corresponding
 	// a "get" request's ActionID (on cache hit) or a "put" request's

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -60,14 +61,18 @@ func (dc *SimpleDiskCache) Get(_ context.Context, actionID string) (outputID, di
 		return "", "", nil
 	}
 	if _, err := hex.DecodeString(ie.OutputID); err != nil {
+		log.Printf("Warning: Output ID for action %q: %v", actionID, err)
 		// Protect against malicious non-hex OutputID on disk
 		return "", "", nil
 	}
 	return ie.OutputID, filepath.Join(dc.dir, fmt.Sprintf("o-%v", ie.OutputID)), nil
 }
 
-func (dc *SimpleDiskCache) Put(_ context.Context, actionID, objectID string, size int64, body io.Reader) (diskPath string, _ error) {
-	file := filepath.Join(dc.dir, fmt.Sprintf("o-%s", objectID))
+func (dc *SimpleDiskCache) Put(_ context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, _ error) {
+	if outputID == "" {
+		return "", errors.New("empty outputID")
+	}
+	file := filepath.Join(dc.dir, fmt.Sprintf("o-%s", outputID))
 
 	// Special case empty files; they're both common and easier to do race-free.
 	if size == 0 {
@@ -88,7 +93,7 @@ func (dc *SimpleDiskCache) Put(_ context.Context, actionID, objectID string, siz
 
 	ij, err := json.Marshal(indexEntry{
 		Version:   1,
-		OutputID:  objectID,
+		OutputID:  outputID,
 		Size:      size,
 		TimeNanos: time.Now().UnixNano(),
 	})

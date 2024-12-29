@@ -89,7 +89,7 @@ func (p *Process) Run(ctx context.Context) error {
 			if int64(len(bodyb)) != req.BodySize {
 				log.Fatalf("only got %d bytes of declared %d", len(bodyb), req.BodySize)
 			}
-			req.Body = bytes.NewReader(bodyb)
+			req.Body = bytes.NewBuffer(bodyb)
 		}
 		wg.Go(func() error {
 			res := &wire.Response{ID: req.ID}
@@ -147,23 +147,24 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 		return fmt.Errorf("not a regular file")
 	}
 	res.Size = fi.Size()
-	res.TimeNanos = fi.ModTime().UnixNano()
+	mt := fi.ModTime()
+	res.Time = &mt
 	res.DiskPath = diskPath
 	return nil
 }
 
 func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
-	actionID, objectID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.ObjectID)
+	actionID, outputID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.OutputID)
 	defer func() {
 		if retErr != nil {
-			log.Printf("put(action %s, obj %s, %v bytes): %v", actionID, objectID, req.BodySize, retErr)
+			log.Printf("put(action %s, obj %s, %v bytes): %v", actionID, outputID, req.BodySize, retErr)
 		}
 	}()
 	var body = req.Body
 	if body == nil {
-		body = bytes.NewReader(nil)
+		body = bytes.NewBuffer(nil)
 	}
-	diskPath, err := p.cache.Put(ctx, actionID, objectID, req.BodySize, body)
+	diskPath, err := p.cache.Put(ctx, actionID, outputID, req.BodySize, body)
 	if err != nil {
 		return err
 	}

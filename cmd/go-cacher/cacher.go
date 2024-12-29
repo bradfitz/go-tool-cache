@@ -7,23 +7,24 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
 	"path/filepath"
-
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bradfitz/go-tool-cache/cacheproc"
 	"github.com/bradfitz/go-tool-cache/cachers"
 )
 
-const defaultCacheKey = "v1"
+const (
+	defaultPrefix = "go-cacher"
+)
 
 // All the following env variable names are optional
 const (
@@ -32,11 +33,13 @@ const (
 
 	// S3 cache
 	envVarS3CacheRegion        = "GOCACHE_AWS_REGION"
+	envVarS3CacheURL           = "GOCACHE_AWS_URL"
 	envVarS3AwsAccessKey       = "GOCACHE_AWS_ACCESS_KEY"
 	envVarS3AwsSecretAccessKey = "GOCACHE_AWS_SECRET_ACCESS_KEY"
+	envVarS3AwsSessionToken    = "GOCACHE_AWS_SESSION_TOKEN"
 	envVarS3AwsCredsProfile    = "GOCACHE_AWS_CREDS_PROFILE"
 	envVarS3BucketName         = "GOCACHE_S3_BUCKET"
-	envVarS3CacheKey           = "GOCACHE_CACHE_KEY"
+	envVarS3Prefix             = "GOCACHE_S3_PREFIX"
 
 	// HTTP cache - optional cache server HTTP prefix (scheme and authority only);
 	envVarHttpCacheServerBase = "GOCACHE_HTTP_SERVER_BASE"
@@ -60,51 +63,56 @@ func getAwsConfigFromEnv(ctx context.Context, env Env) (*aws.Config, error) {
 	// read from env
 	awsRegion := env.Get(envVarS3CacheRegion)
 	if awsRegion == "" {
-		return nil, nil
+		awsRegion = "us-east-1"
 	}
 	accessKey := env.Get(envVarS3AwsAccessKey)
 	secretAccessKey := env.Get(envVarS3AwsSecretAccessKey)
-	if accessKey != "" && secretAccessKey != "" {
+	sessionToken := env.Get(envVarS3AwsSessionToken)
+	if accessKey != "" && secretAccessKey != "" || sessionToken != "" {
 		cfg, err := config.LoadDefaultConfig(ctx,
 			config.WithRegion(awsRegion),
 			config.WithCredentialsProvider(credentials.StaticCredentialsProvider{
 				Value: aws.Credentials{
 					AccessKeyID:     accessKey,
 					SecretAccessKey: secretAccessKey,
+					SessionToken:    sessionToken,
 				},
 			}))
-		if err != nil {
-			return nil, err
-		}
-		return &cfg, nil
+		return &cfg, err
 	}
 	credsProfile := env.Get(envVarS3AwsCredsProfile)
 	if credsProfile != "" {
 		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsRegion), config.WithSharedConfigProfile(credsProfile))
-		if err != nil {
-			return nil, err
-		}
-		return &cfg, nil
+		return &cfg, err
 	}
-	return nil, nil
+	return nil, errors.New("no s3 credentials found")
 }
 
 func maybeS3Cache(ctx context.Context, env Env) (cachers.RemoteCache, error) {
+	bucket := env.Get(envVarS3BucketName)
+	if bucket == "" {
+		// We need at least name of bucket.
+		return nil, nil
+	}
+
 	awsConfig, err := getAwsConfigFromEnv(ctx, env)
 	if err != nil {
 		return nil, err
 	}
-	bucket := env.Get(envVarS3BucketName)
-	if bucket == "" || awsConfig == nil {
-		// We need at least name of bucket and valid aws config
-		return nil, nil
+	prefix := strings.Trim(env.Get(envVarS3Prefix), "/")
+	if prefix == "" {
+		prefix = defaultPrefix
 	}
-	cacheKey := env.Get(envVarS3CacheKey)
-	if cacheKey == "" {
-		cacheKey = defaultCacheKey
-	}
-	s3Client := s3.NewFromConfig(*awsConfig)
-	s3Cache := cachers.NewS3Cache(s3Client, bucket, cacheKey, *verbose)
+
+	s3Client := s3.NewFromConfig(*awsConfig, func(o *s3.Options) {
+		if u := env.Get(envVarS3CacheURL); u != "" {
+			// Custom URL, use path style.
+			o.UsePathStyle = true
+			o.BaseEndpoint = &u
+		}
+	},
+	)
+	s3Cache := cachers.NewS3Cache(s3Client, bucket, prefix, *verbose)
 	return s3Cache, nil
 }
 

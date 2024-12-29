@@ -32,11 +32,11 @@ func newTimeKeeper() *timeKeeper {
 
 func (c *timeKeeper) Start(ctx context.Context) {
 	c.wg, _ = errgroup.WithContext(ctx)
+	start := time.Now()
 	c.wg.Go(func() error {
 		for m := range c.metricsChan {
 			c.TotalBytes += m.bytes
-			speed := float64(m.bytes) / m.duration.Seconds()
-			c.AvgBytesPerSecond = newAverage(c.AvgBytesPerSecond, c.Count, speed)
+			c.AvgBytesPerSecond = float64(c.TotalBytes) / time.Since(start).Seconds()
 			c.Count++
 		}
 		return nil
@@ -51,10 +51,6 @@ func (c *timeKeeper) Stop() error {
 func (c *timeKeeper) Summary() string {
 	return fmt.Sprintf("%s (%s/sec)",
 		formatBytes(float64(c.TotalBytes)), formatBytes(c.AvgBytesPerSecond))
-}
-
-func newAverage(oldAverage float64, count int64, newValue float64) float64 {
-	return (oldAverage*float64(count) + newValue) / float64(count+1)
 }
 
 func (c *timeKeeper) DoWithMeasure(bytesCount int64, f func() (string, error)) (string, error) {

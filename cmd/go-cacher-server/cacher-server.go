@@ -189,16 +189,15 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func OutputFilename(dir, objectID string) string {
-	if len(objectID) < 4 || len(objectID) > 1000 {
+func OutputFilename(dir, outputID string) string {
+	if len(outputID) < 4 || len(outputID) > 1000 {
 		return ""
 	}
-	for i := range objectID {
-		b := objectID[i]
+	for _, b := range outputID {
 		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
 			continue
 		}
 		return ""
 	}
-	return filepath.Join(dir, fmt.Sprintf("o-%s", objectID))
+	return filepath.Join(dir, fmt.Sprintf("o-%s", outputID))
 }
