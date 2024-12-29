@@ -42,11 +42,17 @@ cacher: closing; 808 gets (808 hits, 0 misses, 0 errors); 0 puts (0 errors)
 ```
 
 ## S3 Support
+
 We support S3 backend for caching.
+
 You can connect to S3 backend by setting the following parameters:
-- `GOCACHE_S3_BUCKET` - Name of S3 bucket
-- `GOCACHE_AWS_REGION` - AWS Region of bucket
-- `GOCACHE_AWS_ACCESS_KEY` + `GOCACHE_AWS_SECRET_KEY` / `GOCACHE_AWS_CREDS_PROFILE` - Direct credentials or creds profile to use.
-- `GOCACHE_CACHE_KEY` - (Optional, default `v1`) Unique key
+- `GOCACHE_S3_BUCKET` - Name of S3 bucket (required)
+- `GOCACHE_S3_PREFIX` - Use a custom prefix for all entries. Default is `go-cacher`.
+- `GOCACHE_AWS_REGION` - AWS Region of bucket. Default is `us-east-1`.
+- Direct credentials or creds profile to use:
+  - `GOCACHE_AWS_ACCESS_KEY` + `GOCACHE_AWS_SECRET_KEY` 
+  - `GOCACHE_AWS_CREDS_PROFILE` 
+  - `GOCACHE_AWS_SESSION_TOKEN`
+- `GOCACHE_AWS_URL` - specify a custom endpoint. Will switch to path-style requests.  
 
 The cache would be stored to `s3://<bucket>/cache/<cache_key>/<architecture>/<os>/<go-version>`
