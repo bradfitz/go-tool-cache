@@ -1,7 +1,6 @@
 package cachers
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/bradfitz/go-tool-cache/internal/sbytes"
 	"github.com/klauspost/compress/s2"
 )
 
@@ -93,7 +93,7 @@ var s2Encoders = sync.Pool{
 
 func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (err error) {
 	if size == 0 {
-		body = bytes.NewBuffer(nil)
+		body = sbytes.NewBuffer(nil)
 	}
 
 	actionKey := s.actionKey(actionID)
@@ -104,8 +104,8 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 		outputIDMetadataKey: outputID,
 	}
 
-	if bb, ok := body.(*bytes.Buffer); size > 8<<10 && ok {
-		dst := bytes.NewBuffer(make([]byte, 0, size/2))
+	if bb, ok := body.(*sbytes.Buffer); size > 8<<10 && ok {
+		dst := sbytes.NewBuffer(make([]byte, 0, size/2))
 		enc := s2Encoders.Get().(*s2.Writer)
 		enc.Reset(dst)
 		enc.EncodeBuffer(bb.Bytes())

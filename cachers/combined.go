@@ -1,13 +1,13 @@
 package cachers
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 
+	"github.com/bradfitz/go-tool-cache/internal/sbytes"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -81,7 +81,7 @@ func (l *CombinedCache) Get(ctx context.Context, actionID string) (string, strin
 }
 
 func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, err error) {
-	if br, ok := body.(*bytes.Buffer); ok {
+	if br, ok := body.(*sbytes.Buffer); ok {
 		return l.putBytes(ctx, actionID, outputID, size, br.Bytes())
 	}
 	pr, pw := io.Pipe()
@@ -89,7 +89,7 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 	wg.Go(func() error {
 		var putBody io.Reader = pr
 		if size == 0 {
-			putBody = bytes.NewBuffer(nil)
+			putBody = sbytes.NewBuffer(nil)
 		}
 		var err2 error
 		diskPath, err2 = l.localCache.Put(ctx, actionID, outputID, size, putBody)
@@ -101,7 +101,7 @@ func (l *CombinedCache) Put(ctx context.Context, actionID, outputID string, size
 		// Special case the empty file so NewRequest sets "Content-Length: 0",
 		// as opposed to thinking we didn't set it and not being able to sniff its size
 		// from the type.
-		putBody = bytes.NewBuffer(nil)
+		putBody = sbytes.NewBuffer(nil)
 	} else {
 
 		putBody = io.TeeReader(body, pw)
@@ -123,13 +123,13 @@ func (l *CombinedCache) putBytes(ctx context.Context, actionID, outputID string,
 	wg, _ := errgroup.WithContext(ctx)
 	wg.Go(func() error {
 		var err2 error
-		diskPath, err2 = l.localCache.Put(ctx, actionID, outputID, size, bytes.NewBuffer(body))
+		diskPath, err2 = l.localCache.Put(ctx, actionID, outputID, size, sbytes.NewBuffer(body))
 		return err2
 	})
 
 	// tolerate remote write errors
 	_, _ = l.putsMetrics.DoWithMeasure(size, func() (string, error) {
-		e := l.remoteCache.Put(ctx, actionID, outputID, size, bytes.NewBuffer(body))
+		e := l.remoteCache.Put(ctx, actionID, outputID, size, sbytes.NewBuffer(body))
 		return "", e
 	})
 
