@@ -32,14 +32,14 @@ const (
 	envVarDiskCacheDir = "GOCACHE_DISK_DIR"
 
 	// S3 cache
-	envVarS3CacheRegion        = "GOCACHE_AWS_REGION"
-	envVarS3CacheURL           = "GOCACHE_AWS_URL"
-	envVarS3AwsAccessKey       = "GOCACHE_AWS_ACCESS_KEY"
-	envVarS3AwsSecretAccessKey = "GOCACHE_AWS_SECRET_ACCESS_KEY"
-	envVarS3AwsSessionToken    = "GOCACHE_AWS_SESSION_TOKEN"
-	envVarS3AwsCredsProfile    = "GOCACHE_AWS_CREDS_PROFILE"
+	envVarS3CacheRegion        = "GOCACHE_S3_REGION"
+	envVarS3CacheURL           = "GOCACHE_S3_URL"
+	envVarS3AwsAccessKey       = "GOCACHE_S3_ACCESS_KEY"
+	envVarS3AwsSecretAccessKey = "GOCACHE_S3_SECRET_KEY"
+	envVarS3AwsSessionToken    = "GOCACHE_S3_SESSION_TOKEN"
 	envVarS3BucketName         = "GOCACHE_S3_BUCKET"
 	envVarS3Prefix             = "GOCACHE_S3_PREFIX"
+	envVarS3AwsCredsProfile    = "GOCACHE_AWS_CREDS_PROFILE"
 
 	// HTTP cache - optional cache server HTTP prefix (scheme and authority only);
 	envVarHttpCacheServerBase = "GOCACHE_HTTP_SERVER_BASE"
@@ -80,11 +80,12 @@ func getAwsConfigFromEnv(ctx context.Context, env Env) (*aws.Config, error) {
 			}))
 		return &cfg, err
 	}
-	credsProfile := env.Get(envVarS3AwsCredsProfile)
-	if credsProfile != "" {
-		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsRegion), config.WithSharedConfigProfile(credsProfile))
+
+	if p := env.Get(envVarS3AwsCredsProfile); p != "" {
+		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(awsRegion), config.WithSharedConfigProfile(p))
 		return &cfg, err
 	}
+
 	return nil, errors.New("no s3 credentials found")
 }
 
@@ -112,8 +113,7 @@ func maybeS3Cache(ctx context.Context, env Env) (cachers.RemoteCache, error) {
 		}
 	},
 	)
-	s3Cache := cachers.NewS3Cache(s3Client, bucket, prefix, *verbose)
-	return s3Cache, nil
+	return cachers.NewS3Cache(s3Client, bucket, prefix, *verbose), nil
 }
 
 func getCache(ctx context.Context, env Env, verbose bool) cachers.LocalCache {
