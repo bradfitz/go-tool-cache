@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path"
 	"runtime"
 
 	"github.com/aws/smithy-go"
@@ -58,7 +59,7 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, si
 		if s.verbose {
 			log.Printf("error S3 get for %s:  %v", actionKey, getOutputErr)
 		}
-		return "", 0, nil, fmt.Errorf("unexpected S3 get for %s:  %v", actionKey, getOutputErr)
+		return "", 0, nil, fmt.Errorf("unexpected S3 get for %s:  %w", actionKey, getOutputErr)
 	}
 	contentSize := outputResult.ContentLength
 	outputID, ok := outputResult.Metadata[outputIDMetadataKey]
@@ -105,7 +106,7 @@ func NewS3Cache(client s3Client, bucketName string, cacheKey string, verbose boo
 	if goos == "" {
 		goos = runtime.GOOS
 	}
-	prefix := fmt.Sprintf("cache/%s/%s/%s", cacheKey, goarch, goos)
+	prefix := path.Join("cache", cacheKey, goarch, goos)
 	cache := &S3Cache{
 		s3Client: client,
 		bucket:   bucketName,
