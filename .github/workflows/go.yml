@@ -3,23 +3,23 @@
 
 name: Go
 
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+on: [push, fork]
 
 jobs:
 
   build:
     runs-on: ubuntu-latest
+    name: Build with Go ${{ matrix.go }} 
+    strategy:
+      matrix:
+        go: [ '1.23' ]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: ${{ matrix.go }} 
           check-latest: true
 
       - name: Build
@@ -29,7 +29,7 @@ jobs:
         run: go test -v ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v3
+        uses: golangci/golangci-lint-action@v6
         with:
           version: latest
           args: --timeout 5m
