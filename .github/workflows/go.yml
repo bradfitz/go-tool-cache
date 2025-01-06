@@ -9,10 +9,11 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-    name: Build with Go ${{ matrix.go }} 
+    name: Build with Go ${{ matrix.go }}
     strategy:
       matrix:
-        go: [ '1.23' ]
+        go-version: [1.23.x,1.24rc1]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
