@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
 	"path"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -34,6 +36,7 @@ type s3Client interface {
 type S3Cache struct {
 	bucket string
 	prefix string
+	tags   string
 	// verbose optionally specifies whether to log verbose messages.
 	verbose  bool
 	s3Client s3Client
@@ -57,7 +60,7 @@ func (s *S3Cache) Get(ctx context.Context, actionID string) (outputID string, si
 		Key:    &actionKey,
 	})
 	if s.verbose {
-		log.Printf("[%s]\t GetObject: s3://%s/%s", s.Kind(), s.bucket, actionKey)
+		log.Printf("[%s]\t GetObject: s3://%s/%s ok:%v", s.Kind(), s.bucket, actionKey, getOutputErr == nil)
 	}
 	if isNotFoundError(getOutputErr) {
 		// handle object not found
@@ -124,6 +127,7 @@ func (s *S3Cache) Put(ctx context.Context, actionID, outputID string, size int64
 		Body:          body,
 		ContentLength: &size,
 		Metadata:      metadata,
+		Tagging:       &s.tags,
 	}, func(options *s3.Options) {
 		options.RetryMaxAttempts = 1 // We cannot perform seek in Body
 	})
@@ -148,11 +152,16 @@ func NewS3Cache(client s3Client, bucketName, prefix string, verbose bool) *S3Cac
 	if goos == "" {
 		goos = runtime.GOOS
 	}
+	tags := make(url.Values, 2)
+	tags.Add("GOARCH", goarch)
+	tags.Add("GOOS", goos)
+
 	cache := &S3Cache{
 		s3Client: client,
 		bucket:   bucketName,
-		prefix:   path.Join(prefix, goarch, goos),
+		prefix:   strings.Trim(prefix, "/.\\"),
 		verbose:  verbose,
+		tags:     tags.Encode(),
 	}
 	return cache
 }
