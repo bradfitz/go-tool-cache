@@ -79,6 +79,10 @@ func (p *Process) Run(ctx context.Context) error {
 			}
 			return err
 		}
+		// For Go1.23 backward compatibility, remove in Go1.25.
+		if len(req.OutputID) == 0 && len(req.ObjectID) != 0 {
+			req.OutputID = req.ObjectID
+		}
 		if req.Command == wire.CmdPut && req.BodySize > 0 {
 			// TODO(bradfitz): stream this and pass a checksum-validating
 			// io.Reader that validates on EOF.
@@ -153,17 +157,17 @@ func (p *Process) handleGet(ctx context.Context, req *wire.Request, res *wire.Re
 }
 
 func (p *Process) handlePut(ctx context.Context, req *wire.Request, res *wire.Response) (retErr error) {
-	actionID, objectID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.ObjectID)
+	actionID, outputID := fmt.Sprintf("%x", req.ActionID), fmt.Sprintf("%x", req.OutputID)
 	defer func() {
 		if retErr != nil {
-			log.Printf("put(action %s, obj %s, %v bytes): %v", actionID, objectID, req.BodySize, retErr)
+			log.Printf("put(action %s, obj %s, %v bytes): %v", actionID, outputID, req.BodySize, retErr)
 		}
 	}()
 	var body = req.Body
 	if body == nil {
 		body = bytes.NewReader(nil)
 	}
-	diskPath, err := p.cache.Put(ctx, actionID, objectID, req.BodySize, body)
+	diskPath, err := p.cache.Put(ctx, actionID, outputID, req.BodySize, body)
 	if err != nil {
 		return err
 	}

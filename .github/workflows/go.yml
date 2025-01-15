@@ -20,7 +20,7 @@ jobs:
     name: Build with Go ${{ matrix.go }} 
     strategy:
       matrix:
-        go: [ '1.23' ]
+        go: [ '1.23', '1.24.0-rc.1' ]
     steps:
       - uses: actions/checkout@v4
 
