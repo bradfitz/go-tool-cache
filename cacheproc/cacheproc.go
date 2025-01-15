@@ -79,6 +79,10 @@ func (p *Process) Run(ctx context.Context) error {
 			}
 			return err
 		}
+		// For Go1.23 backward compatibility, remove in Go1.25.
+		if len(req.OutputID) == 0 && len(req.ObjectID) != 0 {
+			req.OutputID = req.ObjectID
+		}
 		if req.Command == wire.CmdPut && req.BodySize > 0 {
 			// TODO(bradfitz): stream this and pass a checksum-validating
 			// io.Reader that validates on EOF.

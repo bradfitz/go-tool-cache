@@ -44,6 +44,10 @@ type Request struct {
 	// OutputID is set for Type "put" and "output-file".
 	OutputID []byte `json:",omitempty"` // or nil if not used
 
+	// ObjectID is the name of `OutputID` before Go1.24, it will be removed in Go1.25.
+	// It's used for backward compatibility.
+	ObjectID []byte `json:",omitempty"`
+
 	// Body is the body for "put" requests. It's sent after the JSON object
 	// as a base64-encoded JSON string when BodySize is non-zero.
 	// It's sent as a separate JSON value instead of being a struct field
@@ -84,8 +88,8 @@ type Response struct {
 	Size     int64      `json:",omitempty"`
 	Time     *time.Time `json:",omitempty"` // when the object was put in the cache (optional; used for cache expiration)
 
-	// DiskPath is the absolute path on disk of the ObjectID corresponding
+	// DiskPath is the absolute path on disk of the OutputID corresponding
 	// a "get" request's ActionID (on cache hit) or a "put" request's
-	// provided ObjectID.
+	// provided OutputID.
 	DiskPath string `json:",omitempty"`
 }

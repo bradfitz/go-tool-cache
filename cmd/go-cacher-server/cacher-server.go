@@ -194,6 +194,7 @@ func OutputFilename(dir, outputID string) string {
 		return ""
 	}
 	for _, b := range outputID {
+		b := outputID[i]
 		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
 			continue
 		}
