@@ -37,7 +37,9 @@ func NewHttpCache(baseURL string, verbose bool) *HTTPCache {
 }
 
 func (c *HTTPCache) Start(context.Context) error {
-	log.Printf("[%s]\tconfigured to %s", c.Kind(), c.baseURL)
+	if c.verbose {
+		log.Printf("[%s]\tconfigured to %s", c.Kind(), c.baseURL)
+	}
 	return nil
 }
 

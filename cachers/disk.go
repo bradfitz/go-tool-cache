@@ -41,7 +41,9 @@ func NewSimpleDiskCache(verbose bool, dir string) *SimpleDiskCache {
 var _ LocalCache = &SimpleDiskCache{}
 
 func (dc *SimpleDiskCache) Start(context.Context) error {
-	log.Printf("[%s]\tlocal cache in  %s", dc.Kind(), dc.dir)
+	if dc.verbose {
+		log.Printf("[%s]\tlocal cache in  %s", dc.Kind(), dc.dir)
+	}
 	return os.MkdirAll(dc.dir, 0755)
 }
 

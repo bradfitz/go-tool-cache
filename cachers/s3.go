@@ -42,7 +42,9 @@ func (s *S3Cache) Kind() string {
 }
 
 func (s *S3Cache) Start(context.Context) error {
-	log.Printf("[%s]\tconfigured to s3://%s/%s", s.Kind(), s.bucket, s.prefix)
+	if s.verbose {
+		log.Printf("[%s]\tconfigured to s3://%s/%s", s.Kind(), s.bucket, s.prefix)
+	}
 	return nil
 }
 
