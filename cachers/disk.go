@@ -24,6 +24,15 @@ type indexEntry struct {
 type DiskCache struct {
 	Dir     string
 	Verbose bool
+	Logf    func(format string, args ...any) // optional alt logger
+}
+
+func (dc *DiskCache) logf(format string, args ...any) {
+	if dc.Logf != nil {
+		dc.Logf(format, args...)
+	} else if dc.Verbose {
+		log.Printf(format, args...)
+	}
 }
 
 func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
@@ -33,14 +42,14 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 		if os.IsNotExist(err) {
 			err = nil
 			if dc.Verbose {
-				log.Printf("disk miss: %v", actionID)
+				dc.logf("disk miss: %v", actionID)
 			}
 		}
 		return "", "", err
 	}
 	var ie indexEntry
 	if err := json.Unmarshal(ij, &ie); err != nil {
-		log.Printf("Warning: JSON error for action %q: %v", actionID, err)
+		dc.logf("Warning: JSON error for action %q: %v", actionID, err)
 		return "", "", nil
 	}
 	if _, err := hex.DecodeString(ie.OutputID); err != nil {

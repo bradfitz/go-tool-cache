@@ -47,6 +47,13 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/action/"+actionID, nil)
 
+	// Set a header to indicate we want the object and metadata in one response.
+	// Prior to 2025-08-09, the protocol was two separate requests. Rather than
+	// change this repo's protocol and potentially break existing clients,
+	// we just add a header to indicate we want the object and then we support
+	// both the old and new response types.
+	req.Header.Set("Want-Object", "1") // opt in to new single roundtrip protocol
+
 	res, err := c.httpClient().Do(req)
 	if err != nil {
 		return "", "", err
@@ -58,35 +65,53 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	if res.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("unexpected GET /action/%s status %v", actionID, res.Status)
 	}
-	var av ActionValue
-	if err := json.NewDecoder(res.Body).Decode(&av); err != nil {
-		return "", "", err
-	}
-	outputID = av.OutputID
 
-	// If not on disk, download it to disk.
-	var putBody io.Reader
-	if av.Size == 0 {
-		putBody = bytes.NewReader(nil)
-	} else {
-		req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
-		res, err = c.httpClient().Do(req)
-		if err != nil {
-			return "", "", err
-		}
-		defer res.Body.Close()
-		if res.StatusCode == http.StatusNotFound {
-			return "", "", nil
-		}
-		if res.StatusCode != http.StatusOK {
-			return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
+	switch res.Header.Get("Content-Type") {
+	default:
+		return "", "", fmt.Errorf("unexpected Content-Type %q from server", res.Header.Get("Content-Type"))
+
+	case "application/octet-stream": // new single roundtrip protocol
+		outputID = res.Header.Get("Go-Output-Id")
+		if outputID == "" {
+			return "", "", fmt.Errorf("missing Go-Output-Id header in response")
 		}
 		if res.ContentLength == -1 {
 			return "", "", fmt.Errorf("no Content-Length from server")
 		}
-		putBody = res.Body
+		diskPath, err = c.Disk.Put(ctx, actionID, outputID, res.ContentLength, res.Body)
+
+	case "application/json": // old two-hop protocol
+		var av ActionValue
+		if err := json.NewDecoder(res.Body).Decode(&av); err != nil {
+			return "", "", err
+		}
+		outputID = av.OutputID
+
+		// If not on disk, download it to disk.
+		var putBody io.Reader
+		if av.Size == 0 {
+			putBody = bytes.NewReader(nil)
+		} else {
+			req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
+			res, err = c.httpClient().Do(req)
+			if err != nil {
+				return "", "", err
+			}
+			defer res.Body.Close()
+			if res.StatusCode == http.StatusNotFound {
+				return "", "", nil
+			}
+			if res.StatusCode != http.StatusOK {
+				return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
+			}
+			if res.ContentLength == -1 {
+				return "", "", fmt.Errorf("no Content-Length from server")
+			}
+			putBody = res.Body
+		}
+		diskPath, err = c.Disk.Put(ctx, actionID, outputID, av.Size, putBody)
 	}
-	diskPath, err = c.Disk.Put(ctx, actionID, outputID, av.Size, putBody)
+
 	return outputID, diskPath, err
 }
 
