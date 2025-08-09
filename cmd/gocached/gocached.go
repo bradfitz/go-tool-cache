@@ -145,8 +145,14 @@ type server struct {
 	clock   func() time.Time // if non-nil, alternate time.Now for testing
 
 	// Metrics
-	gets    expvar.Int
-	getHits expvar.Int
+	gets          expvar.Int // gets = getHits + getErrs + implicit misses
+	getBytes      expvar.Int
+	getHits       expvar.Int
+	getHitsInline expvar.Int // includes getHits; subset of getHits stored in SQLite
+	getErrs       expvar.Int // errors from GET requests
+	puts          expvar.Int
+	putsBytes     expvar.Int
+	putsInline    expvar.Int
 }
 
 func (s *server) now() time.Time {
@@ -172,7 +178,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/action/"):
 		s.handleGetAction(w, r)
 	case r.URL.Path == "/":
-		io.WriteString(w, "hi")
+		io.WriteString(w, "gocached")
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -204,13 +210,18 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	s.gets.Add(1)
 	ctx := r.Context()
 
+	httpErr := func(msg string, code int) {
+		http.Error(w, msg, code)
+		s.getErrs.Add(1)
+	}
+
 	actionID, ok := getHexSuffix(r, "/action/")
 	if !ok {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		httpErr("bad request", http.StatusBadRequest)
 		return
 	}
 	if r.Header.Get("Want-Object") != "1" {
-		http.Error(w, "bad request: missing Want-Object header", http.StatusBadRequest)
+		httpErr("bad request: missing Want-Object header", http.StatusBadRequest)
 		return
 	}
 
@@ -223,9 +234,10 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		httpErr("bad request: missing Want-Object header", http.StatusBadRequest)
 		return
 	}
+
 	s.getHits.Add(1)
 
 	w.Header().Set("Content-Type", "application/octet-stream")
@@ -238,6 +250,8 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 
 	if inlineOutput.Valid {
 		// For small outputs stored inline in the database, we can return them directly.
+		s.getHitsInline.Add(1)
+		s.getBytes.Add(size)
 		io.WriteString(w, inlineOutput.String)
 		return
 	}
@@ -246,13 +260,14 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	// from our local disk or a peer.
 	rc, err := s.getObjectFromDiskOrPeer(ctx, actionID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		httpErr(err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if rc == nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	s.getBytes.Add(size)
 	defer rc.Close()
 	io.Copy(w, rc)
 }
@@ -323,6 +338,12 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 		s.logf("INSERT error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	s.puts.Add(1)
+	s.putsBytes.Add(r.ContentLength)
+	if inline != nil {
+		s.putsInline.Add(1)
 	}
 
 	w.WriteHeader(http.StatusNoContent)

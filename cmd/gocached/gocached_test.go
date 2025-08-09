@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"expvar"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -37,68 +38,89 @@ func TestServer(t *testing.T) {
 		}
 	}
 
+	// wantMetric is a helper to check an expvar.Int metric and reset it
+	// for future tests.
+	wantMetric := func(m *expvar.Int, want int64) {
+		t.Helper()
+		if got := m.Value(); got != want {
+			t.Errorf("metric = %d, want %d", got, want)
+		}
+		m.Set(0)
+	}
+
 	// Make two clients (imagine: two different builder VMs)
 	c1 := mkClient()
 	c2 := mkClient()
 
 	const testActionID = "0001"
 	const testActionIDMiss = "0002" // this one doesn't exist
+	const testActionIDBig = "0bbb"  // non-inline object
 	const testOutputID = "9900"
+	const testOutputIDBig = "9bbb"
 	const testObjectValue = "test data"
+	testObjectValueBig := strings.Repeat("x", smallObjectSize+1)
+
+	wantPut := func(c *cachers.HTTPClient, actionID, outputID string, val string) {
+		t.Helper()
+		clientDiskPath, err := c.Put(ctx, actionID, outputID, int64(len(val)), strings.NewReader(val))
+		if err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		if clientDiskPath == "" {
+			t.Fatal("Put returned empty disk path")
+		}
+		wantMetric(&srv.puts, 1)
+		wrote, err := os.ReadFile(clientDiskPath)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if string(wrote) != val {
+			t.Errorf("ReadFile got %q, want %q", wrote, val)
+		}
+	}
+
+	wantGet := func(c *cachers.HTTPClient, actionID, outputID, wantVal string) {
+		t.Helper()
+		gotOutputID, diskPath, err := c.Get(ctx, actionID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if gotOutputID != outputID {
+			t.Errorf("Get got outputID %q, want %q", gotOutputID, outputID)
+		}
+		if diskPath == "" {
+			t.Fatal("Get returned empty disk path")
+		}
+		wrote, err := os.ReadFile(diskPath)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if string(wrote) != wantVal {
+			t.Errorf("ReadFile got %q, want %q", wrote, wantVal)
+		}
+	}
 
 	// Populate from the first client.
-	clientDiskPath, err := c1.Put(ctx, testActionID, testOutputID, int64(len(testObjectValue)), strings.NewReader(testObjectValue))
-	if err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if clientDiskPath == "" {
-		t.Fatal("Put returned empty disk path")
-	}
-	wrote, err := os.ReadFile(clientDiskPath)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if string(wrote) != testObjectValue {
-		t.Errorf("ReadFile got %q, want %q", wrote, testObjectValue)
-	}
+	wantPut(c1, testActionID, testOutputID, testObjectValue)
+	wantPut(c1, testActionIDBig, testOutputIDBig, testObjectValueBig)
 
 	// Read from the second client.
-	gotOutputID, diskPath, err := c2.Get(ctx, testActionID)
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if gotOutputID != testOutputID {
-		t.Errorf("Get got outputID %q, want %q", gotOutputID, testOutputID)
-	}
-	if diskPath == "" {
-		t.Fatal("Get returned empty disk path")
-	}
-	wrote, err = os.ReadFile(diskPath)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	if string(wrote) != testObjectValue {
-		t.Errorf("ReadFile got %q, want %q", wrote, testObjectValue)
-	}
+	wantGet(c2, testActionID, testOutputID, testObjectValue)
+	wantGet(c2, testActionIDBig, testOutputIDBig, testObjectValueBig)
+
 	// Check metrics
-	if got, want := srv.gets.Value(), int64(1); got != want {
-		t.Errorf("server metric gets = %d, want %d", got, want)
-	}
-	if got, want := srv.getHits.Value(), int64(1); got != want {
-		t.Errorf("server metric getHits = %d, want %d", got, want)
-	}
+	wantMetric(&srv.gets, 2)
+	wantMetric(&srv.getHits, 2)
+	wantMetric(&srv.getHitsInline, 1)
 
 	// Do the same get again from the same client. This shouldn't hit the network.
-	if _, _, err = c2.Get(ctx, testActionID); err != nil {
-		t.Fatalf("Get: %v", err)
-	} else if srv.gets.Value() != 1 {
-		t.Errorf("server metric gets = %d, want 1", srv.gets.Value())
-	}
+	wantGet(c2, testActionID, testOutputID, testObjectValue)
+	wantMetric(&srv.gets, 0)
 
 	// Cache miss. This should hit the network and fail.
 	if _, _, err = c2.Get(ctx, testActionIDMiss); err != nil {
 		t.Fatalf("miss Get: %v", err)
-	} else if srv.gets.Value() != 2 {
-		t.Errorf("server metric gets = %d, want 1", srv.gets.Value())
 	}
+	wantMetric(&srv.gets, 1)
+	wantMetric(&srv.getHits, 0)
 }
