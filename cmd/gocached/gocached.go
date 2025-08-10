@@ -93,7 +93,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(*listen, srv))
 }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS Actions (
   CHECK (ActionID = lower(ActionID)),
   CHECK (OutputID = lower(OutputID)),
   CHECK (ActionID GLOB '[0-9a-f]*'),
-  CHECK (OutputID GLOB '[0-9a-f]*'),
+  CHECK (OutputID GLOB '[0-9a-f]*' OR OutputID GLOB 'wk*'),
   CHECK (OutputSize >= 0),
   CHECK (CreateTime >= 0),
   CHECK (AccessTime >= 0),
@@ -306,6 +306,7 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		httpErr("bad request: missing Want-Object header", http.StatusBadRequest)
 		return
 	}
+	outputID = outputIDFromWellknown(outputID)
 
 	// If it's been more than a day since the last access, update the access time.
 	// This is similar to the Linux "relatime" behavior.
@@ -415,7 +416,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	_, err := s.db.Exec(`
 INSERT OR IGNORE INTO Actions (ActionID, OutputID, OutputSize, CreateTime, AccessTime, InlineOutput)
 VALUES (?, ?, ?, ?, ?, ?)`,
-		actionID, outputID, r.ContentLength, nowUnix, nowUnix, inline)
+		actionID, outputIDOrWellKnown(outputID), r.ContentLength, nowUnix, nowUnix, inline)
 	if err != nil {
 		s.logf("INSERT error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -429,6 +430,25 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// sha256OfEmpty is the SHA-256 hash of an empty string, used as a well-known
+// value in SQLite to store bytes, as it's common. We store it in SQLite
+// as "wk0" (for "well known 0") to save space, as it's common.
+const sha256OfEmpty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+func outputIDOrWellKnown(id string) string {
+	if id == sha256OfEmpty {
+		return "wk0"
+	}
+	return id
+}
+
+func outputIDFromWellknown(idStored string) string {
+	if idStored == "wk0" {
+		return sha256OfEmpty
+	}
+	return idStored
 }
 
 // expvarCounterMetric is a Prometheus counter metric backed by an expvar.Int.

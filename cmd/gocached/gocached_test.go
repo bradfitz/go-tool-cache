@@ -72,8 +72,10 @@ func TestServer(t *testing.T) {
 	const testActionID = "0001"
 	const testActionIDMiss = "0002" // this one doesn't exist
 	const testActionIDBig = "0bbb"  // non-inline object
+	const testActionIDEmpty = "0000"
 	const testOutputID = "9900"
 	const testOutputIDBig = "9bbb"
+	const testOutputIDEmpty = sha256OfEmpty
 	const testObjectValue = "test data"
 	testObjectValueBig := strings.Repeat("x", smallObjectSize+1)
 
@@ -120,14 +122,16 @@ func TestServer(t *testing.T) {
 	// Populate from the first client.
 	wantPut(c1, testActionID, testOutputID, testObjectValue)
 	wantPut(c1, testActionIDBig, testOutputIDBig, testObjectValueBig)
+	wantPut(c1, testActionIDEmpty, testOutputIDEmpty, "")
 
 	// Read from the second client.
 	wantGet(c2, testActionID, testOutputID, testObjectValue)
 	wantGet(c2, testActionIDBig, testOutputIDBig, testObjectValueBig)
+	wantGet(c2, testActionIDEmpty, testOutputIDEmpty, "")
 
 	// Check metrics
-	wantMetric(&srv.Gets, 2)
-	wantMetric(&srv.GetHits, 2)
+	wantMetric(&srv.Gets, 3)
+	wantMetric(&srv.GetHits, 3)
 	wantMetric(&srv.GetHitsInline, 1)
 
 	// Do the same get again from the same client. This shouldn't hit the network.
