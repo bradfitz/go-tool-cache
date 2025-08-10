@@ -120,7 +120,7 @@ CREATE INDEX IF NOT EXISTS idx_actions_access ON Actions(AccessTime, OutputSize)
 
 func openDB(dbDir string) (*sql.DB, error) {
 	dbPath := filepath.Join(dbDir, fmt.Sprintf("gocached-v%d.db", schemaVersion))
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
