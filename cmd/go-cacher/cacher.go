@@ -23,6 +23,9 @@ var (
 
 func main() {
 	flag.Parse()
+	if *verbose {
+		log.Printf("go-cacher: verbose mode enabled")
+	}
 	if *dir == "" {
 		d, err := os.UserCacheDir()
 		if err != nil {
