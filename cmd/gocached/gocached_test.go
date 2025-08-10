@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bradfitz/go-tool-cache/cachers"
 )
@@ -21,6 +23,21 @@ func TestServer(t *testing.T) {
 	}
 	srv.logf = t.Logf
 	srv.verbose = true
+
+	var (
+		timeMu sync.Mutex
+		now    = time.Unix(1234, 0)
+	)
+	srv.clock = func() time.Time {
+		timeMu.Lock()
+		defer timeMu.Unlock()
+		return now
+	}
+	advanceClock := func(d time.Duration) {
+		timeMu.Lock()
+		defer timeMu.Unlock()
+		now = now.Add(d)
+	}
 
 	hs := httptest.NewServer(srv)
 	defer hs.Close()
@@ -123,4 +140,12 @@ func TestServer(t *testing.T) {
 	}
 	wantMetric(&srv.gets, 1)
 	wantMetric(&srv.getHits, 0)
+
+	// Check that access time gets updated.
+	// Do it from a fresh client without a disk cache.
+	wantMetric(&srv.getAccessBumps, 0)
+	advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
+	c3 := mkClient()
+	wantGet(c3, testActionID, testOutputID, testObjectValue)
+	wantMetric(&srv.getAccessBumps, 1)
 }

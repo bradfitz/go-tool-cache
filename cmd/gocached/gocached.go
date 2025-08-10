@@ -145,14 +145,15 @@ type server struct {
 	clock   func() time.Time // if non-nil, alternate time.Now for testing
 
 	// Metrics
-	gets          expvar.Int // gets = getHits + getErrs + implicit misses
-	getBytes      expvar.Int
-	getHits       expvar.Int
-	getHitsInline expvar.Int // includes getHits; subset of getHits stored in SQLite
-	getErrs       expvar.Int // errors from GET requests
-	puts          expvar.Int
-	putsBytes     expvar.Int
-	putsInline    expvar.Int
+	gets           expvar.Int // gets = getHits + getErrs + implicit misses
+	getBytes       expvar.Int
+	getHits        expvar.Int
+	getAccessBumps expvar.Int // number of times we updated the AccessTime
+	getHitsInline  expvar.Int // includes getHits; subset of getHits stored in SQLite
+	getErrs        expvar.Int // errors from GET requests
+	puts           expvar.Int
+	putsBytes      expvar.Int
+	putsInline     expvar.Int
 }
 
 func (s *server) now() time.Time {
@@ -206,6 +207,10 @@ func validHex(x string) bool {
 	return true
 }
 
+// relAtimeSeconds is how old an access time needs to be before
+// we do a DB write to update it.
+const relAtimeSeconds = 60 * 60 * 24 // 1 day
+
 func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	s.gets.Add(1)
 	ctx := r.Context()
@@ -228,7 +233,8 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	var outputID string
 	var size int64
 	var inlineOutput sql.NullString
-	err := s.db.QueryRow("SELECT OutputID, OutputSize, InlineOutput FROM Actions WHERE ActionID = ?", actionID).Scan(&outputID, &size, &inlineOutput)
+	var accessTime int64
+	err := s.db.QueryRow("SELECT OutputID, OutputSize, InlineOutput, AccessTime FROM Actions WHERE ActionID = ?", actionID).Scan(&outputID, &size, &inlineOutput, &accessTime)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -236,6 +242,19 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		}
 		httpErr("bad request: missing Want-Object header", http.StatusBadRequest)
 		return
+	}
+
+	// If it's been more than a day since the last access, update the access time.
+	// This is similar to the Linux "relatime" behavior.
+	now := s.now().Unix()
+	if accessTime < now-relAtimeSeconds {
+		_, err := s.db.Exec("UPDATE Actions SET AccessTime = ? WHERE ActionID = ?", now, actionID)
+		if err != nil {
+			s.logf("Update AccessTime error: %v", err)
+			httpErr("internal server error", http.StatusInternalServerError)
+			return
+		}
+		s.getAccessBumps.Add(1)
 	}
 
 	s.getHits.Add(1)
