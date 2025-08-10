@@ -34,7 +34,9 @@ And to insert an object:
 package main
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"expvar"
@@ -93,29 +95,44 @@ func main() {
 	log.Fatal(http.ListenAndServe(*listen, srv))
 }
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schema = `
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS Actions (
-  ActionID     TEXT    NOT NULL PRIMARY KEY,
-  OutputID     TEXT    NOT NULL,
-  OutputSize   INTEGER NOT NULL, -- bytes of the output (even if stored off-DB)
+  NamespaceID  INTEGER NOT NULL, -- 0 for global trusted namespace
+  ActionID     TEXT    NOT NULL,
+  BlobID       INTEGER NOT NULL,
+  AltOutputID  TEXT NOT NULL DEFAULT '', -- if non-empty, the alternate object ID to use for this action; NULL means the blob's sha256
   CreateTime   INTEGER NOT NULL, -- unix sec when inserted (locally or on a peer)
   AccessTime   INTEGER NOT NULL, -- unix sec of last access
-  InlineOutput BLOB, -- optional inline output value (e.g. for small output)
+
+  PRIMARY KEY (NamespaceID, ActionID),
 
   CHECK (ActionID = lower(ActionID)),
-  CHECK (OutputID = lower(OutputID)),
   CHECK (ActionID GLOB '[0-9a-f]*'),
-  CHECK (OutputID GLOB '[0-9a-f]*' OR OutputID GLOB 'wk*'),
-  CHECK (OutputSize >= 0),
   CHECK (CreateTime >= 0),
-  CHECK (AccessTime >= 0),
-  CHECK (InlineOutput IS NULL OR length(InlineOutput) = OutputSize)
+  CHECK (AccessTime >= 0)
 ) STRICT;
 
-CREATE INDEX IF NOT EXISTS idx_actions_access ON Actions(AccessTime, OutputSize);
+CREATE INDEX IF NOT EXISTS idx_actions_access ON Actions(AccessTime);
+CREATE INDEX IF NOT EXISTS idx_actions_blobid ON Actions(BlobID);
+
+CREATE TABLE IF NOT EXISTS Blobs (
+  BlobID       INTEGER PRIMARY KEY AUTOINCREMENT,
+  SHA256       TEXT NOT NULL,
+  BlobSize     INTEGER NOT NULL, -- size in bytes, either inline or on disk
+  SmallData    BLOB, -- NULL if stored on disk
+
+  CHECK (SmalLData IS NULL OR length(SmallData) = BlobSize)
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_blobs_sha256 ON Blobs(SHA256);
+
+CREATE TABLE IF NOT EXISTS Namespaces (
+  NamespaceID INTEGER PRIMARY KEY AUTOINCREMENT,
+  Namespace   TEXT NOT NULL UNIQUE CHECK (Namespace = lower(Namespace))
+) STRICT;
 `
 
 func openDB(dbDir string) (*sql.DB, error) {
@@ -293,20 +310,25 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var outputID string
+	var sha256hex string
 	var size int64
-	var inlineOutput sql.NullString
+	var smallData sql.NullString
+	var altObjectID string
 	var accessTime int64
-	err := s.db.QueryRow("SELECT OutputID, OutputSize, InlineOutput, AccessTime FROM Actions WHERE ActionID = ?", actionID).Scan(&outputID, &size, &inlineOutput, &accessTime)
+	namespaceID := 0 // global for now; TODO(bradfitz): support namespaces
+	err := s.db.QueryRow(
+		"SELECT b.SHA256, b.BlobSize, b.SmallData, a.AltOutputID, a.AccessTime FROM Actions a, Blobs b WHERE a.NameSpaceID = ? AND a.ActionID = ? AND a.BlobID = b.BlobID",
+		namespaceID, actionID).Scan(
+		&sha256hex, &size, &smallData, &altObjectID, &accessTime)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		httpErr("bad request: missing Want-Object header", http.StatusBadRequest)
+		s.logf("QueryRow error: %v", err)
+		httpErr("Query: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	outputID = outputIDFromWellknown(outputID)
 
 	// If it's been more than a day since the last access, update the access time.
 	// This is similar to the Linux "relatime" behavior.
@@ -323,6 +345,8 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 
 	s.GetHits.Add(1)
 
+	outputID := cmp.Or(altObjectID, sha256hex)
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprint(size))
 	w.Header().Set("Go-Output-Id", outputID)
@@ -331,16 +355,19 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if inlineOutput.Valid {
+	if smallData.Valid {
 		// For small outputs stored inline in the database, we can return them directly.
 		s.GetHitsInline.Add(1)
 		s.GetBytes.Add(size)
-		io.WriteString(w, inlineOutput.String)
+		io.WriteString(w, smallData.String)
 		return
 	}
 
 	// Otherwise, for large objects that we know about, we can try to get them
 	// from our local disk or a peer.
+
+	// TODO(bradfitz): for namespace support (when that comes), this discovery
+	// should only be be sha256, not an actionID or namespace.
 	rc, err := s.getObjectFromDiskOrPeer(ctx, actionID)
 	if err != nil {
 		httpErr(err.Error(), http.StatusInternalServerError)
@@ -393,39 +420,67 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var inline []byte
+	hasher := sha256.New()
+	hashingBody := io.TeeReader(r.Body, hasher)
+
+	var smallData []byte
 	if r.ContentLength <= smallObjectSize {
 		// Store small objects inline in the database.
 		var err error
-		inline, err = io.ReadAll(r.Body)
+		smallData, err = io.ReadAll(hashingBody)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	} else {
 		// For larger objects, we store them on disk.
-		_, err := s.disk.Put(ctx, actionID, outputID, r.ContentLength, r.Body)
+		_, err := s.disk.Put(ctx, actionID, outputID, r.ContentLength, hashingBody)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 
+	sha256hex := fmt.Sprintf("%x", hasher.Sum(nil))
+	blobSize := r.ContentLength
+
+	var blobID int64
+	err := s.db.QueryRow(`INSERT INTO Blobs (SHA256, BlobSize, SmallData)
+		VALUES (?, ?, ?)
+		ON CONFLICT(SHA256) DO UPDATE SET SHA256=excluded.SHA256
+		RETURNING BlobID;
+`, sha256hex, blobSize, smallData).Scan(&blobID)
+	if err != nil {
+		s.logf("Blobs insert error: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	// Insert or update the action in the database.
 	nowUnix := s.now().Unix()
-	_, err := s.db.Exec(`
-INSERT OR IGNORE INTO Actions (ActionID, OutputID, OutputSize, CreateTime, AccessTime, InlineOutput)
-VALUES (?, ?, ?, ?, ?, ?)`,
-		actionID, outputIDOrWellKnown(outputID), r.ContentLength, nowUnix, nowUnix, inline)
+	altObjectID := ""
+	namespace := 0 // global for now; TODO(bradfitz): support namespaces
+	if sha256hex != outputID {
+		altObjectID = outputID
+	}
+	_, err = s.db.Exec(`INSERT OR IGNORE INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime)
+	VALUES (?, ?, ?, ?, ?, ?)`,
+		namespace,
+		actionID,
+		blobID,
+		altObjectID,
+		nowUnix,
+		nowUnix,
+	)
 	if err != nil {
-		s.logf("INSERT error: %v", err)
+		s.logf("Actions insert error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	s.Puts.Add(1)
 	s.PutsBytes.Add(r.ContentLength)
-	if inline != nil {
+	if smallData != nil {
 		s.PutsInline.Add(1)
 	}
 
@@ -436,20 +491,6 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 // value in SQLite to store bytes, as it's common. We store it in SQLite
 // as "wk0" (for "well known 0") to save space, as it's common.
 const sha256OfEmpty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-func outputIDOrWellKnown(id string) string {
-	if id == sha256OfEmpty {
-		return "wk0"
-	}
-	return id
-}
-
-func outputIDFromWellknown(idStored string) string {
-	if idStored == "wk0" {
-		return sha256OfEmpty
-	}
-	return idStored
-}
 
 // expvarCounterMetric is a Prometheus counter metric backed by an expvar.Int.
 type expvarCounterMetric struct {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -96,8 +97,13 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 	if len(actionID) < 4 || len(outputID) < 4 {
 		return "", fmt.Errorf("actionID and outputID must be at least 4 characters long")
 	}
-	if !validHex(actionID) || !validHex(outputID) {
-		return "", fmt.Errorf("actionID and outputID must be valid hex strings")
+	if !validHex(actionID) {
+		log.Printf("diskcache: got invalid actionID %q", actionID)
+		return "", errors.New("actionID must be hex")
+	}
+	if !validHex(outputID) {
+		log.Printf("diskcache: got invalid outputID %q", outputID)
+		return "", errors.New("outputID must be hex")
 	}
 
 	action2, output2 := actionID[:2], outputID[:2]
