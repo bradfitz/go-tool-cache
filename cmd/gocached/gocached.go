@@ -51,7 +51,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/bradfitz/go-tool-cache/cachers"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -152,7 +151,6 @@ func newServer(dir string) (*server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("openDB: %w", err)
 	}
-	dc := &cachers.DiskCache{Dir: dir}
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
@@ -163,7 +161,7 @@ func newServer(dir string) (*server, error) {
 
 	srv := &server{
 		db:   db,
-		disk: dc,
+		dir:  dir,
 		logf: log.Printf,
 	}
 	srv.registerMetrics(reg)
@@ -212,7 +210,7 @@ func (s *server) registerMetrics(reg *prometheus.Registry) {
 
 type server struct {
 	db             *sql.DB
-	disk           *cachers.DiskCache // for large outputs only
+	dir            string // for SQLite DB + large blobs
 	verbose        bool
 	logf           func(format string, args ...any)
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
@@ -366,9 +364,7 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	// Otherwise, for large objects that we know about, we can try to get them
 	// from our local disk or a peer.
 
-	// TODO(bradfitz): for namespace support (when that comes), this discovery
-	// should only be be sha256, not an actionID or namespace.
-	rc, err := s.getObjectFromDiskOrPeer(ctx, actionID)
+	rc, err := s.getObjectFromDiskOrPeer(ctx, sha256hex)
 	if err != nil {
 		httpErr(err.Error(), http.StatusInternalServerError)
 		return
@@ -387,25 +383,27 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 // exists but is not stored in SQLite.
 //
 // It returns (nil, nil) on miss.
-func (s *server) getObjectFromDiskOrPeer(ctx context.Context, actionID string) (rc io.ReadCloser, err error) {
-	_, diskPath, diskErr := s.disk.Get(ctx, actionID)
-	if diskErr != nil {
-		return nil, diskErr
+func (s *server) getObjectFromDiskOrPeer(ctx context.Context, sha256hex string) (rc io.ReadCloser, err error) {
+	if len(sha256hex) != sha256.Size*2 {
+		return nil, fmt.Errorf("invalid sha256hex %q", sha256hex)
 	}
-	if diskPath != "" {
-		f, err := os.Open(diskPath)
-		if err != nil {
+	diskPath := filepath.Join(s.dir, sha256hex[:2], sha256hex)
+	f, err := os.Open(diskPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
 			return nil, err
 		}
+	}
+	if err == nil {
 		return f, nil
 	}
+
 	// TODO(bradfitz): search peers, S3, etc.
 	// For now, just return nil, nil on miss.
 	return nil, nil
 }
 
 func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	if r.Method != "PUT" {
 		http.Error(w, "bad method", http.StatusMethodNotAllowed)
 		return
@@ -432,10 +430,15 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if int64(len(smallData)) != r.ContentLength {
+			// This check is redundant with net/http's validation, but
+			// for extra clarity.
+			http.Error(w, "bad content length", http.StatusInternalServerError)
+			return
+		}
 	} else {
 		// For larger objects, we store them on disk.
-		_, err := s.disk.Put(ctx, actionID, outputID, r.ContentLength, hashingBody)
-		if err != nil {
+		if err := s.writeDiskBlob(r.ContentLength, hashingBody); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -485,6 +488,39 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *server) writeDiskBlob(size int64, r io.Reader) (err error) {
+	nowUnix := s.now().Unix()
+	tf, err := os.CreateTemp(s.dir, fmt.Sprintf("upload-%d-*", nowUnix))
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		tf.Close()
+		os.Remove(tf.Name())
+	}()
+	hasher := sha256.New()
+	n, err := io.Copy(tf, io.LimitReader(io.TeeReader(r, hasher), size+1))
+	if err != nil {
+		return err
+	}
+	if n != size {
+		return fmt.Errorf("wrote %d bytes; wanted %d", n, size)
+	}
+	if err := tf.Close(); err != nil {
+		return err
+	}
+	hex := fmt.Sprintf("%02x", hasher.Sum(nil))
+	dir := filepath.Join(s.dir, hex[:2])
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	target := filepath.Join(dir, hex)
+	return os.Rename(tf.Name(), target)
 }
 
 // sha256OfEmpty is the SHA-256 hash of an empty string, used as a well-known
