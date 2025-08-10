@@ -45,10 +45,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/bradfitz/go-tool-cache/cachers"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	_ "modernc.org/sqlite"
 )
 
@@ -84,20 +89,8 @@ func main() {
 	}
 	srv.verbose = *verbose
 
+	log.Printf("gocached listening on %s ...", *listen)
 	log.Fatal(http.ListenAndServe(*listen, srv))
-}
-
-func newServer(dir string) (*server, error) {
-	db, err := openDB(dir)
-	if err != nil {
-		return nil, fmt.Errorf("openDB: %w", err)
-	}
-	dc := &cachers.DiskCache{Dir: dir}
-	return &server{
-		db:   db,
-		disk: dc,
-		logf: log.Printf,
-	}, nil
 }
 
 const schemaVersion = 1
@@ -137,23 +130,88 @@ func openDB(dbDir string) (*sql.DB, error) {
 	return db, nil
 }
 
+func newServer(dir string) (*server, error) {
+	db, err := openDB(dir)
+	if err != nil {
+		return nil, fmt.Errorf("openDB: %w", err)
+	}
+	dc := &cachers.DiskCache{Dir: dir}
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		collectors.NewBuildInfoCollector(),
+	)
+
+	srv := &server{
+		db:   db,
+		disk: dc,
+		logf: log.Printf,
+	}
+	srv.registerMetrics(reg)
+
+	srv.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{
+		ErrorLog: log.Default(),
+	})
+
+	return srv, nil
+}
+
+func (s *server) registerMetrics(reg *prometheus.Registry) {
+	rv := reflect.ValueOf(s).Elem()
+	t := reflect.TypeOf(s).Elem()
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.Type == reflect.TypeFor[expvar.Int]() {
+			expvarInt := rv.Field(i).Addr().Interface().(*expvar.Int)
+			typ := sf.Tag.Get("type")
+			name := sf.Tag.Get("name")
+			if typ == "" {
+				panic("missing type tag for " + sf.Name)
+			}
+			if name == "" {
+				panic("missing name tag for " + sf.Name)
+			}
+			help := sf.Tag.Get("help")
+			metricName := "gocached_" + name
+
+			if tag := sf.Tag.Get("type"); tag != "" {
+				if tag == "gauge" {
+					reg.MustRegister(singleMetricCollector{&expvarGaugeMetric{
+						desc: prometheus.NewDesc(metricName, help, nil, nil),
+						v:    expvarInt,
+					}})
+				} else if tag == "counter" {
+					reg.MustRegister(singleMetricCollector{&expvarCounterMetric{
+						desc: prometheus.NewDesc(metricName, help, nil, nil),
+						v:    expvarInt,
+					}})
+				}
+			}
+		}
+	}
+}
+
 type server struct {
-	db      *sql.DB
-	disk    *cachers.DiskCache // for large outputs only
-	verbose bool
-	logf    func(format string, args ...any)
-	clock   func() time.Time // if non-nil, alternate time.Now for testing
+	db             *sql.DB
+	disk           *cachers.DiskCache // for large outputs only
+	verbose        bool
+	logf           func(format string, args ...any)
+	clock          func() time.Time // if non-nil, alternate time.Now for testing
+	metricsHandler http.Handler
 
 	// Metrics
-	gets           expvar.Int // gets = getHits + getErrs + implicit misses
-	getBytes       expvar.Int
-	getHits        expvar.Int
-	getAccessBumps expvar.Int // number of times we updated the AccessTime
-	getHitsInline  expvar.Int // includes getHits; subset of getHits stored in SQLite
-	getErrs        expvar.Int // errors from GET requests
-	puts           expvar.Int
-	putsBytes      expvar.Int
-	putsInline     expvar.Int
+	ActiveGets     expvar.Int `type:"gauge" name:"active_gets" help:"currently pending get requests; should usually be zero"`
+	Gets           expvar.Int `type:"counter" name:"gets" help:"total number of gocache get requests"` // gets = getHits + getErrs + implicit misses
+	GetBytes       expvar.Int `type:"counter" name:"get_bytes" help:"total bytes fetched from gocache gets that were cache hits"`
+	GetHits        expvar.Int `type:"counter" name:"get_hits" help:"total number of successful gocache get requests"`
+	GetAccessBumps expvar.Int `type:"counter" name:"get_access_bumps" help:"number of times a get request updated the access time of object"`
+	GetHitsInline  expvar.Int `type:"counter" name:"get_hits_inline" help:"cache hits served from inline database storage (small objects)"`
+	GetErrs        expvar.Int `type:"counter" name:"get_errs" help:"number of gocache get request errors"`
+	Puts           expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
+	PutsBytes      expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
+	PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
 }
 
 func (s *server) now() time.Time {
@@ -171,7 +229,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePut(w, r)
 		return
 	}
-	if r.Method != "GET" {
+	if r.Method != "GET" && r.Method != "HEAD" {
 		http.Error(w, "bad method", http.StatusBadRequest)
 		return
 	}
@@ -180,6 +238,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleGetAction(w, r)
 	case r.URL.Path == "/":
 		io.WriteString(w, "gocached")
+	case r.URL.Path == "/metrics":
+		s.metricsHandler.ServeHTTP(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -212,12 +272,15 @@ func validHex(x string) bool {
 const relAtimeSeconds = 60 * 60 * 24 // 1 day
 
 func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
-	s.gets.Add(1)
+	s.ActiveGets.Add(1)
+	defer s.ActiveGets.Add(-1)
+
+	s.Gets.Add(1)
 	ctx := r.Context()
 
 	httpErr := func(msg string, code int) {
 		http.Error(w, msg, code)
-		s.getErrs.Add(1)
+		s.GetErrs.Add(1)
 	}
 
 	actionID, ok := getHexSuffix(r, "/action/")
@@ -254,10 +317,10 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 			httpErr("internal server error", http.StatusInternalServerError)
 			return
 		}
-		s.getAccessBumps.Add(1)
+		s.GetAccessBumps.Add(1)
 	}
 
-	s.getHits.Add(1)
+	s.GetHits.Add(1)
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprint(size))
@@ -269,8 +332,8 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 
 	if inlineOutput.Valid {
 		// For small outputs stored inline in the database, we can return them directly.
-		s.getHitsInline.Add(1)
-		s.getBytes.Add(size)
+		s.GetHitsInline.Add(1)
+		s.GetBytes.Add(size)
 		io.WriteString(w, inlineOutput.String)
 		return
 	}
@@ -286,7 +349,7 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	s.getBytes.Add(size)
+	s.GetBytes.Add(size)
 	defer rc.Close()
 	io.Copy(w, rc)
 }
@@ -359,11 +422,53 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 		return
 	}
 
-	s.puts.Add(1)
-	s.putsBytes.Add(r.ContentLength)
+	s.Puts.Add(1)
+	s.PutsBytes.Add(r.ContentLength)
 	if inline != nil {
-		s.putsInline.Add(1)
+		s.PutsInline.Add(1)
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// expvarCounterMetric is a Prometheus counter metric backed by an expvar.Int.
+type expvarCounterMetric struct {
+	desc *prometheus.Desc
+	v    *expvar.Int
+}
+
+var _ prometheus.Metric = (*expvarCounterMetric)(nil)
+
+func (m *expvarCounterMetric) Desc() *prometheus.Desc { return m.desc }
+
+func (m *expvarCounterMetric) Write(out *dto.Metric) error {
+	val := float64(m.v.Value())
+	out.Counter = &dto.Counter{Value: &val}
+	return nil
+}
+
+// expvarGaugeMetric is a Prometheus gauge metric backed by an expvar.Int.
+type expvarGaugeMetric struct {
+	desc *prometheus.Desc
+	v    *expvar.Int
+}
+
+var _ prometheus.Metric = (*expvarGaugeMetric)(nil)
+
+func (m *expvarGaugeMetric) Desc() *prometheus.Desc { return m.desc }
+
+func (m *expvarGaugeMetric) Write(out *dto.Metric) error {
+	val := float64(m.v.Value())
+	out.Gauge = &dto.Gauge{Value: &val}
+	return nil
+}
+
+// singleMetricCollector is a Prometheus collector that collects a single metric.
+type singleMetricCollector struct {
+	metric prometheus.Metric
+}
+
+var _ prometheus.Collector = singleMetricCollector{}
+
+func (c singleMetricCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.metric.Desc() }
+func (c singleMetricCollector) Collect(ch chan<- prometheus.Metric) { ch <- c.metric }

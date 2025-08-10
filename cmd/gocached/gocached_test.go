@@ -86,7 +86,7 @@ func TestServer(t *testing.T) {
 		if clientDiskPath == "" {
 			t.Fatal("Put returned empty disk path")
 		}
-		wantMetric(&srv.puts, 1)
+		wantMetric(&srv.Puts, 1)
 		wrote, err := os.ReadFile(clientDiskPath)
 		if err != nil {
 			t.Fatalf("ReadFile: %v", err)
@@ -126,26 +126,26 @@ func TestServer(t *testing.T) {
 	wantGet(c2, testActionIDBig, testOutputIDBig, testObjectValueBig)
 
 	// Check metrics
-	wantMetric(&srv.gets, 2)
-	wantMetric(&srv.getHits, 2)
-	wantMetric(&srv.getHitsInline, 1)
+	wantMetric(&srv.Gets, 2)
+	wantMetric(&srv.GetHits, 2)
+	wantMetric(&srv.GetHitsInline, 1)
 
 	// Do the same get again from the same client. This shouldn't hit the network.
 	wantGet(c2, testActionID, testOutputID, testObjectValue)
-	wantMetric(&srv.gets, 0)
+	wantMetric(&srv.Gets, 0)
 
 	// Cache miss. This should hit the network and fail.
 	if _, _, err = c2.Get(ctx, testActionIDMiss); err != nil {
 		t.Fatalf("miss Get: %v", err)
 	}
-	wantMetric(&srv.gets, 1)
-	wantMetric(&srv.getHits, 0)
+	wantMetric(&srv.Gets, 1)
+	wantMetric(&srv.GetHits, 0)
 
 	// Check that access time gets updated.
 	// Do it from a fresh client without a disk cache.
-	wantMetric(&srv.getAccessBumps, 0)
+	wantMetric(&srv.GetAccessBumps, 0)
 	advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
 	c3 := mkClient()
 	wantGet(c3, testActionID, testOutputID, testObjectValue)
-	wantMetric(&srv.getAccessBumps, 1)
+	wantMetric(&srv.GetAccessBumps, 1)
 }
