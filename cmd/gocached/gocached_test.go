@@ -7,6 +7,8 @@ import (
 	"math"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -56,6 +58,45 @@ func (t *tester) mkClient() *cachers.HTTPClient {
 			},
 		},
 	}
+}
+
+func (st *tester) usageStats() *usageStats {
+	st.t.Helper()
+	stats, err := st.srv.usageStats()
+	if err != nil {
+		st.t.Fatalf("usageStats: %v", err)
+	}
+	return stats
+}
+
+func (st *tester) cleanOldObjects() countAndSize {
+	st.t.Helper()
+	stats, err := st.srv.cleanOldObjects(st.usageStats())
+	if err != nil {
+		st.t.Fatalf("cleanOldObjects: %v", err)
+	}
+	return stats
+}
+
+func (st *tester) diskFiles() []string {
+	st.t.Helper()
+	var ret []string
+
+	err := filepath.Walk(st.srv.dir, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsRegular() || strings.HasPrefix(fi.Name(), ".") || strings.HasPrefix(fi.Name(), "gocached") {
+			return nil
+		}
+		ret = append(ret, fi.Name())
+		return nil
+	})
+	if err != nil {
+		st.t.Fatalf("Walk: %v", err)
+	}
+	slices.Sort(ret)
+	return ret
 }
 
 // wantMetric is a helper to check an expvar.Int metric and reset it
@@ -195,7 +236,6 @@ func TestServer(t *testing.T) {
 		ActionsLE: map[time.Duration]countAndSize{
 			24 * time.Hour:   {Count: 1, Size: 9},
 			48 * time.Hour:   {Count: 1, Size: 9},
-			72 * time.Hour:   {Count: 3, Size: 1034},
 			96 * time.Hour:   {Count: 3, Size: 1034},
 			168 * time.Hour:  {Count: 3, Size: 1034},
 			336 * time.Hour:  {Count: 3, Size: 1034},
@@ -228,7 +268,7 @@ func TestCleanCandidates(t *testing.T) {
 
 	tests := []struct {
 		maxAge time.Duration
-		limit  int
+		limit  int64
 		want   []cleanCandidate
 	}{
 		{
@@ -269,5 +309,77 @@ func TestCleanCandidates(t *testing.T) {
 
 			}
 		})
+	}
+}
+
+func TestCleanOldObjectsByAge(t *testing.T) {
+	st := newServerTester(t)
+	st.srv.maxAge = 24 * time.Hour
+
+	// Populate some data.
+	c1 := st.mkClient()
+	st.wantPut(c1, "0001", "9901", strings.Repeat("x", smallObjectSize+1))
+	st.advanceClock(25 * time.Hour)
+	st.wantPut(c1, "0002", "9902", strings.Repeat("x", smallObjectSize+2))
+	st.wantPut(c1, "0003", "9903", "small")
+	smallLen := int64(len("small"))
+
+	st1 := st.usageStats()
+	if all, want := st1.All(), (countAndSize{Count: 3, Size: smallObjectSize*2 + 3 + smallLen}); all != want {
+		t.Errorf("usageStats: %v; want %v", all, want)
+	}
+	if got, want := st.diskFiles(), []string{"333092a3daf718ed8f38a94e302df139edd4e3b5da4239a497995683942cf28c", "c6d8e9905300876046729949cc95c2385221270d389176f7234fe7ac00c4e430"}; !slices.Equal(got, want) {
+		t.Errorf("diskFiles: %v; want %v", got, want)
+	}
+
+	clean1 := st.cleanOldObjects()
+	if clean1.Count != 1 || clean1.Size != smallObjectSize+1 {
+		t.Errorf("cleanOldObjects got %v, want {Count: 1, Size: %d}", clean1, smallObjectSize+1)
+	}
+	clean2 := st.cleanOldObjects()
+	if clean2.Count != 0 || clean2.Size != 0 {
+		t.Errorf("cleanOldObjects got %v, want {Count: 0, Size: 0}", clean2)
+	}
+
+	st2 := st.usageStats()
+	if all, want := st2.All(), (countAndSize{Count: 2, Size: smallObjectSize + 2 + smallLen}); all != want {
+		t.Errorf("usageStats after clean: %v; want %v", all, want)
+	}
+	if got, want := st.diskFiles(), []string{"333092a3daf718ed8f38a94e302df139edd4e3b5da4239a497995683942cf28c"}; !slices.Equal(got, want) {
+		t.Errorf("diskFiles after clean: %v; want %v", got, want)
+	}
+}
+
+func TestCleanOldObjectsBySize(t *testing.T) {
+	st := newServerTester(t)
+
+	// Populate some data.
+	c1 := st.mkClient()
+	st.wantPut(c1, "0001", "9901", "1")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0002", "9902", "22")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0003", "9903", "333")
+	st.advanceClock(time.Second)
+	st.wantPut(c1, "0004", "9904", "4444")
+	st.advanceClock(time.Second)
+
+	st1 := st.usageStats()
+	if all, want := st1.All(), (countAndSize{Count: 4, Size: 10}); all != want {
+		t.Errorf("usageStats: %v; want %v", all, want)
+	}
+
+	clean1 := st.cleanOldObjects()
+	if clean1.Count != 0 || clean1.Size != 0 {
+		t.Errorf("cleanOldObjects got %v, want no clean", clean1)
+	}
+
+	st.srv.maxSize = 8 // the only way get to 8 or under is by deleting "1" and "22" (3 bytes)
+
+	if got, want := st.cleanOldObjects(), (countAndSize{Count: 2, Size: 3}); got != want {
+		t.Errorf("cleanOldObjects got %v, want %v", got, want)
+	}
+	if got, want := st.usageStats().All(), (countAndSize{Count: 2, Size: 7}); got != want {
+		t.Errorf("usageStats: %v; want %v", got, want)
 	}
 }

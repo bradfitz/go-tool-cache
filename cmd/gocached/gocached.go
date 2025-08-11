@@ -38,19 +38,22 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"expvar"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -69,6 +72,9 @@ var (
 	dir     = flag.String("cache-dir", "", "cache directory, if empty defaults to <UserCacheDir>/gocached")
 	verbose = flag.Bool("verbose", false, "be verbose")
 	listen  = flag.String("listen", ":31364", "listen address")
+
+	maxSize = flag.Int("max-size-gb", 50, "maximum size of the cache in GiB; 0 means no limit")
+	maxAge  = flag.Int("max-age-days", 60, "maximum age of objects in the cache in days; 0 means no limit")
 )
 
 func main() {
@@ -91,8 +97,25 @@ func main() {
 		log.Fatalf("newServer: %v", err)
 	}
 	srv.verbose = *verbose
+	srv.maxSize = int64(*maxSize) << 30
+	srv.maxAge = time.Duration(*maxAge) * 24 * time.Hour
 
-	log.Printf("gocached listening on %s ...", *listen)
+	log.Printf("gocached: scanning usage & cleaning as needed...")
+	us, err := srv.usageStats()
+	if err != nil {
+		log.Fatalf("getting usage stats: %v", err)
+	}
+
+	log.Printf("gocached: current usage: %v of limit %v", us.All(), bytesFmt(srv.maxSize))
+	if res, err := srv.cleanOldObjects(us); err != nil {
+		log.Fatalf("clean old objects: %v", err)
+	} else if res.Count > 0 {
+		log.Printf("gocached: cleaned %v", res)
+	}
+
+	go srv.runCleanLoop()
+
+	log.Printf("gocached: listening on %s ...", *listen)
 	log.Fatal(http.ListenAndServe(*listen, srv))
 }
 
@@ -166,6 +189,7 @@ func newServer(dir string) (*server, error) {
 		dir:  dir,
 		logf: log.Printf,
 	}
+	srv.shutdownCtx, srv.shutdownCancel = context.WithCancel(context.Background())
 	srv.registerMetrics(reg)
 
 	srv.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{
@@ -217,16 +241,16 @@ type server struct {
 	logf           func(format string, args ...any)
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
 	metricsHandler http.Handler
+	maxSize        int64         // maximum size of the cache in bytes; 0 means no limit
+	maxAge         time.Duration // maximum age of objects; 0 means no limit
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 
-	// statsMu protects stats & cleanups to the DB, so that we don't have
-	// multiple goroutines writing to the DB at the same time.
-	//
-	// It's a read-write mutex so that writes can still happen concurrently (to
-	// the extent permitted by SQLite, which will still serialize its bit).
-	statsMu sync.RWMutex
+	lastUsage atomic.Pointer[usageStats]
 
 	// Metrics
 	ActiveGets     expvar.Int `type:"gauge" name:"active_gets" help:"currently pending get requests; should usually be zero"`
+	ActivePuts     expvar.Int `type:"gauge" name:"active_puts" help:"currently pending put requests; should usually be zero"`
 	Gets           expvar.Int `type:"counter" name:"gets" help:"total number of gocache get requests"` // gets = getHits + getErrs + implicit misses
 	GetBytes       expvar.Int `type:"counter" name:"get_bytes" help:"total bytes fetched from gocache gets that were cache hits"`
 	GetHits        expvar.Int `type:"counter" name:"get_hits" help:"total number of successful gocache get requests"`
@@ -236,21 +260,27 @@ type server struct {
 	Puts           expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
 	PutsBytes      expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
 	PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
+	BlobCount      expvar.Int `type:"gauge" name:"blob_count" help:"number of blobs currently stored in the cache"`
+	BlobBytes      expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
 }
 
-func (s *server) now() time.Time {
-	if s.clock != nil {
-		return s.clock()
+func (srv *server) now() time.Time {
+	if srv.clock != nil {
+		return srv.clock()
 	}
 	return time.Now()
 }
 
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.verbose {
-		s.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
+func (srv *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if srv.verbose {
+		srv.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
+	}
+	if r.URL.Path == "/usage" {
+		srv.serveUsage(w, r)
+		return
 	}
 	if r.Method == "PUT" {
-		s.handlePut(w, r)
+		srv.handlePut(w, r)
 		return
 	}
 	if r.Method != "GET" && r.Method != "HEAD" {
@@ -259,11 +289,15 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/action/"):
-		s.handleGetAction(w, r)
+		srv.handleGetAction(w, r)
 	case r.URL.Path == "/":
-		io.WriteString(w, "gocached")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, "<h1>gocached</h1>")
+		io.WriteString(w, "<p>This is a shared Go build cache server, hit by GOCACHEPROG clients.</p>")
+		io.WriteString(w, "<p>See <a href='/usage'>/usage</a> for usage stats.</p>")
+		io.WriteString(w, "<p>See <a href='/metrics'>/metrics</a> for Prometheus metrics.</p>")
 	case r.URL.Path == "/metrics":
-		s.metricsHandler.ServeHTTP(w, r)
+		srv.metricsHandler.ServeHTTP(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -295,16 +329,16 @@ func validHex(x string) bool {
 // we do a DB write to update it.
 const relAtimeSeconds = 60 * 60 * 24 // 1 day
 
-func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
-	s.ActiveGets.Add(1)
-	defer s.ActiveGets.Add(-1)
+func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
+	srv.ActiveGets.Add(1)
+	defer srv.ActiveGets.Add(-1)
 
-	s.Gets.Add(1)
+	srv.Gets.Add(1)
 	ctx := r.Context()
 
 	httpErr := func(msg string, code int) {
 		http.Error(w, msg, code)
-		s.GetErrs.Add(1)
+		srv.GetErrs.Add(1)
 	}
 
 	actionID, ok := getHexSuffix(r, "/action/")
@@ -323,7 +357,7 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	var altObjectID string
 	var accessTime int64
 	namespaceID := 0 // global for now; TODO(bradfitz): support namespaces
-	err := s.db.QueryRow(
+	err := srv.db.QueryRow(
 		"SELECT b.SHA256, b.BlobSize, b.SmallData, a.AltOutputID, a.AccessTime FROM Actions a, Blobs b WHERE a.NameSpaceID = ? AND a.ActionID = ? AND a.BlobID = b.BlobID",
 		namespaceID, actionID).Scan(
 		&sha256hex, &size, &smallData, &altObjectID, &accessTime)
@@ -332,27 +366,27 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		s.logf("QueryRow error: %v", err)
+		srv.logf("QueryRow error: %v", err)
 		httpErr("Query: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// If it's been more than a day since the last access, update the access time.
 	// This is similar to the Linux "relatime" behavior.
-	now := s.now().Unix()
+	now := srv.now().Unix()
 	if accessTime < now-relAtimeSeconds {
 		// TODO(bradfitz): do this async? not worth blocking the caller.
 		// But we need a mechanism for tests to wait on async work.
-		_, err := s.db.Exec("UPDATE Actions SET AccessTime = ? WHERE ActionID = ?", now, actionID)
+		_, err := srv.db.Exec("UPDATE Actions SET AccessTime = ? WHERE ActionID = ?", now, actionID)
 		if err != nil {
-			s.logf("Update AccessTime error: %v", err)
+			srv.logf("Update AccessTime error: %v", err)
 			httpErr("internal server error", http.StatusInternalServerError)
 			return
 		}
-		s.GetAccessBumps.Add(1)
+		srv.GetAccessBumps.Add(1)
 	}
 
-	s.GetHits.Add(1)
+	srv.GetHits.Add(1)
 
 	outputID := cmp.Or(altObjectID, sha256hex)
 
@@ -366,8 +400,8 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 
 	if smallData.Valid {
 		// For small outputs stored inline in the database, we can return them directly.
-		s.GetHitsInline.Add(1)
-		s.GetBytes.Add(size)
+		srv.GetHitsInline.Add(1)
+		srv.GetBytes.Add(size)
 		io.WriteString(w, smallData.String)
 		return
 	}
@@ -375,7 +409,7 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	// Otherwise, for large objects that we know about, we can try to get them
 	// from our local disk or a peer.
 
-	rc, err := s.getObjectFromDiskOrPeer(ctx, sha256hex)
+	rc, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex)
 	if err != nil {
 		httpErr(err.Error(), http.StatusInternalServerError)
 		return
@@ -389,7 +423,7 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	s.GetBytes.Add(size)
+	srv.GetBytes.Add(size)
 	defer rc.Close()
 	io.Copy(w, rc)
 }
@@ -399,11 +433,11 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 // exists but is not stored in SQLite.
 //
 // It returns (nil, nil) on miss.
-func (s *server) getObjectFromDiskOrPeer(ctx context.Context, sha256hex string) (rc io.ReadCloser, err error) {
+func (srv *server) getObjectFromDiskOrPeer(ctx context.Context, sha256hex string) (rc io.ReadCloser, err error) {
 	if len(sha256hex) != sha256.Size*2 {
 		return nil, fmt.Errorf("invalid sha256hex %q", sha256hex)
 	}
-	diskPath := filepath.Join(s.dir, sha256hex[:2], sha256hex)
+	diskPath := filepath.Join(srv.dir, sha256hex[:2], sha256hex)
 	f, err := os.Open(diskPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -417,8 +451,8 @@ func (s *server) getObjectFromDiskOrPeer(ctx context.Context, sha256hex string) 
 }
 
 func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
-	s.statsMu.RLock()
-	defer s.statsMu.RUnlock()
+	s.ActivePuts.Add(1)
+	defer s.ActivePuts.Add(-1)
 
 	if r.Method != "PUT" {
 		http.Error(w, "bad method", http.StatusMethodNotAllowed)
@@ -506,6 +540,11 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *server) sha256Filepath(hash [sha256.Size]byte) string {
+	hex := fmt.Sprintf("%x", hash)
+	return filepath.Join(s.dir, hex[:2], hex)
+}
+
 func (s *server) writeDiskBlob(size int64, r io.Reader) (err error) {
 	nowUnix := s.now().Unix()
 	tf, err := os.CreateTemp(s.dir, fmt.Sprintf("upload-%d-*", nowUnix))
@@ -530,18 +569,26 @@ func (s *server) writeDiskBlob(size int64, r io.Reader) (err error) {
 	if err := tf.Close(); err != nil {
 		return err
 	}
-	hex := fmt.Sprintf("%02x", hasher.Sum(nil))
-	dir := filepath.Join(s.dir, hex[:2])
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	var hash [sha256.Size]byte
+	hasher.Sum(hash[:0])
+
+	target := s.sha256Filepath(hash)
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		return err
 	}
-	target := filepath.Join(dir, hex)
 	return os.Rename(tf.Name(), target)
 }
 
 type countAndSize struct {
 	Count int64 // number of actions
 	Size  int64 // total size of all actions' blobs (even if shared by other actions)
+}
+
+func (cs countAndSize) String() string {
+	if cs.Count == 0 {
+		return "0 objects, 0 bytes"
+	}
+	return fmt.Sprintf("%d objects, %s", cs.Count, bytesFmt(cs.Size))
 }
 
 type usageStats struct {
@@ -554,7 +601,7 @@ type usageStats struct {
 	// The map keys are day-granularity, as the access time is only updated once
 	// it's over a day old.
 	//
-	// So the map keys are 24h, 48h, 72h, 96h, 168h (7d), 336h (14d), 720h
+	// So the map keys are 24h, 48h, 96h, 168h (7d), 336h (14d), 720h
 	// (30d), and 2160h (90d) and math.MaxInt64 for infinity.
 	ActionsLE map[time.Duration]countAndSize
 
@@ -564,10 +611,19 @@ type usageStats struct {
 	MissingBlobRows int
 }
 
-var durs = []time.Duration{
-	24 * time.Hour, 48 * time.Hour, 72 * time.Hour,
-	96 * time.Hour, 168 * time.Hour, 336 * time.Hour,
-	720 * time.Hour, 2160 * time.Hour, math.MaxInt64,
+func (us *usageStats) All() countAndSize { return us.ActionsLE[math.MaxInt64] }
+
+const day = 24 * time.Hour
+
+var standardDurs = []time.Duration{
+	1 * day,
+	2 * day,
+	4 * day,
+	7 * day,
+	14 * day,
+	30 * day,
+	90 * day,
+	math.MaxInt64,
 }
 
 func (s *server) usageStats() (_ *usageStats, err error) {
@@ -577,11 +633,26 @@ func (s *server) usageStats() (_ *usageStats, err error) {
 		}
 	}()
 
-	s.statsMu.Lock()
-	defer s.statsMu.Unlock()
-
 	st := &usageStats{
 		ActionsLE: make(map[time.Duration]countAndSize),
+	}
+
+	// Build the durations to use for the histogram.
+	// The math.MaxInt64 value is always included.
+	// If s.maxAge is set, we ignore sizes above that, except
+	// for the math.MaxInt64 value.
+	var durs []time.Duration
+	if s.maxAge == 0 {
+		durs = standardDurs
+	} else {
+		durs = make([]time.Duration, 0, len(standardDurs)+1)
+		durs = append(durs, s.maxAge)
+		for _, d := range standardDurs {
+			if d < s.maxAge || d == math.MaxInt64 {
+				durs = append(durs, d)
+			}
+		}
+		slices.Sort(durs)
 	}
 
 	now := s.now().Unix()
@@ -619,6 +690,10 @@ func (s *server) usageStats() (_ *usageStats, err error) {
 		return nil, fmt.Errorf("rows.Next: %w", err)
 	}
 
+	s.lastUsage.Store(st)
+	all := st.All()
+	s.BlobCount.Set(all.Count)
+	s.BlobBytes.Set(all.Size)
 	return st, nil
 }
 
@@ -628,7 +703,7 @@ type cleanCandidate struct {
 	BlobSize int64 // size of the blob, in bytes
 }
 
-func (s *server) cleanCandidates(olderThan time.Duration, limit int) ([]cleanCandidate, error) {
+func (s *server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanCandidate, error) {
 	now := s.now()
 	nowUnix := now.Unix()
 	cutoff := now.Add(-olderThan).Unix()
@@ -660,7 +735,204 @@ func (s *server) cleanCandidates(olderThan time.Duration, limit int) ([]cleanCan
 	}
 
 	return candidates, nil
+}
 
+func (srv *server) deleteBlobs(blobIDs ...int64) error {
+	tx, err := srv.db.Begin()
+	if err != nil {
+		return fmt.Errorf("delete blob Begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	for _, blobID := range blobIDs {
+		var sha256Hex string
+		if err := tx.QueryRow("SELECT SHA256 FROM Blobs WHERE BlobID = ?", blobID).Scan(&sha256Hex); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("querying blob SHA256: %w", err)
+		}
+		if _, err := tx.Exec("DELETE FROM Blobs WHERE BlobID = ?", blobID); err != nil {
+			return fmt.Errorf("deleting blob: %w", err)
+		}
+		if _, err := tx.Exec("DELETE FROM Actions WHERE BlobID = ?", blobID); err != nil {
+			return fmt.Errorf("deleting actions: %w", err)
+		}
+		var hash [sha256.Size]byte
+		if _, err := hex.Decode(hash[:], []byte(sha256Hex)); err == nil {
+			if err := os.Remove(srv.sha256Filepath(hash)); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removing disk file: %w", err)
+			}
+		}
+	}
+	return tx.Commit()
+}
+
+func (srv *server) cleanOldObjects(us *usageStats) (countAndSize, error) {
+	var zero countAndSize
+	var ret countAndSize
+
+	all := us.ActionsLE[math.MaxInt64]
+	if srv.verbose {
+		srv.logf("current usage stats: %v", all)
+		last := all
+		for _, d := range slices.Sorted(maps.Keys(us.ActionsLE)) {
+			if d == math.MaxInt64 {
+				continue // skip infinity
+			}
+			c := us.ActionsLE[d]
+			srv.logf("  <=%v: %v", durFmt(d), c)
+			if last == c {
+				break
+			}
+			last = c
+		}
+	}
+
+	// First clean things that are just too old.
+	if srv.maxAge > 0 {
+		if toDelete := all.Count - us.ActionsLE[srv.maxAge].Count; toDelete > 0 {
+			srv.logf("Cleaning %d objects older than %v ...", toDelete, durFmt(srv.maxAge))
+			candidates, err := srv.cleanCandidates(srv.maxAge, toDelete+1)
+			if err != nil {
+				return zero, fmt.Errorf("getting clean candidates: %v", err)
+			}
+			blobIDs := make([]int64, 0, len(candidates))
+			var sumSize int64
+			for _, c := range candidates {
+				blobIDs = append(blobIDs, c.BlobID)
+				sumSize += c.BlobSize
+			}
+			if err := srv.deleteBlobs(blobIDs...); err != nil {
+				return zero, fmt.Errorf("deleting old blobs: %v", err)
+			}
+			all.Count -= int64(len(candidates))
+			all.Size -= sumSize
+			ret.Count += int64(len(candidates))
+			ret.Size += sumSize
+		}
+	}
+
+	for srv.maxSize > 0 && all.Size > srv.maxSize {
+		toClean := all.Size - srv.maxSize
+		if srv.verbose {
+			srv.logf("need to clean %v to get under max size of %v ...",
+				bytesFmt(toClean), bytesFmt(srv.maxSize))
+		}
+
+		var batchBytes int64
+		var blobIDs []int64
+		candidates, err := srv.cleanCandidates(0, 10000)
+		if err != nil {
+			return zero, fmt.Errorf("getting clean candidates: %v", err)
+		}
+		for _, c := range candidates {
+			blobIDs = append(blobIDs, c.BlobID)
+			batchBytes += c.BlobSize
+			if batchBytes >= toClean {
+				break
+			}
+		}
+		if err := srv.deleteBlobs(blobIDs...); err != nil {
+			return zero, fmt.Errorf("deleting old blobs: %v", err)
+		}
+		ret.Count += int64(len(blobIDs))
+		ret.Size += batchBytes
+		all.Count -= int64(len(blobIDs))
+		all.Size -= batchBytes
+
+		if len(blobIDs) == len(candidates) {
+			// We didn't find enough candidates to delete.
+			// Just stop here.
+			srv.logf("[unexpected] didn't find enough candidates to delete")
+			break
+		}
+	}
+
+	return ret, nil
+}
+
+func (srv *server) runCleanLoop() {
+	for {
+		select {
+		case <-srv.shutdownCtx.Done():
+			return
+		case <-time.After(5 * time.Minute):
+		}
+
+		us, err := srv.usageStats()
+		if err != nil {
+			srv.logf("error getting usage stats: %v", err)
+			continue
+		}
+
+		res, err := srv.cleanOldObjects(us)
+		if err != nil {
+			srv.logf("error cleaning old objects: %v", err)
+			continue
+		}
+		if res.Count > 0 {
+			srv.logf("cleaned %v", res)
+			srv.usageStats() // for side effect of updating lastUsage
+		}
+
+	}
+}
+
+func durFmt(d time.Duration) string {
+	days := int(d.Hours() / 24)
+	if days > 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return d.String()
+}
+
+func bytesFmt(n int64) string {
+	if n >= 1<<30 {
+		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+	}
+	if n >= 1<<20 {
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	}
+	if n >= 1<<10 {
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d bytes", n)
+}
+
+func (srv *server) serveUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		// For side effect of updating lastUsage.
+		_, err := srv.usageStats()
+		if err != nil {
+			http.Error(w, "error getting usage stats: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	us := srv.lastUsage.Load()
+	if us == nil {
+		http.Error(w, "no usage stats available", http.StatusInternalServerError)
+		return
+	}
+
+	// Print out an HTML table of the usage stats, sorted by age.
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, "<html><body><h1>gocached usage stats</h1>\n")
+	fmt.Fprintf(w, "<p>Current usage: %v of limit %v</p>\n",
+		us.All(), bytesFmt(srv.maxSize))
+
+	fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")
+	fmt.Fprintf(w, "<tr><th>Age</th><th>Count</th><th>Size</th></tr>\n")
+	for _, d := range slices.Sorted(maps.Keys(us.ActionsLE)) {
+		var title string
+		if d == math.MaxInt64 {
+			title = "all"
+		} else {
+			title = "&lt;= " + durFmt(d)
+		}
+		c := us.ActionsLE[d]
+		fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%s</td></tr>\n",
+			title, c.Count, bytesFmt(c.Size))
+	}
+	fmt.Fprintf(w, "</table>\n")
 }
 
 // expvarCounterMetric is a Prometheus counter metric backed by an expvar.Int.
