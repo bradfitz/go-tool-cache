@@ -44,11 +44,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -216,6 +218,13 @@ type server struct {
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
 	metricsHandler http.Handler
 
+	// statsMu protects stats & cleanups to the DB, so that we don't have
+	// multiple goroutines writing to the DB at the same time.
+	//
+	// It's a read-write mutex so that writes can still happen concurrently (to
+	// the extent permitted by SQLite, which will still serialize its bit).
+	statsMu sync.RWMutex
+
 	// Metrics
 	ActiveGets     expvar.Int `type:"gauge" name:"active_gets" help:"currently pending get requests; should usually be zero"`
 	Gets           expvar.Int `type:"counter" name:"gets" help:"total number of gocache get requests"` // gets = getHits + getErrs + implicit misses
@@ -332,6 +341,8 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	// This is similar to the Linux "relatime" behavior.
 	now := s.now().Unix()
 	if accessTime < now-relAtimeSeconds {
+		// TODO(bradfitz): do this async? not worth blocking the caller.
+		// But we need a mechanism for tests to wait on async work.
 		_, err := s.db.Exec("UPDATE Actions SET AccessTime = ? WHERE ActionID = ?", now, actionID)
 		if err != nil {
 			s.logf("Update AccessTime error: %v", err)
@@ -370,6 +381,11 @@ func (s *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rc == nil {
+		// Our database suggested we should've had this object,
+		// but maybe somebody delete it by hand from the filesystem.
+		// Just treat it as a cache miss. The background cleanup
+		// will eventually remove the Action row from the DB
+		// after identifying it as a dangling reference.
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -390,20 +406,20 @@ func (s *server) getObjectFromDiskOrPeer(ctx context.Context, sha256hex string) 
 	diskPath := filepath.Join(s.dir, sha256hex[:2], sha256hex)
 	f, err := os.Open(diskPath)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, err
+		if os.IsNotExist(err) {
+			// TODO(bradfitz): search peers, S3, etc.
+			// For now, just return nil, nil on miss.
+			return nil, nil
 		}
+		return nil, err
 	}
-	if err == nil {
-		return f, nil
-	}
-
-	// TODO(bradfitz): search peers, S3, etc.
-	// For now, just return nil, nil on miss.
-	return nil, nil
+	return f, nil
 }
 
 func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
+	s.statsMu.RLock()
+	defer s.statsMu.RUnlock()
+
 	if r.Method != "PUT" {
 		http.Error(w, "bad method", http.StatusMethodNotAllowed)
 		return
@@ -523,10 +539,129 @@ func (s *server) writeDiskBlob(size int64, r io.Reader) (err error) {
 	return os.Rename(tf.Name(), target)
 }
 
-// sha256OfEmpty is the SHA-256 hash of an empty string, used as a well-known
-// value in SQLite to store bytes, as it's common. We store it in SQLite
-// as "wk0" (for "well known 0") to save space, as it's common.
-const sha256OfEmpty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+type countAndSize struct {
+	Count int64 // number of actions
+	Size  int64 // total size of all actions' blobs (even if shared by other actions)
+}
+
+type usageStats struct {
+	// ActionsLE is a histogram of the actions in the DB by their access time.
+	//
+	// The key is a Prometheus-style histogram "less than" value. That is, if
+	// there are map keys for 24h and 48h, the latter includes the sum of the
+	// 24h values as well.
+	//
+	// The map keys are day-granularity, as the access time is only updated once
+	// it's over a day old.
+	//
+	// So the map keys are 24h, 48h, 72h, 96h, 168h (7d), 336h (14d), 720h
+	// (30d), and 2160h (90d) and math.MaxInt64 for infinity.
+	ActionsLE map[time.Duration]countAndSize
+
+	// MissingBlobRows is the number of rows in the Actions table that
+	// reference a BlobID that doesn't exist in the Blobs table.
+	// This should always be zero in a healthy system.
+	MissingBlobRows int
+}
+
+var durs = []time.Duration{
+	24 * time.Hour, 48 * time.Hour, 72 * time.Hour,
+	96 * time.Hour, 168 * time.Hour, 336 * time.Hour,
+	720 * time.Hour, 2160 * time.Hour, math.MaxInt64,
+}
+
+func (s *server) usageStats() (_ *usageStats, err error) {
+	defer func() {
+		if err != nil {
+			s.logf("usageStats error: %v", err)
+		}
+	}()
+
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+
+	st := &usageStats{
+		ActionsLE: make(map[time.Duration]countAndSize),
+	}
+
+	now := s.now().Unix()
+	rows, err := s.db.Query(
+		"SELECT a.BlobID, a.AccessTime, b.BlobSize FROM Actions a LEFT JOIN Blobs b ON a.BlobID = b.BlobID")
+	if err != nil {
+		return nil, fmt.Errorf("query Actions: %w", err)
+	}
+	var blobID int64
+	var accessTime int64
+	var blobSize sql.NullInt64
+	for rows.Next() {
+		if err := rows.Scan(&blobID, &accessTime, &blobSize); err != nil {
+			return nil, fmt.Errorf("rows.Scan: %w", err)
+		}
+		if !blobSize.Valid {
+			st.MissingBlobRows++
+			continue
+		}
+
+		dur := time.Duration(now-accessTime) * time.Second
+		if dur < 0 {
+			dur = 0
+		}
+		for _, d := range durs {
+			if dur < d {
+				was := st.ActionsLE[d]
+				was.Count++
+				was.Size += blobSize.Int64
+				st.ActionsLE[d] = was
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows.Next: %w", err)
+	}
+
+	return st, nil
+}
+
+type cleanCandidate struct {
+	BlobID   int64
+	Age      time.Duration
+	BlobSize int64 // size of the blob, in bytes
+}
+
+func (s *server) cleanCandidates(olderThan time.Duration, limit int) ([]cleanCandidate, error) {
+	now := s.now()
+	nowUnix := now.Unix()
+	cutoff := now.Add(-olderThan).Unix()
+
+	rows, err := s.db.Query(`
+		SELECT b.BlobID, MAX(a.AccessTime), b.BlobSize
+		FROM Blobs b LEFT JOIN Actions a ON b.BlobID = a.BlobID
+		GROUP BY b.BlobID
+		HAVING MAX(a.AccessTime) <= ?
+		ORDER BY MAX(a.AccessTime)
+		LIMIT ?`, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query clean candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var candidates []cleanCandidate
+	var accessTime int64
+	for rows.Next() {
+		var c cleanCandidate
+		if err := rows.Scan(&c.BlobID, &accessTime, &c.BlobSize); err != nil {
+			return nil, fmt.Errorf("rows.Scan: %w", err)
+		}
+		c.Age = time.Duration(nowUnix-accessTime) * time.Second
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows.Next: %w", err)
+	}
+
+	return candidates, nil
+
+}
 
 // expvarCounterMetric is a Prometheus counter metric backed by an expvar.Int.
 type expvarCounterMetric struct {
