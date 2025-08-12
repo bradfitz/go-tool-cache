@@ -7,9 +7,15 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"time"
 
 	"github.com/bradfitz/go-tool-cache/cacheproc"
 	"github.com/bradfitz/go-tool-cache/cachers"
@@ -19,6 +25,7 @@ var (
 	dir        = flag.String("cache-dir", "", "cache directory; empty means automatic")
 	serverBase = flag.String("cache-server", "", "optional cache server HTTP prefix (scheme and authority only); should be low latency. empty means to not use one.")
 	verbose    = flag.Bool("verbose", false, "be verbose")
+	gwPort     = flag.Int("gateway-addr-port", 0, "if non-zero, try to use an HTTP server on this port on our machine's gateway IP. If that fails, use local disk instead.")
 )
 
 func main() {
@@ -54,6 +61,24 @@ func main() {
 		Put: dc.Put,
 	}
 
+	if *gwPort != 0 {
+		if gw, ok := getGatewayIP(); ok {
+			probe := net.JoinHostPort(gw, fmt.Sprint(*gwPort))
+			log.Printf("go-cacher: probing gateway IP %v", gw)
+			var d net.Dialer
+			d.Timeout = time.Second / 2
+			c, err := d.Dial("tcp", probe)
+			if err != nil {
+				log.Printf("go-cacher: failed to probe %v: %v", probe, err)
+			} else {
+				c.Close()
+				*serverBase = "http://" + probe
+			}
+		} else {
+			log.Printf("go-cacher: failed to get gateway IP; using local disk cache instead")
+		}
+	}
+
 	if *serverBase != "" {
 		hc := &cachers.HTTPClient{
 			BaseURL: *serverBase,
@@ -67,4 +92,20 @@ func main() {
 	if err := p.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func getGatewayIP() (ip string, ok bool) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
+	if err != nil {
+		log.Printf("getGatewayIP: %v, %s", err, out)
+		return "", false
+	}
+	rx := regexp.MustCompile(`(?m)^\s*gateway: (\S+)`)
+	if m := rx.FindSubmatch(out); len(m) == 2 {
+		return string(m[1]), true
+	}
+	return "", false
 }
