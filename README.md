@@ -9,7 +9,8 @@ custom `GOCACHE` implementations to handle the cache however you'd like.
 
 ## Status
 
-Currently you need to build your own Go toolchain to use this. As of 2023-04-24 it's still an open proposal & work in progress.
+- Starting from [Go 1.24](https://tip.golang.org/doc/go1.24) you can use the official golang releases. For protocol details - [see the documentation](https://tip.golang.org/cmd/go/internal/cacheprog)
+- This was previously behind a GOEXPERIMENT
 
 ## Using
 
