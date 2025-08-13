@@ -258,10 +258,13 @@ type server struct {
 	GetHitsInline  expvar.Int `type:"counter" name:"get_hits_inline" help:"cache hits served from inline database storage (small objects)"`
 	GetErrs        expvar.Int `type:"counter" name:"get_errs" help:"number of gocache get request errors"`
 	Puts           expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
+	PutsDup        expvar.Int `type:"counter" name:"puts_dup" help:"total number of gocache put requests that are duplicates of a mapping we already had"`
 	PutsBytes      expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
 	PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
 	BlobCount      expvar.Int `type:"gauge" name:"blob_count" help:"number of blobs currently stored in the cache"`
 	BlobBytes      expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
+	EvictedBlobs   expvar.Int `type:"counter" name:"evicted_blobs" help:"number of blobs evicted from the cache"`
+	EvictedBytes   expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes evicted from the cache"`
 }
 
 func (srv *server) now() time.Time {
@@ -516,7 +519,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	if sha256hex != outputID {
 		altObjectID = outputID
 	}
-	_, err = s.db.Exec(`INSERT OR IGNORE INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime)
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime)
 	VALUES (?, ?, ?, ?, ?, ?)`,
 		namespace,
 		actionID,
@@ -529,6 +532,17 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		s.logf("Actions insert error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	affected, err := res.RowsAffected()
+	if err != nil {
+		s.logf("Actions rows affected error: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if affected == 0 {
+		s.PutsDup.Add(1)
 	}
 
 	s.Puts.Add(1)
@@ -744,11 +758,14 @@ func (srv *server) deleteBlobs(blobIDs ...int64) error {
 	}
 	defer tx.Rollback()
 
+	var sumBytes int64
 	for _, blobID := range blobIDs {
 		var sha256Hex string
-		if err := tx.QueryRow("SELECT SHA256 FROM Blobs WHERE BlobID = ?", blobID).Scan(&sha256Hex); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		var blobSize int64
+		if err := tx.QueryRow("SELECT SHA256, BlobSize FROM Blobs WHERE BlobID = ?", blobID).Scan(&sha256Hex, &blobSize); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("querying blob SHA256: %w", err)
 		}
+		sumBytes += blobSize
 		if _, err := tx.Exec("DELETE FROM Blobs WHERE BlobID = ?", blobID); err != nil {
 			return fmt.Errorf("deleting blob: %w", err)
 		}
@@ -762,7 +779,14 @@ func (srv *server) deleteBlobs(blobIDs ...int64) error {
 			}
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	srv.EvictedBlobs.Add(int64(len(blobIDs)))
+	srv.EvictedBytes.Add(sumBytes)
+
+	return nil
 }
 
 func (srv *server) cleanOldObjects(us *usageStats) (countAndSize, error) {
@@ -833,6 +857,7 @@ func (srv *server) cleanOldObjects(us *usageStats) (countAndSize, error) {
 		if err := srv.deleteBlobs(blobIDs...); err != nil {
 			return zero, fmt.Errorf("deleting old blobs: %v", err)
 		}
+
 		ret.Count += int64(len(blobIDs))
 		ret.Size += batchBytes
 		all.Count -= int64(len(blobIDs))
