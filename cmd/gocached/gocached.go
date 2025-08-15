@@ -53,6 +53,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -246,6 +247,12 @@ type server struct {
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 
+	// sqliteWriteMu serializes access to SQLite. In theory the SQLite driver
+	// should serialize access with our 5000ms busy timeout, but empirically we
+	// sometimes seen DB busy errors. Just serialize it explicitly out of
+	// laziness for now.
+	sqliteWriteMu sync.Mutex
+
 	lastUsage atomic.Pointer[usageStats]
 
 	// Metrics
@@ -258,6 +265,7 @@ type server struct {
 	GetHitsInline  expvar.Int `type:"counter" name:"get_hits_inline" help:"cache hits served from inline database storage (small objects)"`
 	GetErrs        expvar.Int `type:"counter" name:"get_errs" help:"number of gocache get request errors"`
 	Puts           expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
+	PutErrs        expvar.Int `type:"counter" name:"put_errs" help:"number of gocache put request errors"`
 	PutsDup        expvar.Int `type:"counter" name:"puts_dup" help:"total number of gocache put requests that are duplicates of a mapping we already had"`
 	PutsBytes      expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
 	PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
@@ -500,6 +508,9 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	sha256hex := fmt.Sprintf("%x", hasher.Sum(nil))
 	blobSize := r.ContentLength
 
+	s.sqliteWriteMu.Lock()
+	defer s.sqliteWriteMu.Unlock()
+
 	var blobID int64
 	err := s.db.QueryRow(`INSERT INTO Blobs (SHA256, BlobSize, SmallData)
 		VALUES (?, ?, ?)
@@ -508,6 +519,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 `, sha256hex, blobSize, smallData).Scan(&blobID)
 	if err != nil {
 		s.logf("Blobs insert error: %v", err)
+		s.PutErrs.Add(1)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -530,6 +542,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		s.logf("Actions insert error: %v", err)
+		s.PutErrs.Add(1)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -537,6 +550,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	affected, err := res.RowsAffected()
 	if err != nil {
 		s.logf("Actions rows affected error: %v", err)
+		s.PutErrs.Add(1)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -752,6 +766,9 @@ func (s *server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanC
 }
 
 func (srv *server) deleteBlobs(blobIDs ...int64) error {
+	srv.sqliteWriteMu.Lock()
+	defer srv.sqliteWriteMu.Unlock()
+
 	tx, err := srv.db.Begin()
 	if err != nil {
 		return fmt.Errorf("delete blob Begin: %w", err)
