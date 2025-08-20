@@ -166,6 +166,9 @@ func openDB(dbDir string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(0) // no limit
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
@@ -388,7 +391,9 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 	if accessTime < now-relAtimeSeconds {
 		// TODO(bradfitz): do this async? not worth blocking the caller.
 		// But we need a mechanism for tests to wait on async work.
+		srv.sqliteWriteMu.Lock()
 		_, err := srv.db.Exec("UPDATE Actions SET AccessTime = ? WHERE ActionID = ?", now, actionID)
+		srv.sqliteWriteMu.Unlock()
 		if err != nil {
 			srv.logf("Update AccessTime error: %v", err)
 			httpErr("internal server error", http.StatusInternalServerError)
