@@ -95,15 +95,35 @@ func main() {
 }
 
 func getGatewayIP() (ip string, ok bool) {
-	if runtime.GOOS != "darwin" {
-		return
+	switch runtime.GOOS {
+	case "darwin":
+		return getDarwinGatewayIP()
+	case "linux":
+		return getLinuxGatewayIP()
 	}
+	return "", false
+}
+
+func getDarwinGatewayIP() (ip string, ok bool) {
 	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
 	if err != nil {
 		log.Printf("getGatewayIP: %v, %s", err, out)
 		return "", false
 	}
 	rx := regexp.MustCompile(`(?m)^\s*gateway: (\S+)`)
+	if m := rx.FindSubmatch(out); len(m) == 2 {
+		return string(m[1]), true
+	}
+	return "", false
+}
+
+func getLinuxGatewayIP() (ip string, ok bool) {
+	out, err := exec.Command("ip", "route", "show", "default").CombinedOutput()
+	if err != nil {
+		log.Printf("getGatewayIP: %v, %s", err, out)
+		return "", false
+	}
+	rx := regexp.MustCompile(`^default via (\d+\.\d+\.\d+\.\d+)`) // 'default via 192.168.0.1 dev eth0... '
 	if m := rx.FindSubmatch(out); len(m) == 2 {
 		return string(m[1]), true
 	}
