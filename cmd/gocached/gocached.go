@@ -47,7 +47,9 @@ import (
 	"log"
 	"maps"
 	"math"
+	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -70,9 +72,10 @@ import (
 const smallObjectSize = 1 << 10
 
 var (
-	dir     = flag.String("cache-dir", "", "cache directory, if empty defaults to <UserCacheDir>/gocached")
-	verbose = flag.Bool("verbose", false, "be verbose")
-	listen  = flag.String("listen", ":31364", "listen address")
+	dir         = flag.String("cache-dir", "", "cache directory, if empty defaults to <UserCacheDir>/gocached")
+	verbose     = flag.Bool("verbose", false, "be verbose")
+	listen      = flag.String("listen", ":31364", "listen address for the build-facing HTTP server")
+	debugListen = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
 
 	maxSize = flag.Int("max-size-gb", 50, "maximum size of the cache in GiB; 0 means no limit")
 	maxAge  = flag.Int("max-age-days", 60, "maximum age of objects in the cache in days; 0 means no limit")
@@ -112,6 +115,16 @@ func main() {
 		log.Fatalf("clean old objects: %v", err)
 	} else if res.Count > 0 {
 		log.Printf("gocached: cleaned %v", res)
+	}
+
+	if *debugListen != "" {
+		debugLn, err := net.Listen("tcp", *debugListen)
+		if err != nil {
+			log.Fatalf("debug listen: %v", err)
+		}
+		go func() {
+			log.Fatal(http.Serve(debugLn, http.HandlerFunc(srv.ServeHTTPDebug)))
+		}()
 	}
 
 	go srv.runCleanLoop()
@@ -285,13 +298,41 @@ func (srv *server) now() time.Time {
 	return time.Now()
 }
 
+func (srv *server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
+	if srv.verbose {
+		srv.logf("ServeHTTPDebug: %s %s", r.Method, r.RequestURI)
+	}
+	switch {
+	case r.URL.Path == "/":
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, "<h1>gocached</h1>")
+		io.WriteString(w, "<p>This is a shared Go build cache server, hit by GOCACHEPROG clients.</p>")
+		io.WriteString(w, "<p>See <a href='/usage'>/usage</a> for usage stats.</p>")
+		io.WriteString(w, "<p>See <a href='/metrics'>/metrics</a> for Prometheus metrics.</p>")
+		io.WriteString(w, "<p>See <a href='/debug/pprof/'>/debug/pprof/</a> for pprof</p>")
+		io.WriteString(w, "<p>See <a href='/debug/pprof/goroutine?debug=2'>/debug/pprof/goroutine?debug=2</a> - full goroutines</p>")
+	case r.URL.Path == "/usage":
+		srv.serveUsage(w, r)
+	case r.URL.Path == "/metrics":
+		srv.metricsHandler.ServeHTTP(w, r)
+	case strings.HasPrefix(r.URL.Path, "/debug/pprof/profile"):
+		pprof.Profile(w, r)
+	case strings.HasPrefix(r.URL.Path, "/debug/pprof/cmdline"):
+		pprof.Cmdline(w, r)
+	case strings.HasPrefix(r.URL.Path, "/debug/pprof/symbol"):
+		pprof.Symbol(w, r)
+	case strings.HasPrefix(r.URL.Path, "/debug/pprof/trace"):
+		pprof.Trace(w, r)
+	case strings.HasPrefix(r.URL.Path, "/debug/pprof/"):
+		pprof.Index(w, r)
+	default:
+		http.Error(w, "not found", http.StatusNotFound)
+	}
+}
+
 func (srv *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if srv.verbose {
 		srv.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
-	}
-	if r.URL.Path == "/usage" {
-		srv.serveUsage(w, r)
-		return
 	}
 	if r.Method == "PUT" {
 		srv.handlePut(w, r)
@@ -301,20 +342,11 @@ func (srv *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad method", http.StatusBadRequest)
 		return
 	}
-	switch {
-	case strings.HasPrefix(r.URL.Path, "/action/"):
+	if strings.HasPrefix(r.URL.Path, "/action/") {
 		srv.handleGetAction(w, r)
-	case r.URL.Path == "/":
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		io.WriteString(w, "<h1>gocached</h1>")
-		io.WriteString(w, "<p>This is a shared Go build cache server, hit by GOCACHEPROG clients.</p>")
-		io.WriteString(w, "<p>See <a href='/usage'>/usage</a> for usage stats.</p>")
-		io.WriteString(w, "<p>See <a href='/metrics'>/metrics</a> for Prometheus metrics.</p>")
-	case r.URL.Path == "/metrics":
-		srv.metricsHandler.ServeHTTP(w, r)
-	default:
-		http.Error(w, "not found", http.StatusNotFound)
+		return
 	}
+	http.Error(w, "not found", http.StatusNotFound)
 }
 
 func getHexSuffix(r *http.Request, prefix string) (hexSuffix string, ok bool) {
