@@ -5,12 +5,15 @@ import (
 	"expvar"
 	"fmt"
 	"math"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,6 +151,21 @@ func (st *tester) wantGet(c *cachers.HTTPClient, actionID, outputID, wantVal str
 	}
 	if string(wrote) != wantVal {
 		st.t.Errorf("ReadFile got %q, want %q", wrote, wantVal)
+	}
+}
+
+func (st *tester) wantGetMiss(c *cachers.HTTPClient, actionID string) {
+	ctx := context.Background()
+	st.t.Helper()
+	gotOutputID, diskPath, err := c.Get(ctx, actionID)
+	if err != nil {
+		st.t.Fatalf("Get: %v", err)
+	}
+	if gotOutputID != "" {
+		st.t.Errorf("Get got outputID %q; want empty", gotOutputID)
+	}
+	if diskPath != "" {
+		st.t.Fatalf("Get returned disk path %q; want empty", diskPath)
 	}
 }
 
@@ -381,5 +399,31 @@ func TestCleanOldObjectsBySize(t *testing.T) {
 	}
 	if got, want := st.usageStats().All(), (countAndSize{Count: 2, Size: 7}); got != want {
 		t.Errorf("usageStats: %v; want %v", got, want)
+	}
+}
+
+func TestClientConnReuse(t *testing.T) {
+	st := newServerTester(t)
+
+	var numDials atomic.Int32
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		num := numDials.Add(1)
+		t.Logf("DialContext #%d for %s %s", num, network, addr)
+		var std net.Dialer
+		return std.DialContext(ctx, network, addr)
+	}
+	t.Cleanup(func() { tr.CloseIdleConnections() })
+
+	c1 := st.mkClient()
+	c1.HTTPClient = &http.Client{Transport: tr}
+	const missAction = "0001"
+	st.wantGetMiss(c1, missAction)
+	st.wantGetMiss(c1, missAction)
+	st.wantGetMiss(c1, missAction)
+	st.wantPut(c1, "0001", "9901", "1")
+	st.wantGet(c1, "0001", "9901", "1")
+	if got := numDials.Load(); got != 1 {
+		t.Errorf("numDials = %d; want 1", got)
 	}
 }
