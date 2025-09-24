@@ -39,6 +39,19 @@ func (c *HTTPClient) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+// tryDrainResponse reads and throws away a small bounded amount of data from
+// res.Body. This is a best-effort attempt to allow connection reuse. (Go's
+// HTTP/1 Transport won't reuse a TCP connection unless you fully consume HTTP
+// responses)
+func tryDrainResponse(res *http.Response) {
+	io.CopyN(io.Discard, res.Body, 4<<10)
+}
+
+func tryReadErrorMessage(res *http.Response) []byte {
+	msg, _ := io.ReadAll(io.LimitReader(res.Body, 4<<10))
+	return msg
+}
+
 func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
 	outputID, diskPath, err = c.Disk.Get(ctx, actionID)
 	if err == nil && outputID != "" {
@@ -59,10 +72,13 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 		return "", "", err
 	}
 	defer res.Body.Close()
+	defer tryDrainResponse(res)
 	if res.StatusCode == http.StatusNotFound {
 		return "", "", nil
 	}
 	if res.StatusCode != http.StatusOK {
+		msg := tryReadErrorMessage(res)
+		log.Printf("error GET /action/%s: %v, %s", actionID, res.Status, msg)
 		return "", "", fmt.Errorf("unexpected GET /action/%s status %v", actionID, res.Status)
 	}
 
@@ -98,10 +114,13 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 				return "", "", err
 			}
 			defer res.Body.Close()
+			defer tryDrainResponse(res)
 			if res.StatusCode == http.StatusNotFound {
 				return "", "", nil
 			}
 			if res.StatusCode != http.StatusOK {
+				msg := tryReadErrorMessage(res)
+				log.Printf("error GET /output/%s: %v, %s", outputID, res.Status, msg)
 				return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
 			}
 			if res.ContentLength == -1 {
@@ -152,8 +171,9 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusNoContent {
-		all, _ := io.ReadAll(io.LimitReader(res.Body, 4<<10))
-		return "", fmt.Errorf("unexpected PUT /%s/%s status %v: %s", actionID, outputID, res.Status, all)
+		msg := tryReadErrorMessage(res)
+		log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)
+		return "", fmt.Errorf("unexpected PUT /%s/%s status %v", actionID, outputID, res.Status)
 	}
 	v := <-diskPutCh
 	if err, ok := v.(error); ok {
