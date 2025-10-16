@@ -76,7 +76,11 @@ type server struct {
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	time.Sleep(s.latency)
 	if s.verbose {
-		log.Printf("%s %s", r.Method, r.RequestURI)
+		lw := newLoggingResponseWriter(w)
+		w = lw
+		defer func() {
+			log.Printf("%d %s %s ", lw.StatusCode(), r.Method, r.RequestURI)
+		}()
 	}
 	if r.Method == "PUT" {
 		s.handlePut(w, r)
@@ -184,4 +188,36 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// loggingResponseWriter is a trivial wrapper around http.ResponseWriter to
+// capture the returned status code for logging.
+type loggingResponseWriter struct {
+	http.ResponseWriter
+
+	statusCodeSet bool
+	statusCode    int
+}
+
+func newLoggingResponseWriter(w http.ResponseWriter) *loggingResponseWriter {
+	return &loggingResponseWriter{
+		ResponseWriter: w,
+	}
+}
+
+func (w *loggingResponseWriter) WriteHeader(statusCode int) {
+	if !w.statusCodeSet {
+		w.statusCode = statusCode
+		w.statusCodeSet = true
+	}
+
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *loggingResponseWriter) StatusCode() int {
+	if !w.statusCodeSet {
+		return http.StatusOK
+	}
+
+	return w.statusCode
 }
