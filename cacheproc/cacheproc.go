@@ -27,7 +27,7 @@ import (
 // funcs that callers can optionally implement.
 type Process struct {
 	// Get optionally specifies a func to look up something from the cache. If
-	// nil, all gets are treated as cache misses.touch
+	// nil, all gets are treated as cache misses.
 	//
 	// The actionID is a lowercase hex string of unspecified format or length.
 	//
@@ -86,11 +86,15 @@ func (p *Process) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var wg sync.WaitGroup
+
 	for {
 		var req wire.Request
 		if err := jd.Decode(&req); err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				// The parent process (e.g. cmd/go) has closed its end of the pipe.
+				// Break the loop to stop reading requests and allow a graceful shutdown.
+				break
 			}
 			return err
 		}
@@ -103,25 +107,30 @@ func (p *Process) Run() error {
 			// io.Reader that validates on EOF.
 			var bodyb []byte
 			if err := jd.Decode(&bodyb); err != nil {
-				log.Fatal(err)
+				return err
 			}
 			if int64(len(bodyb)) != req.BodySize {
-				log.Fatalf("only got %d bytes of declared %d", len(bodyb), req.BodySize)
+				return fmt.Errorf("only got %d bytes of declared %d", len(bodyb), req.BodySize)
 			}
 			req.Body = bytes.NewReader(bodyb)
 		}
-		go func() {
-			res := &wire.Response{ID: req.ID}
-			ctx := ctx // TODO: include req ID as a context.Value for tracing?
-			if err := p.handleRequest(ctx, &req, res); err != nil {
+		wg.Add(1)
+		go func(c context.Context, r wire.Request) {
+			defer wg.Done()
+
+			// TODO: include req ID as a context.Value for tracing?
+			res := &wire.Response{ID: r.ID}
+			if err := p.handleRequest(c, &r, res); err != nil {
 				res.Err = err.Error()
 			}
 			wmu.Lock()
 			defer wmu.Unlock()
-			je.Encode(res)
-			bw.Flush()
-		}()
+			_ = je.Encode(res)
+			_ = bw.Flush()
+		}(ctx, req)
 	}
+	wg.Wait()
+	return nil
 }
 
 func (p *Process) handleRequest(ctx context.Context, req *wire.Request, res *wire.Response) error {
