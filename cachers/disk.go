@@ -39,9 +39,8 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 	if !validHex(actionID) {
 		return "", "", fmt.Errorf("actionID must be valid hex strings")
 	}
-	action2 := actionID[:2]
 
-	actionFile := filepath.Join(dc.Dir, action2, fmt.Sprintf("a-%s", actionID))
+	actionFile := dc.ActionFilename(actionID)
 	ij, err := os.ReadFile(actionFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -61,30 +60,28 @@ func (dc *DiskCache) Get(ctx context.Context, actionID string) (outputID, diskPa
 		// Protect against malicious non-hex OutputID on disk
 		return "", "", nil
 	}
-	output2 := ie.OutputID[:2]
-	return ie.OutputID, filepath.Join(dc.Dir, output2, fmt.Sprintf("o-%v", ie.OutputID)), nil
+	return ie.OutputID, dc.OutputFilename(ie.OutputID), nil
 }
 
 func (dc *DiskCache) OutputFilename(outputID string) string {
-	if len(outputID) < 4 || len(outputID) > 1000 {
+	if !validHex(outputID) {
 		return ""
 	}
-	for i := range outputID {
-		b := outputID[i]
-		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
-			continue
-		}
+	return filepath.Join(dc.Dir, outputID[:2], fmt.Sprintf("o-%s", outputID))
+}
+
+func (dc *DiskCache) ActionFilename(actionID string) string {
+	if !validHex(actionID) {
 		return ""
 	}
-	return filepath.Join(dc.Dir, fmt.Sprintf("o-%s", outputID))
+	return filepath.Join(dc.Dir, actionID[:2], fmt.Sprintf("a-%s", actionID))
 }
 
 func validHex(x string) bool {
 	if len(x) < 4 || len(x) > 100 {
 		return false
 	}
-	for i := range len(x) {
-		b := x[i]
+	for _, b := range x {
 		if b >= '0' && b <= '9' || b >= 'a' && b <= 'f' {
 			continue
 		}
@@ -106,9 +103,10 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 		return "", errors.New("outputID must be hex")
 	}
 
-	action2, output2 := actionID[:2], outputID[:2]
-	outputDir := filepath.Join(dc.Dir, output2)
-	actionDir := filepath.Join(dc.Dir, action2)
+	actionFile := dc.ActionFilename(actionID)
+	outputFile := dc.OutputFilename(outputID)
+	actionDir := filepath.Dir(actionFile)
+	outputDir := filepath.Dir(outputFile)
 
 	if err := os.MkdirAll(actionDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create action directory: %w", err)
@@ -117,17 +115,15 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 		return "", fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	file := filepath.Join(outputDir, fmt.Sprintf("o-%s", outputID))
-
 	// Special case empty files; they're both common and easier to do race-free.
 	if size == 0 {
-		zf, err := os.OpenFile(file, os.O_CREATE|os.O_RDWR, 0644)
+		zf, err := os.OpenFile(outputFile, os.O_CREATE|os.O_RDWR, 0644)
 		if err != nil {
 			return "", err
 		}
 		zf.Close()
 	} else {
-		wrote, err := writeAtomic(file, body)
+		wrote, err := writeAtomic(outputFile, body)
 		if err != nil {
 			return "", err
 		}
@@ -145,11 +141,10 @@ func (dc *DiskCache) Put(ctx context.Context, actionID, outputID string, size in
 	if err != nil {
 		return "", err
 	}
-	actionFile := filepath.Join(actionDir, fmt.Sprintf("a-%s", actionID))
 	if _, err := writeAtomic(actionFile, bytes.NewReader(ij)); err != nil {
 		return "", err
 	}
-	return file, nil
+	return outputFile, nil
 }
 
 func writeAtomic(dest string, r io.Reader) (int64, error) {
