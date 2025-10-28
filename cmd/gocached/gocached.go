@@ -36,9 +36,11 @@ package main
 import (
 	"cmp"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"flag"
@@ -59,6 +61,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bradfitz/go-tool-cache/cmd/gocached/internal/jwt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -66,10 +69,19 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// smallObjectSize is the maximum size of an object that we store inline in the
-// database, rather than on disk. Empirically, about half of objects are 1KB or
-// smaller.
-const smallObjectSize = 1 << 10
+const (
+	// smallObjectSize is the maximum size of an object that we store inline in the
+	// database, rather than on disk. Empirically, about half of objects are 1KB or
+	// smaller.
+	smallObjectSize = 1 << 10
+
+	// tokenPrefix is the prefix for all gocached access tokens.
+	tokenPrefix = "gocached-token-"
+
+	// gocachedAudience is the audience we require JWTs to have. Could be
+	// configurable in future, but for now just needs to be specific to gocached.
+	gocachedAudience = "gocached"
+)
 
 var (
 	dir         = flag.String("cache-dir", "", "cache directory, if empty defaults to <UserCacheDir>/gocached")
@@ -79,9 +91,32 @@ var (
 
 	maxSize = flag.Int("max-size-gb", 50, "maximum size of the cache in GiB; 0 means no limit")
 	maxAge  = flag.Int("max-age-days", 60, "maximum age of objects in the cache in days; 0 means no limit")
+
+	jwtIssuer = flag.String("jwt-issuer", "", "the issuer to trust JWTs from; if set, all requests will require auth, and must set at least one -jwt-claim")
+	// See example GitHub token claims for what can be available:
+	// https://docs.github.com/en/actions/concepts/security/openid-connect
+	jwtClaims       = make(jwtClaimValue)
+	globalJWTClaims = make(jwtClaimValue)
 )
 
+type jwtClaimValue map[string]string
+
+func (v jwtClaimValue) String() string {
+	return fmt.Sprintf("%v", map[string]string(v))
+}
+
+func (v jwtClaimValue) Set(s string) error {
+	claim, value, ok := strings.Cut(s, "=")
+	if !ok || claim == "" || value == "" {
+		return fmt.Errorf("bad claim %q, want x=y", s)
+	}
+	v[claim] = value
+	return nil
+}
+
 func main() {
+	flag.Var(&jwtClaims, "jwt-claim", "a claim in the form x=y that any JWT presented must have to start a session; may be specified more than once")
+	flag.Var(&globalJWTClaims, "global-jwt-claim", "an additional claim in the form x=y that a JWT must have to allow writing to the cache's global namespace; may be specified more than once")
 	flag.Parse()
 	if *dir == "" {
 		d, err := os.UserCacheDir()
@@ -125,6 +160,26 @@ func main() {
 		go func() {
 			log.Fatal(http.Serve(debugLn, http.HandlerFunc(srv.ServeHTTPDebug)))
 		}()
+	}
+
+	if *jwtIssuer != "" {
+		if len(jwtClaims) == 0 {
+			log.Fatal("must specify --jwt-claim at least once when --jwt-issuer is set")
+		}
+		srv.jwtValidator = jwt.NewJWTValidator(*jwtIssuer, gocachedAudience)
+		if err := srv.jwtValidator.RunUpdateJWKSLoop(srv.shutdownCtx); err != nil {
+			log.Fatalf("failed to fetch JWKS for JWT validator: %v", err)
+		}
+		srv.jwtClaims = jwtClaims
+
+		globalClaims := map[string]string{}
+		maps.Copy(globalClaims, jwtClaims)
+		maps.Copy(globalClaims, globalJWTClaims)
+		srv.globalJWTClaims = globalClaims
+
+		log.Printf("gocached: using JWT issuer %q with claims %v, global claims %v", *jwtIssuer, srv.jwtClaims, srv.globalJWTClaims)
+
+		go srv.runCleanSessionsLoop()
 	}
 
 	go srv.runCleanLoop()
@@ -202,9 +257,10 @@ func newServer(dir string) (*server, error) {
 	)
 
 	srv := &server{
-		db:   db,
-		dir:  dir,
-		logf: log.Printf,
+		db:       db,
+		dir:      dir,
+		logf:     log.Printf,
+		sessions: make(map[string]*sessionData),
 	}
 	srv.shutdownCtx, srv.shutdownCancel = context.WithCancel(context.Background())
 	srv.registerMetrics(reg)
@@ -263,6 +319,13 @@ type server struct {
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 
+	jwtValidator    *jwt.Validator    // nil unless -jwt-issuer flag is set
+	jwtClaims       map[string]string // claims required for any JWT to start a session
+	globalJWTClaims map[string]string // additional claims required to write to global namespace
+
+	sessionsMu sync.RWMutex            // guards sessions
+	sessions   map[string]*sessionData // maps access token -> session data.
+
 	// sqliteWriteMu serializes access to SQLite. In theory the SQLite driver
 	// should serialize access with our 5000ms busy timeout, but empirically we
 	// sometimes seen DB busy errors. Just serialize it explicitly out of
@@ -289,6 +352,39 @@ type server struct {
 	BlobBytes      expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
 	EvictedBlobs   expvar.Int `type:"counter" name:"evicted_blobs" help:"number of blobs evicted from the cache"`
 	EvictedBytes   expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes evicted from the cache"`
+	Sessions       expvar.Int `type:"gauge" name:"sessions" help:"number of active authenticated sessions"`
+	Auths          expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
+	AuthErrs       expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
+}
+
+// sessionData corresponds to a specific access token, and is only used if JWT
+// auth is enabled.
+type sessionData struct {
+	expiry        time.Time      // Session valid until.
+	globalNSWrite bool           // Whether this session can write to the cache's global namespace.
+	claims        map[string]any // Claims from the JWT used to create this session, stored for debug.
+
+	mu    sync.Mutex // Guards stats.
+	stats stats
+}
+
+// stats holds per-request or per-session stats which get rolled up into server
+// stats. See [server] struct for detailed definitions.
+type stats struct {
+	LastUsed       time.Time // Only applies to session stats. Last time the access token for this session was used.
+	Gets           int64
+	GetBytes       int64
+	GetHits        int64
+	GetAccessBumps int64
+	GetHitsInline  int64
+	GetNanos       int64
+	GetErrs        int64
+	Puts           int64
+	PutErrs        int64
+	PutsDup        int64
+	PutsBytes      int64
+	PutsInline     int64
+	PutsNanos      int64
 }
 
 func (srv *server) now() time.Time {
@@ -308,11 +404,14 @@ func (srv *server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "<h1>gocached</h1>")
 		io.WriteString(w, "<p>This is a shared Go build cache server, hit by GOCACHEPROG clients.</p>")
 		io.WriteString(w, "<p>See <a href='/usage'>/usage</a> for usage stats.</p>")
+		io.WriteString(w, "<p>See <a href='/sessions'>/sessions</a> for session data</p>")
 		io.WriteString(w, "<p>See <a href='/metrics'>/metrics</a> for Prometheus metrics.</p>")
 		io.WriteString(w, "<p>See <a href='/debug/pprof/'>/debug/pprof/</a> for pprof</p>")
 		io.WriteString(w, "<p>See <a href='/debug/pprof/goroutine?debug=2'>/debug/pprof/goroutine?debug=2</a> - full goroutines</p>")
 	case r.URL.Path == "/usage":
 		srv.serveUsage(w, r)
+	case r.URL.Path == "/sessions":
+		srv.serveSessions(w, r)
 	case r.URL.Path == "/metrics":
 		srv.metricsHandler.ServeHTTP(w, r)
 	case strings.HasPrefix(r.URL.Path, "/debug/pprof/profile"):
@@ -334,8 +433,51 @@ func (srv *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if srv.verbose {
 		srv.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
 	}
+
+	var sessionData *sessionData // remains nil for unauthenticated requests.
+	reqStats := &stats{}
+	defer func() {
+		// Call inside func to capture maybe-updated sessionData pointer.
+		srv.processRequestStats(reqStats, sessionData)
+	}()
+
+	// Handle session auth first if enabled.
+	if srv.jwtValidator != nil {
+		// If JWT auth enabled, this is the only unauthenticated (non-debug) endpoint.
+		if r.Method == "POST" && r.URL.Path == "/auth/exchange-token" {
+			srv.handleTokenExchange(w, r)
+			return
+		}
+
+		// Check for session data and error if none.
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !strings.HasPrefix(token, tokenPrefix) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		var ok bool
+		sessionData, ok = srv.getSessionData(token)
+		if !ok || srv.now().After(sessionData.expiry) {
+			if srv.verbose {
+				reason := fmt.Sprintf("exists: %v", ok)
+				if sessionData != nil {
+					reason += fmt.Sprintf(", expiry: %v", sessionData.expiry)
+				}
+				srv.logf("unauthorized; %s", reason)
+			}
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
 	if r.Method == "PUT" {
-		srv.handlePut(w, r)
+		if sessionData != nil && !sessionData.globalNSWrite {
+			// TODO(tomhjp): support per-namespace writes.
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		srv.handlePut(w, r, reqStats)
 		return
 	}
 	if r.Method != "GET" && r.Method != "HEAD" {
@@ -343,10 +485,62 @@ func (srv *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/action/") {
-		srv.handleGetAction(w, r)
+		srv.handleGetAction(w, r, reqStats)
+		return
+	}
+	if sessionData != nil && r.URL.Path == "/session/stats" {
+		srv.handleSessionStats(w, sessionData)
 		return
 	}
 	http.Error(w, "not found", http.StatusNotFound)
+}
+
+func (srv *server) getSessionData(token string) (*sessionData, bool) {
+	srv.sessionsMu.Lock()
+	defer srv.sessionsMu.Unlock()
+	sessionData, ok := srv.sessions[token]
+	return sessionData, ok
+}
+
+func (srv *server) addSessionData(token string, sessionData *sessionData) {
+	srv.sessionsMu.Lock()
+	defer srv.sessionsMu.Unlock()
+	srv.sessions[token] = sessionData
+	srv.Sessions.Add(1)
+}
+
+func (srv *server) processRequestStats(req *stats, sessionData *sessionData) {
+	srv.Gets.Add(req.Gets)
+	srv.GetBytes.Add(req.GetBytes)
+	srv.GetHits.Add(req.GetHits)
+	srv.GetAccessBumps.Add(req.GetAccessBumps)
+	srv.GetHitsInline.Add(req.GetHitsInline)
+	srv.GetErrs.Add(req.GetErrs)
+	srv.Puts.Add(req.Puts)
+	srv.PutErrs.Add(req.PutErrs)
+	srv.PutsDup.Add(req.PutsDup)
+	srv.PutsBytes.Add(req.PutsBytes)
+	srv.PutsInline.Add(req.PutsInline)
+
+	if sessionData != nil {
+		sessionData.mu.Lock()
+		defer sessionData.mu.Unlock()
+
+		sessionData.stats.LastUsed = srv.now().UTC()
+		sessionData.stats.Gets += req.Gets
+		sessionData.stats.GetBytes += req.GetBytes
+		sessionData.stats.GetHits += req.GetHits
+		sessionData.stats.GetAccessBumps += req.GetAccessBumps
+		sessionData.stats.GetHitsInline += req.GetHitsInline
+		sessionData.stats.GetErrs += req.GetErrs
+		sessionData.stats.GetNanos += req.GetNanos
+		sessionData.stats.Puts += req.Puts
+		sessionData.stats.PutErrs += req.PutErrs
+		sessionData.stats.PutsDup += req.PutsDup
+		sessionData.stats.PutsBytes += req.PutsBytes
+		sessionData.stats.PutsInline += req.PutsInline
+		sessionData.stats.PutsNanos += req.PutsNanos
+	}
 }
 
 func getHexSuffix(r *http.Request, prefix string) (hexSuffix string, ok bool) {
@@ -375,16 +569,20 @@ func validHex(x string) bool {
 // we do a DB write to update it.
 const relAtimeSeconds = 60 * 60 * 24 // 1 day
 
-func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
+func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request, stats *stats) {
 	srv.ActiveGets.Add(1)
 	defer srv.ActiveGets.Add(-1)
 
-	srv.Gets.Add(1)
+	start := srv.now()
+	defer func() {
+		stats.GetNanos += srv.now().Sub(start).Nanoseconds()
+	}()
+	stats.Gets++
 	ctx := r.Context()
 
 	httpErr := func(msg string, code int) {
 		http.Error(w, msg, code)
-		srv.GetErrs.Add(1)
+		stats.GetErrs++
 	}
 
 	actionID, ok := getHexSuffix(r, "/action/")
@@ -431,10 +629,10 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 			httpErr("internal server error", http.StatusInternalServerError)
 			return
 		}
-		srv.GetAccessBumps.Add(1)
+		stats.GetAccessBumps++
 	}
 
-	srv.GetHits.Add(1)
+	stats.GetHits++
 
 	outputID := cmp.Or(altObjectID, sha256hex)
 
@@ -448,8 +646,8 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 
 	if smallData.Valid {
 		// For small outputs stored inline in the database, we can return them directly.
-		srv.GetHitsInline.Add(1)
-		srv.GetBytes.Add(size)
+		stats.GetHitsInline++
+		stats.GetBytes += size
 		io.WriteString(w, smallData.String)
 		return
 	}
@@ -472,7 +670,7 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	srv.GetBytes.Add(size)
+	stats.GetBytes += size
 	defer rc.Close()
 	io.Copy(w, rc)
 }
@@ -499,9 +697,14 @@ func (srv *server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string) 
 	return f, nil
 }
 
-func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
+func (s *server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats) {
 	s.ActivePuts.Add(1)
 	defer s.ActivePuts.Add(-1)
+
+	start := s.now()
+	defer func() {
+		stats.PutsNanos += s.now().Sub(start).Nanoseconds()
+	}()
 
 	if r.Method != "PUT" {
 		http.Error(w, "bad method", http.StatusMethodNotAllowed)
@@ -559,7 +762,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 `, sha256hex, blobSize, smallData).Scan(&blobID)
 	if err != nil {
 		s.logf("Blobs insert error: %v", err)
-		s.PutErrs.Add(1)
+		stats.PutErrs++
 		http.Error(w, "Blobs insert error", http.StatusInternalServerError)
 		return
 	}
@@ -582,7 +785,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		s.logf("Actions insert error: %v", err)
-		s.PutErrs.Add(1)
+		stats.PutErrs++
 		http.Error(w, "Actions insert error", http.StatusInternalServerError)
 		return
 	}
@@ -590,22 +793,112 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	affected, err := res.RowsAffected()
 	if err != nil {
 		s.logf("Actions rows affected error: %v", err)
-		s.PutErrs.Add(1)
+		stats.PutErrs++
 		http.Error(w, "Actions rows affected error", http.StatusInternalServerError)
 		return
 	}
 
 	if affected == 0 {
-		s.PutsDup.Add(1)
+		stats.PutsDup++
 	}
 
-	s.Puts.Add(1)
-	s.PutsBytes.Add(r.ContentLength)
+	stats.Puts++
+	stats.PutsBytes += r.ContentLength
 	if smallData != nil {
-		s.PutsInline.Add(1)
+		stats.PutsInline++
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleTokenExchange handles POST /auth/exchange-token requests to exchange
+// a JWT for an access token. Each access token represents a session that will
+// last for one hour and have cache stats associated with it.
+func (srv *server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		JWT string `json:"jwt"`
+	}
+	// JWTs are often sent in HTTP headers, so 4KiB should ~always be enough.
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
+		srv.AuthErrs.Add(1)
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	jwtClaims, err := srv.jwtValidator.Validate(r.Context(), req.JWT)
+	if err != nil {
+		srv.AuthErrs.Add(1)
+		if srv.verbose {
+			srv.logf("token exchange: JWT validation error: %v", err)
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	globalNSWrite, err := srv.evaluateClaims(jwtClaims)
+	if err != nil {
+		srv.AuthErrs.Add(1)
+		if srv.verbose {
+			srv.logf("token exchange: %v", err)
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	const ttl = time.Hour
+	// 52 base32 characters, 256 bits of entropy.
+	accessToken := tokenPrefix + strings.ToLower(rand.Text()+rand.Text())
+	srv.addSessionData(accessToken, &sessionData{
+		expiry:        srv.now().UTC().Add(ttl),
+		globalNSWrite: globalNSWrite,
+		claims:        jwtClaims,
+	})
+
+	resp := map[string]any{
+		"access_token": accessToken,
+		"token_type":   "Bearer",
+		"expires_in":   ttl.Seconds(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		srv.AuthErrs.Add(1)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	srv.Auths.Add(1)
+}
+
+func (srv *server) evaluateClaims(claims map[string]any) (globalNSWrite bool, _ error) {
+	if missing := findMissingClaims(srv.jwtClaims, claims); len(missing) > 0 {
+		return false, fmt.Errorf("got claims %v; missing required claims: %v", claims, missing)
+	}
+
+	if missing := findMissingClaims(srv.globalJWTClaims, claims); len(missing) == 0 {
+		return true, nil
+	} else if srv.verbose {
+		srv.logf("token exchange: missing global namespace write claims: %v", missing)
+	}
+
+	return false, nil
+}
+
+func findMissingClaims(wantClaims map[string]string, gotClaims map[string]any) map[string]string {
+	missing := make(map[string]string)
+	for k, want := range wantClaims {
+		if got, ok := gotClaims[k]; !ok || got != want {
+			missing[k] = want
+		}
+	}
+	return missing
+}
+
+func (srv *server) handleSessionStats(w http.ResponseWriter, sessionData *sessionData) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(sessionData.stats); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 func (s *server) sha256Filepath(hash [sha256.Size]byte) string {
@@ -958,6 +1251,29 @@ func (srv *server) runCleanLoop() {
 	}
 }
 
+func (srv *server) runCleanSessionsLoop() {
+	for {
+		select {
+		case <-srv.shutdownCtx.Done():
+			return
+		case <-time.After(time.Hour):
+		}
+
+		srv.sessionsMu.Lock()
+		count := len(srv.sessions)
+		var deleted int
+		for token, metadata := range srv.sessions {
+			if time.Now().After(metadata.expiry) {
+				delete(srv.sessions, token)
+				deleted++
+				srv.Sessions.Add(-1)
+			}
+		}
+		srv.sessionsMu.Unlock()
+		srv.logf("cleaned up %d/%d access tokens", deleted, count)
+	}
+}
+
 func durFmt(d time.Duration) string {
 	days := int(d.Hours() / 24)
 	if days > 0 {
@@ -1013,6 +1329,52 @@ func (srv *server) serveUsage(w http.ResponseWriter, r *http.Request) {
 		c := us.ActionsLE[d]
 		fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td>%s</td></tr>\n",
 			title, c.Count, bytesFmt(c.Size))
+	}
+	fmt.Fprintf(w, "</table>\n")
+}
+
+func (srv *server) serveSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "bad method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	srv.sessionsMu.RLock()
+	// Make a copy of all session data (excluding the mutex).
+	sessions := make([]*sessionData, 0, len(srv.sessions))
+	for _, v := range srv.sessions {
+		v.mu.Lock()
+		sessions = append(sessions, &sessionData{
+			expiry:        v.expiry,
+			globalNSWrite: v.globalNSWrite,
+			claims:        v.claims,
+			stats:         v.stats,
+		})
+		v.mu.Unlock()
+	}
+	srv.sessionsMu.RUnlock()
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, "<html><body><h1>gocached sessions</h1>\n")
+	fmt.Fprintf(w, "<p>JWT issuer: %s</p>\n", *jwtIssuer)
+	fmt.Fprintf(w, "<p>JWT claims required: %v</p>\n", srv.jwtClaims)
+	fmt.Fprintf(w, "<p>JWT global write claims required: %v</p>\n", srv.globalJWTClaims)
+	fmt.Fprintf(w, "<p>Number of sessions: %d</p>\n", len(sessions))
+
+	fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")
+	fmt.Fprintf(w, "<tr><th>Last used</th><th>Expiry time</th><th>Global write</th><th>Stats</th><th>Claims</th></tr>\n")
+	slices.SortFunc(sessions, func(a, b *sessionData) int {
+		return a.stats.LastUsed.Compare(b.stats.LastUsed)
+	})
+	for _, d := range slices.Backward(sessions) {
+		lastUsed := "never"
+		if !d.stats.LastUsed.IsZero() {
+			lastUsed = durFmt(time.Since(d.stats.LastUsed)) + " ago"
+		}
+		statsJSON, _ := json.MarshalIndent(d.stats, "", "  ")
+		claimsJSON, _ := json.MarshalIndent(d.claims, "", "  ")
+		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%v</td><td><pre>%s</pre></td><td><pre>%s</pre></td></tr>\n",
+			lastUsed, d.expiry.Format(time.RFC3339), d.globalNSWrite, statsJSON, claimsJSON)
 	}
 	fmt.Fprintf(w, "</table>\n")
 }
