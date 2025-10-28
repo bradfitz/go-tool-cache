@@ -1,9 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/json"
 	"expvar"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -18,6 +25,9 @@ import (
 	"time"
 
 	"github.com/bradfitz/go-tool-cache/cachers"
+	ijwt "github.com/bradfitz/go-tool-cache/cmd/gocached/internal/jwt"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -29,6 +39,10 @@ type tester struct {
 	t   testing.TB
 	srv *server
 	hs  *httptest.Server
+
+	issuer    string
+	audience  string
+	createJWT func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string
 
 	timeMu  sync.Mutex
 	curTime time.Time
@@ -189,6 +203,65 @@ func newServerTester(t testing.TB) *tester {
 	t.Cleanup(st.hs.Close)
 
 	return st
+}
+
+// startOIDCServer starts a mock OIDC server and configures gocached to use it
+// for JWT validation. The provided publicKey is what JWT signatures will be
+// validated against. Use st.createJWT to create signed JWTs.
+func (st *tester) startOIDCServer(publicKey crypto.PublicKey) {
+	st.t.Helper()
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	st.t.Cleanup(srv.Close)
+
+	st.issuer = fmt.Sprintf("http://%s", srv.Listener.Addr().String())
+	st.audience = gocachedAudience
+
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"issuer":   st.issuer,
+			"jwks_uri": fmt.Sprintf("%s/jwks", st.issuer),
+		})
+	})
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"keys": []jose.JSONWebKey{
+				{
+					Key:       publicKey,
+					KeyID:     "test-key",
+					Algorithm: "ES256",
+					Use:       "sig",
+				},
+			},
+		})
+	})
+
+	st.srv.jwtValidator = ijwt.NewJWTValidator(st.issuer, st.audience)
+	st.srv.jwtValidator.Logf = st.Logf
+	if err := st.srv.jwtValidator.RunUpdateJWKSLoop(st.srv.shutdownCtx); err != nil {
+		st.t.Fatalf("failed to start JWKS loop for JWT validator: %v", err)
+	}
+
+	st.createJWT = func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string {
+		st.t.Helper()
+		unsignedTk := &jwt.Token{
+			Header: map[string]any{
+				"typ": "JWT",
+				"alg": jwt.SigningMethodES256.Alg(),
+				"kid": "test-key",
+			},
+			Claims: claims,
+			Method: jwt.SigningMethodES256,
+		}
+		tk, err := unsignedTk.SignedString(signingKey)
+		if err != nil {
+			st.t.Fatalf("error signing token: %v", err)
+		}
+
+		return tk
+	}
 }
 
 func TestServer(t *testing.T) {
@@ -425,5 +498,247 @@ func TestClientConnReuse(t *testing.T) {
 	st.wantGet(c1, "0001", "9901", "1")
 	if got := numDials.Load(); got != 1 {
 		t.Errorf("numDials = %d; want 1", got)
+	}
+}
+
+func TestExchangeToken(t *testing.T) {
+	// Generate private keys outside of the loop for speed.
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("error generating OIDC server private key: %v", err)
+	}
+	otherPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("error generating OIDC server private key: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		mutateClaims   func(jwt.MapClaims)
+		signingKey     *ecdsa.PrivateKey
+		wantStatusCode int
+		wantWrite      bool
+	}{
+		// Base case: no mutation.
+		"valid_read": {
+			wantStatusCode: http.StatusOK,
+			wantWrite:      false,
+		},
+		// Additional claim needed for write scope.
+		"valid_write": {
+			mutateClaims: func(cl jwt.MapClaims) {
+				cl["ref"] = "refs/heads/main"
+			},
+			wantStatusCode: http.StatusOK,
+			wantWrite:      true,
+		},
+		// Every other test makes one mutation from the base case that should cause failure.
+		"missing_sub": {
+			mutateClaims: func(cl jwt.MapClaims) {
+				delete(cl, "sub")
+			},
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		"invalid_sub": {
+			mutateClaims: func(cl jwt.MapClaims) {
+				cl["sub"] = "user456"
+			},
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		"invalid_iss": {
+			mutateClaims: func(cl jwt.MapClaims) {
+				cl["iss"] = "invalid_issuer"
+			},
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		"invalid_aud": {
+			mutateClaims: func(cl jwt.MapClaims) {
+				cl["aud"] = "invalid_audience"
+			},
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		"not_yet_valid": {
+			mutateClaims: func(cl jwt.MapClaims) {
+				cl["nbf"] = jwt.NewNumericDate(time.Now().Add(10 * time.Minute))
+			},
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		"expired": {
+			mutateClaims: func(cl jwt.MapClaims) {
+				cl["exp"] = jwt.NewNumericDate(time.Now().Add(-time.Minute))
+			},
+			wantStatusCode: http.StatusUnauthorized,
+		},
+		"invalid_signature": {
+			signingKey:     otherPrivateKey,
+			wantStatusCode: http.StatusUnauthorized,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newServerTester(t)
+			st.startOIDCServer(privateKey.Public())
+			st.srv.jwtClaims = map[string]string{
+				"sub": "user123",
+			}
+			st.srv.globalJWTClaims = map[string]string{
+				"sub": "user123",
+				"ref": "refs/heads/main",
+			}
+
+			// Generate JWT.
+			tokenClaims := jwt.MapClaims{
+				"sub": "user123",
+				"iss": st.issuer,
+				"aud": st.audience,
+				"nbf": jwt.NewNumericDate(time.Now().Add(-time.Minute)),
+				"exp": jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			}
+			if tc.mutateClaims != nil {
+				tc.mutateClaims(tokenClaims)
+			}
+			signingKey := privateKey
+			if tc.signingKey != nil {
+				signingKey = tc.signingKey
+			}
+			body, err := json.Marshal(map[string]any{
+				"jwt": st.createJWT(tokenClaims, signingKey),
+			})
+			if err != nil {
+				t.Fatalf("error marshaling request body: %v", err)
+			}
+
+			// Exchange JWT for access token.
+			req, err := http.NewRequest("POST", st.hs.URL+"/auth/exchange-token", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("error creating request: %v", err)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("error making request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatusCode {
+				t.Fatalf("unexpected status code: want %d, got %d", tc.wantStatusCode, resp.StatusCode)
+			}
+			body, err = io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("error reading response body: %v", err)
+			}
+
+			if tc.wantStatusCode != http.StatusOK {
+				if string(body) != "unauthorized\n" {
+					t.Fatalf("unexpected error body: %s", string(body))
+				}
+
+				// No access token to do further checks with; test finished.
+				return
+			}
+
+			// Check returned access token.
+			var d struct {
+				AccessToken string `json:"access_token"`
+			}
+			if err := json.Unmarshal(body, &d); err != nil {
+				t.Fatalf("error decoding response body: %v", err)
+			}
+			if d.AccessToken == "" {
+				t.Fatalf("expected access_token in response, got %s", string(body))
+			}
+
+			cl := st.mkClient()
+			if _, _, err := cl.Get(t.Context(), "abc123"); err == nil {
+				t.Fatalf("Get without access token succeeded unexpectedly")
+			}
+
+			cl.AccessToken = d.AccessToken
+			st.wantGetMiss(cl, "abc123")
+
+			if tc.wantWrite {
+				st.wantPut(cl, "abc123", "def456", "data789")
+				st.wantGet(cl, "abc123", "def456", "data789")
+			} else {
+				if _, err := cl.Put(t.Context(), "abc123", "def456", 0, nil); err == nil {
+					t.Fatalf("Put without write scope succeeded unexpectedly")
+				}
+			}
+
+			// Check session stats.
+			reqStats, err := http.NewRequest("GET", st.hs.URL+"/session/stats", nil)
+			if err != nil {
+				t.Fatalf("error creating stats request: %v", err)
+			}
+			reqStats.Header.Set("Authorization", "Bearer "+d.AccessToken)
+			respStats, err := http.DefaultClient.Do(reqStats)
+			if err != nil {
+				t.Fatalf("error making stats request: %v", err)
+			}
+			defer respStats.Body.Close()
+			if respStats.StatusCode != http.StatusOK {
+				t.Fatalf("unexpected stats status code: want %d, got %d", http.StatusOK, respStats.StatusCode)
+			}
+			bodyStats, err := io.ReadAll(respStats.Body)
+			if err != nil {
+				t.Fatalf("error reading stats response body: %v", err)
+			}
+			var stats stats
+			if err := json.Unmarshal(bodyStats, &stats); err != nil {
+				t.Fatalf("error decoding stats response body: %v", err)
+			}
+			t.Logf("stats: %v", stats)
+			if stats.Gets == 0 {
+				t.Errorf("expected non-zero gets in session stats")
+			}
+			if stats.Puts == 0 && tc.wantWrite {
+				t.Errorf("expected non-zero puts in session stats")
+			}
+		})
+	}
+}
+
+func TestJWTClaimFlag(t *testing.T) {
+	for name, tc := range map[string]struct {
+		input []string
+		want  jwtClaimValue
+	}{
+		"single_claim": {
+			input: []string{"role=builder"},
+			want:  jwtClaimValue{"role": "builder"},
+		},
+		"multiple_claims": {
+			input: []string{"env=prod", "team=devops"},
+			want:  jwtClaimValue{"env": "prod", "team": "devops"},
+		},
+		"duplicate_keys": {
+			input: []string{"key=value1", "key=value2"},
+			want:  jwtClaimValue{"key": "value2"},
+		},
+		"value_with_equals": {
+			input: []string{"data=a=b=c"},
+			want:  jwtClaimValue{"data": "a=b=c"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			claim := make(jwtClaimValue)
+			for _, v := range tc.input {
+				if err := claim.Set(v); err != nil {
+					t.Fatalf("Set failed: %v", err)
+				}
+			}
+			if diff := cmp.Diff(claim, tc.want); diff != "" {
+				t.Errorf("jwtClaimValue mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestInvalidJWTClaimFlags(t *testing.T) {
+	for _, s := range []string{
+		"invalidclaim",
+		"=nokey",
+		"novalue=",
+	} {
+		claim := make(jwtClaimValue)
+		if err := claim.Set(s); err == nil {
+			t.Fatalf("Set with invalid claim %q did not return error", s)
+		}
 	}
 }
