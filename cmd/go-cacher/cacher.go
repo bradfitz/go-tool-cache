@@ -26,6 +26,7 @@ var (
 	serverBase = flag.String("cache-server", "", "optional cache server HTTP prefix (scheme and authority only); should be low latency. empty means to not use one.")
 	verbose    = flag.Bool("verbose", false, "be verbose")
 	gwPort     = flag.Int("gateway-addr-port", 0, "if non-zero, try to use an HTTP server on this port on our machine's gateway IP. If that fails, use local disk instead.")
+	token      = flag.String("access-token", "", "optional access token to use with the cache server")
 )
 
 func main() {
@@ -81,9 +82,10 @@ func main() {
 
 	if *serverBase != "" {
 		hc := &cachers.HTTPClient{
-			BaseURL: *serverBase,
-			Disk:    dc,
-			Verbose: *verbose,
+			BaseURL:     *serverBase,
+			Disk:        dc,
+			Verbose:     *verbose,
+			AccessToken: *token,
 		}
 		p.Get = hc.Get
 		p.Put = hc.Put
