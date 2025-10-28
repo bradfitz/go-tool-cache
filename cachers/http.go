@@ -30,6 +30,10 @@ type HTTPClient struct {
 
 	// Verbose optionally specifies whether to log verbose messages.
 	Verbose bool
+
+	// AccessToken optionally specifies a Bearer access token to include
+	// in requests to the server.
+	AccessToken string
 }
 
 func (c *HTTPClient) httpClient() *http.Client {
@@ -59,6 +63,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	}
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/action/"+actionID, nil)
+	if c.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	}
 
 	// Set a header to indicate we want the object and metadata in one response.
 	// Prior to 2025-08-09, the protocol was two separate requests. Rather than
@@ -163,6 +170,9 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 	}
 	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, putBody)
 	req.ContentLength = size
+	if c.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	}
 	res, err := c.httpClient().Do(req)
 	pw.Close()
 	if err != nil {
