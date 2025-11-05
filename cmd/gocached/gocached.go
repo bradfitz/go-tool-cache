@@ -92,7 +92,7 @@ func main() {
 		log.Printf("Defaulting to cache dir %v ...", d)
 		*dir = d
 	}
-	if err := os.MkdirAll(*dir, 0755); err != nil {
+	if err := os.MkdirAll(*dir, 0750); err != nil {
 		log.Fatal(err)
 	}
 
@@ -413,7 +413,7 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		srv.logf("QueryRow error: %v", err)
-		httpErr("Query: "+err.Error(), http.StatusInternalServerError)
+		httpErr("QueryRow error", http.StatusInternalServerError)
 		return
 	}
 
@@ -459,7 +459,8 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 
 	rc, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex)
 	if err != nil {
-		httpErr(err.Error(), http.StatusInternalServerError)
+		srv.logf("Get object error: %v", actionID, err)
+		httpErr("Get object error", http.StatusInternalServerError)
 		return
 	}
 	if rc == nil {
@@ -481,7 +482,7 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request) {
 // exists but is not stored in SQLite.
 //
 // It returns (nil, nil) on miss.
-func (srv *server) getObjectFromDiskOrPeer(ctx context.Context, sha256hex string) (rc io.ReadCloser, err error) {
+func (srv *server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string) (rc io.ReadCloser, err error) {
 	if len(sha256hex) != sha256.Size*2 {
 		return nil, fmt.Errorf("invalid sha256hex %q", sha256hex)
 	}
@@ -525,7 +526,8 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 		var err error
 		smallData, err = io.ReadAll(hashingBody)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			s.logf("Read content error: %v", err)
+			http.Error(w, "Read content error", http.StatusInternalServerError)
 			return
 		}
 		if int64(len(smallData)) != r.ContentLength {
@@ -537,7 +539,8 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// For larger objects, we store them on disk.
 		if err := s.writeDiskBlob(r.ContentLength, hashingBody); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			s.logf("Write disk blob error: %v", err)
+			http.Error(w, "Write disk blob error", http.StatusInternalServerError)
 			return
 		}
 	}
@@ -557,7 +560,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logf("Blobs insert error: %v", err)
 		s.PutErrs.Add(1)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Blobs insert error", http.StatusInternalServerError)
 		return
 	}
 
@@ -580,7 +583,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logf("Actions insert error: %v", err)
 		s.PutErrs.Add(1)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Actions insert error", http.StatusInternalServerError)
 		return
 	}
 
@@ -588,7 +591,7 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.logf("Actions rows affected error: %v", err)
 		s.PutErrs.Add(1)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Actions rows affected error", http.StatusInternalServerError)
 		return
 	}
 
@@ -638,7 +641,7 @@ func (s *server) writeDiskBlob(size int64, r io.Reader) (err error) {
 	hasher.Sum(hash[:0])
 
 	target := s.sha256Filepath(hash)
-	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
 		return err
 	}
 	return os.Rename(tf.Name(), target)
