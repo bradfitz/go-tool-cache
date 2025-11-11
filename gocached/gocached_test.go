@@ -1,4 +1,7 @@
-package main
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
+package gocached
 
 import (
 	"bytes"
@@ -25,7 +28,6 @@ import (
 	"time"
 
 	"github.com/bradfitz/go-tool-cache/cachers"
-	ijwt "github.com/bradfitz/go-tool-cache/cmd/gocached/internal/jwt"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-cmp/cmp"
@@ -37,12 +39,8 @@ const sha256OfEmpty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7
 
 type tester struct {
 	t   testing.TB
-	srv *server
+	srv *Server
 	hs  *httptest.Server
-
-	issuer    string
-	audience  string
-	createJWT func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string
 
 	timeMu  sync.Mutex
 	curTime time.Time
@@ -136,7 +134,7 @@ func (st *tester) wantPut(c *cachers.HTTPClient, actionID, outputID string, val 
 	if clientDiskPath == "" {
 		st.t.Fatal("Put returned empty disk path")
 	}
-	st.wantMetric(&st.srv.Puts, 1)
+	st.wantMetric(&st.srv.m.Puts, 1)
 	wrote, err := os.ReadFile(clientDiskPath)
 	if err != nil {
 		st.t.Fatalf("ReadFile: %v", err)
@@ -183,21 +181,29 @@ func (st *tester) wantGetMiss(c *cachers.HTTPClient, actionID string) {
 	}
 }
 
-func newServerTester(t testing.TB) *tester {
+func withClock(clk func() time.Time) ServerOption {
+	return func(cfg *Server) {
+		cfg.clock = clk
+	}
+}
+
+func newServerTester(t testing.TB, extraOpts ...ServerOption) *tester {
 	st := &tester{
 		t:       t,
 		curTime: time.Unix(1234, 0),
 	}
 
-	var err error
-	dir := t.TempDir()
-	st.srv, err = newServer(dir)
-	if err != nil {
-		t.Fatalf("newServer: %v", err)
+	opts := []ServerOption{
+		WithDir(t.TempDir()),
+		WithLogf(t.Logf),
+		WithVerbose(true),
+		withClock(st.now),
 	}
-	st.srv.logf = t.Logf
-	st.srv.verbose = true
-	st.srv.clock = st.now
+	srv, err := NewServer(append(opts, extraOpts...)...)
+	if err != nil {
+		t.Fatalf("starting gocached: %v", err)
+	}
+	st.srv = srv
 
 	st.hs = httptest.NewServer(st.srv)
 	t.Cleanup(st.hs.Close)
@@ -205,23 +211,23 @@ func newServerTester(t testing.TB) *tester {
 	return st
 }
 
-// startOIDCServer starts a mock OIDC server and configures gocached to use it
-// for JWT validation. The provided publicKey is what JWT signatures will be
-// validated against. Use st.createJWT to create signed JWTs.
-func (st *tester) startOIDCServer(publicKey crypto.PublicKey) {
-	st.t.Helper()
+type jwtFunc func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string
+
+// startOIDCServer starts a mock OIDC server that gocached can use for JWT auth.
+// The provided publicKey is what JWT signatures will be validated against.
+func startOIDCServer(t *testing.T, publicKey crypto.PublicKey) (iss string, jwtFunc jwtFunc) {
+	t.Helper()
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
-	st.t.Cleanup(srv.Close)
+	t.Cleanup(srv.Close)
 
-	st.issuer = fmt.Sprintf("http://%s", srv.Listener.Addr().String())
-	st.audience = gocachedAudience
+	issuer := fmt.Sprintf("http://%s", srv.Listener.Addr().String())
 
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"issuer":   st.issuer,
-			"jwks_uri": fmt.Sprintf("%s/jwks", st.issuer),
+			"issuer":   issuer,
+			"jwks_uri": fmt.Sprintf("%s/jwks", issuer),
 		})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
@@ -238,14 +244,8 @@ func (st *tester) startOIDCServer(publicKey crypto.PublicKey) {
 		})
 	})
 
-	st.srv.jwtValidator = ijwt.NewJWTValidator(st.issuer, st.audience)
-	st.srv.jwtValidator.Logf = st.Logf
-	if err := st.srv.jwtValidator.RunUpdateJWKSLoop(st.srv.shutdownCtx); err != nil {
-		st.t.Fatalf("failed to start JWKS loop for JWT validator: %v", err)
-	}
-
-	st.createJWT = func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string {
-		st.t.Helper()
+	return issuer, func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string {
+		t.Helper()
 		unsignedTk := &jwt.Token{
 			Header: map[string]any{
 				"typ": "JWT",
@@ -257,7 +257,7 @@ func (st *tester) startOIDCServer(publicKey crypto.PublicKey) {
 		}
 		tk, err := unsignedTk.SignedString(signingKey)
 		if err != nil {
-			st.t.Fatalf("error signing token: %v", err)
+			t.Fatalf("error signing token: %v", err)
 		}
 
 		return tk
@@ -294,28 +294,28 @@ func TestServer(t *testing.T) {
 	st.wantGet(c2, testActionIDEmpty, testOutputIDEmpty, "")
 
 	// Check metrics
-	st.wantMetric(&st.srv.Gets, 3)
-	st.wantMetric(&st.srv.GetHits, 3)
-	st.wantMetric(&st.srv.GetHitsInline, 1)
+	st.wantMetric(&st.srv.m.Gets, 3)
+	st.wantMetric(&st.srv.m.GetHits, 3)
+	st.wantMetric(&st.srv.m.GetHitsInline, 1)
 
 	// Do the same get again from the same client. This shouldn't hit the network.
 	st.wantGet(c2, testActionID, testOutputID, testObjectValue)
-	st.wantMetric(&st.srv.Gets, 0)
+	st.wantMetric(&st.srv.m.Gets, 0)
 
 	// Cache miss. This should hit the network and fail.
 	if _, _, err := c2.Get(ctx, testActionIDMiss); err != nil {
 		t.Fatalf("miss Get: %v", err)
 	}
-	st.wantMetric(&st.srv.Gets, 1)
-	st.wantMetric(&st.srv.GetHits, 0)
+	st.wantMetric(&st.srv.m.Gets, 1)
+	st.wantMetric(&st.srv.m.GetHits, 0)
 
 	// Check that access time gets updated.
 	// Do it from a fresh client without a disk cache.
-	st.wantMetric(&st.srv.GetAccessBumps, 0)
+	st.wantMetric(&st.srv.m.GetAccessBumps, 0)
 	st.advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
 	c3 := st.mkClient()
 	st.wantGet(c3, testActionID, testOutputID, testObjectValue)
-	st.wantMetric(&st.srv.GetAccessBumps, 1)
+	st.wantMetric(&st.srv.m.GetAccessBumps, 1)
 
 	// Get usage stats.
 	stats, err := st.srv.usageStats()
@@ -511,6 +511,13 @@ func TestExchangeToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error generating OIDC server private key: %v", err)
 	}
+	wantClaims := map[string]string{
+		"sub": "user123",
+	}
+	wantGlobalClaims := map[string]string{
+		"sub": "user123",
+		"ref": "refs/heads/main",
+	}
 
 	for name, tc := range map[string]struct {
 		mutateClaims   func(jwt.MapClaims)
@@ -574,21 +581,18 @@ func TestExchangeToken(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			st := newServerTester(t)
-			st.startOIDCServer(privateKey.Public())
-			st.srv.jwtClaims = map[string]string{
-				"sub": "user123",
-			}
-			st.srv.globalJWTClaims = map[string]string{
-				"sub": "user123",
-				"ref": "refs/heads/main",
-			}
+			issuer, createJWT := startOIDCServer(t, privateKey.Public())
+			st := newServerTester(t,
+				WithJWTAuth(issuer, wantClaims),
+				WithGlobalNamespaceJWTClaims(wantGlobalClaims),
+			)
 
 			// Generate JWT.
 			tokenClaims := jwt.MapClaims{
 				"sub": "user123",
-				"iss": st.issuer,
-				"aud": st.audience,
+				"num": 42,
+				"iss": issuer,
+				"aud": gocachedAudience,
 				"nbf": jwt.NewNumericDate(time.Now().Add(-time.Minute)),
 				"exp": jwt.NewNumericDate(time.Now().Add(time.Hour)),
 			}
@@ -600,7 +604,7 @@ func TestExchangeToken(t *testing.T) {
 				signingKey = tc.signingKey
 			}
 			body, err := json.Marshal(map[string]any{
-				"jwt": st.createJWT(tokenClaims, signingKey),
+				"jwt": createJWT(tokenClaims, signingKey),
 			})
 			if err != nil {
 				t.Fatalf("error marshaling request body: %v", err)
@@ -691,54 +695,5 @@ func TestExchangeToken(t *testing.T) {
 				t.Errorf("expected non-zero puts in session stats")
 			}
 		})
-	}
-}
-
-func TestJWTClaimFlag(t *testing.T) {
-	for name, tc := range map[string]struct {
-		input []string
-		want  jwtClaimValue
-	}{
-		"single_claim": {
-			input: []string{"role=builder"},
-			want:  jwtClaimValue{"role": "builder"},
-		},
-		"multiple_claims": {
-			input: []string{"env=prod", "team=devops"},
-			want:  jwtClaimValue{"env": "prod", "team": "devops"},
-		},
-		"duplicate_keys": {
-			input: []string{"key=value1", "key=value2"},
-			want:  jwtClaimValue{"key": "value2"},
-		},
-		"value_with_equals": {
-			input: []string{"data=a=b=c"},
-			want:  jwtClaimValue{"data": "a=b=c"},
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			claim := make(jwtClaimValue)
-			for _, v := range tc.input {
-				if err := claim.Set(v); err != nil {
-					t.Fatalf("Set failed: %v", err)
-				}
-			}
-			if diff := cmp.Diff(claim, tc.want); diff != "" {
-				t.Errorf("jwtClaimValue mismatch (-got +want):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestInvalidJWTClaimFlags(t *testing.T) {
-	for _, s := range []string{
-		"invalidclaim",
-		"=nokey",
-		"novalue=",
-	} {
-		claim := make(jwtClaimValue)
-		if err := claim.Set(s); err == nil {
-			t.Fatalf("Set with invalid claim %q did not return error", s)
-		}
 	}
 }

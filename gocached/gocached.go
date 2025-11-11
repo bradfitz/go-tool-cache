@@ -1,9 +1,9 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The gocached daemon is an HTTP server daemon that go-cacher can hit. It does
-// cache tiering and evicts old large things from disk, and can fetch metadata
-// and object contents from peer cache servers.
+// The gocached package provides an HTTP server daemon that go-cacher can hit.
+// It does cache tiering and evicts old large things from disk, and can fetch
+// metadata and object contents from peer cache servers.
 //
 // It uses sqlite (the pure Go modernc.org/sqlite driver) to store metadata and
 // indexes.
@@ -31,7 +31,7 @@ And to insert an object:
 	<bytes>
 
 */
-package main
+package gocached
 
 import (
 	"cmp"
@@ -43,13 +43,11 @@ import (
 	"encoding/json"
 	"errors"
 	"expvar"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"maps"
 	"math"
-	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -61,7 +59,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bradfitz/go-tool-cache/cmd/gocached/internal/jwt"
+	ijwt "github.com/bradfitz/go-tool-cache/gocached/internal/jwt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -82,111 +80,6 @@ const (
 	// configurable in future, but for now just needs to be specific to gocached.
 	gocachedAudience = "gocached"
 )
-
-var (
-	dir         = flag.String("cache-dir", "", "cache directory, if empty defaults to <UserCacheDir>/gocached")
-	verbose     = flag.Bool("verbose", false, "be verbose")
-	listen      = flag.String("listen", ":31364", "listen address for the build-facing HTTP server")
-	debugListen = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
-
-	maxSize = flag.Int("max-size-gb", 50, "maximum size of the cache in GiB; 0 means no limit")
-	maxAge  = flag.Int("max-age-days", 60, "maximum age of objects in the cache in days; 0 means no limit")
-
-	jwtIssuer = flag.String("jwt-issuer", "", "the issuer to trust JWTs from; if set, all requests will require auth, and must set at least one -jwt-claim")
-	// See example GitHub token claims for what can be available:
-	// https://docs.github.com/en/actions/concepts/security/openid-connect
-	jwtClaims       = make(jwtClaimValue)
-	globalJWTClaims = make(jwtClaimValue)
-)
-
-type jwtClaimValue map[string]string
-
-func (v jwtClaimValue) String() string {
-	return fmt.Sprintf("%v", map[string]string(v))
-}
-
-func (v jwtClaimValue) Set(s string) error {
-	claim, value, ok := strings.Cut(s, "=")
-	if !ok || claim == "" || value == "" {
-		return fmt.Errorf("bad claim %q, want x=y", s)
-	}
-	v[claim] = value
-	return nil
-}
-
-func main() {
-	flag.Var(&jwtClaims, "jwt-claim", "a claim in the form x=y that any JWT presented must have to start a session; may be specified more than once")
-	flag.Var(&globalJWTClaims, "global-jwt-claim", "an additional claim in the form x=y that a JWT must have to allow writing to the cache's global namespace; may be specified more than once")
-	flag.Parse()
-	if *dir == "" {
-		d, err := os.UserCacheDir()
-		if err != nil {
-			log.Fatal(err)
-		}
-		d = filepath.Join(d, "gocached")
-		log.Printf("Defaulting to cache dir %v ...", d)
-		*dir = d
-	}
-	if err := os.MkdirAll(*dir, 0750); err != nil {
-		log.Fatal(err)
-	}
-
-	srv, err := newServer(*dir)
-	if err != nil {
-		log.Fatalf("newServer: %v", err)
-	}
-	srv.verbose = *verbose
-	srv.maxSize = int64(*maxSize) << 30
-	srv.maxAge = time.Duration(*maxAge) * 24 * time.Hour
-
-	log.Printf("gocached: scanning usage & cleaning as needed...")
-	us, err := srv.usageStats()
-	if err != nil {
-		log.Fatalf("getting usage stats: %v", err)
-	}
-
-	log.Printf("gocached: current usage: %v of limit %v", us.All(), bytesFmt(srv.maxSize))
-	if res, err := srv.cleanOldObjects(us); err != nil {
-		log.Fatalf("clean old objects: %v", err)
-	} else if res.Count > 0 {
-		log.Printf("gocached: cleaned %v", res)
-	}
-
-	if *debugListen != "" {
-		debugLn, err := net.Listen("tcp", *debugListen)
-		if err != nil {
-			log.Fatalf("debug listen: %v", err)
-		}
-		go func() {
-			log.Fatal(http.Serve(debugLn, http.HandlerFunc(srv.ServeHTTPDebug)))
-		}()
-	}
-
-	if *jwtIssuer != "" {
-		if len(jwtClaims) == 0 {
-			log.Fatal("must specify --jwt-claim at least once when --jwt-issuer is set")
-		}
-		srv.jwtValidator = jwt.NewJWTValidator(*jwtIssuer, gocachedAudience)
-		if err := srv.jwtValidator.RunUpdateJWKSLoop(srv.shutdownCtx); err != nil {
-			log.Fatalf("failed to fetch JWKS for JWT validator: %v", err)
-		}
-		srv.jwtClaims = jwtClaims
-
-		globalClaims := map[string]string{}
-		maps.Copy(globalClaims, jwtClaims)
-		maps.Copy(globalClaims, globalJWTClaims)
-		srv.globalJWTClaims = globalClaims
-
-		log.Printf("gocached: using JWT issuer %q with claims %v, global claims %v", *jwtIssuer, srv.jwtClaims, srv.globalJWTClaims)
-
-		go srv.runCleanSessionsLoop()
-	}
-
-	go srv.runCleanLoop()
-
-	log.Printf("gocached: listening on %s ...", *listen)
-	log.Fatal(http.ListenAndServe(*listen, srv))
-}
 
 const schemaVersion = 3
 
@@ -243,11 +136,24 @@ func openDB(dbDir string) (*sql.DB, error) {
 	return db, nil
 }
 
-func newServer(dir string) (*server, error) {
-	db, err := openDB(dir)
-	if err != nil {
-		return nil, fmt.Errorf("openDB: %w", err)
+// start initializes the server, including defaults and background goroutines.
+func (srv *Server) start() error {
+	if srv.dir == "" {
+		d, err := os.UserCacheDir()
+		if err != nil {
+			return fmt.Errorf("getting user cache dir: %w", err)
+		}
+		srv.dir = filepath.Join(d, "gocached")
+		srv.logf("Defaulting to cache dir %v ...", srv.dir)
 	}
+	if err := os.MkdirAll(srv.dir, 0750); err != nil {
+		return fmt.Errorf("creating cache dir: %w", err)
+	}
+	db, err := openDB(srv.dir)
+	if err != nil {
+		return fmt.Errorf("openDB: %w", err)
+	}
+	srv.db = db
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
@@ -255,26 +161,44 @@ func newServer(dir string) (*server, error) {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		collectors.NewBuildInfoCollector(),
 	)
-
-	srv := &server{
-		db:       db,
-		dir:      dir,
-		logf:     log.Printf,
-		sessions: make(map[string]*sessionData),
-	}
-	srv.shutdownCtx, srv.shutdownCancel = context.WithCancel(context.Background())
 	srv.registerMetrics(reg)
 
 	srv.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		ErrorLog: log.Default(),
 	})
 
-	return srv, nil
+	srv.logf("gocached: scanning usage & cleaning as needed...")
+	us, err := srv.usageStats()
+	if err != nil {
+		return fmt.Errorf("getting usage stats: %w", err)
+	}
+
+	srv.logf("gocached: current usage: %v of limit %v", us.All(), bytesFmt(srv.maxSize))
+	if res, err := srv.cleanOldObjects(us); err != nil {
+		return fmt.Errorf("clean old objects: %w", err)
+	} else if res.Count > 0 {
+		srv.logf("gocached: cleaned %v", res)
+	}
+
+	if srv.jwtIssuer != "" {
+		srv.jwtValidator = ijwt.NewJWTValidator(srv.logf, srv.jwtIssuer, gocachedAudience)
+		if err := srv.jwtValidator.RunUpdateJWKSLoop(srv.shutdownCtx); err != nil {
+			return fmt.Errorf("failed to fetch JWKS for JWT validator: %w", err)
+		}
+
+		srv.logf("gocached: using JWT issuer %q with claims %v, global claims %v", srv.jwtIssuer, srv.jwtClaims, srv.globalJWTClaims)
+
+		go srv.runCleanSessionsLoop()
+	}
+
+	go srv.runCleanLoop()
+
+	return nil
 }
 
-func (s *server) registerMetrics(reg *prometheus.Registry) {
-	rv := reflect.ValueOf(s).Elem()
-	t := reflect.TypeOf(s).Elem()
+func (srv *Server) registerMetrics(reg *prometheus.Registry) {
+	rv := reflect.ValueOf(&srv.m).Elem()
+	t := reflect.TypeOf(&srv.m).Elem()
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if sf.Type == reflect.TypeFor[expvar.Int]() {
@@ -307,19 +231,117 @@ func (s *server) registerMetrics(reg *prometheus.Registry) {
 	}
 }
 
-type server struct {
+// ServerOption configures a gocached Server.
+type ServerOption func(*Server)
+
+// WithShutdownCtx sets the context used to signal server shutdown. Defaults to
+// context.Background().
+func WithShutdownCtx(ctx context.Context) ServerOption {
+	return func(srv *Server) {
+		srv.shutdownCtx = ctx
+	}
+}
+
+// WithDir sets the directory where the server stores its data. Defaults to the
+// OS user cache directory under $XDG_CACHE_HOME/gocached or equivalent.
+func WithDir(dir string) ServerOption {
+	return func(srv *Server) {
+		srv.dir = dir
+	}
+}
+
+// WithVerbose enables verbose logging for the server. Defaults to false.
+func WithVerbose(verbose bool) ServerOption {
+	return func(srv *Server) {
+		srv.verbose = verbose
+	}
+}
+
+type logf func(format string, args ...any)
+
+// WithLogf sets a custom logging function for the server. Defaults to
+// [log.Printf].
+func WithLogf(logf logf) ServerOption {
+	return func(srv *Server) {
+		srv.logf = logf
+	}
+}
+
+// WithMaxSize sets the maximum size of the cache in bytes. Defaults to 0, which
+// means no limit.
+func WithMaxSize(maxSize int64) ServerOption {
+	return func(srv *Server) {
+		srv.maxSize = maxSize
+	}
+}
+
+// WithMaxAge sets the maximum age of objects in the cache. Objects older than
+// this duration will be cleaned periodically. Defaults to 0, which means no
+// limit.
+func WithMaxAge(maxAge time.Duration) ServerOption {
+	return func(srv *Server) {
+		srv.maxAge = maxAge
+	}
+}
+
+// WithJWTAuth enables JWT-based authentication for the server. The issuer must
+// be a reachable HTTP(S) server that serves its JWKS via a URL discoverable at
+// /.well-known/openid-configuration, and any JWT presented to the server must
+// exactly match the provided claims to start a session. No requests are allowed
+// without authentication if JWT auth is enabled.
+func WithJWTAuth(issuer string, claims map[string]string) ServerOption {
+	return func(srv *Server) {
+		srv.jwtIssuer = issuer
+		srv.jwtClaims = claims
+	}
+}
+
+// WithGlobalNamespaceJWTClaims sets additional claims that a JWT must have to
+// write to the cache's global namespace. It should be a superset of the claims
+// provided to [WithJWTAuth].
+func WithGlobalNamespaceJWTClaims(claims map[string]string) ServerOption {
+	return func(srv *Server) {
+		srv.globalJWTClaims = claims
+	}
+}
+
+// NewServer creates and starts a new gocached [Server] that is ready to serve
+// requests. It defaults to requiring no authentication and storing its data in
+// the OS user cache directory under $XDG_CACHE_HOME/gocached or equivalent.
+func NewServer(opts ...ServerOption) (*Server, error) {
+	srv := &Server{
+		shutdownCtx: context.Background(),
+		logf:        log.Printf,
+		sessions:    make(map[string]*sessionData),
+		clock:       time.Now,
+	}
+	for _, opt := range opts {
+		opt(srv)
+	}
+
+	err := srv.start()
+	if err != nil {
+		return nil, err
+	}
+
+	return srv, nil
+}
+
+// Server implements a gocached server. Use [NewServer] to create and start a
+// valid instance.
+type Server struct {
 	db             *sql.DB
 	dir            string // for SQLite DB + large blobs
 	verbose        bool
-	logf           func(format string, args ...any)
+	logf           logf
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
 	metricsHandler http.Handler
 	maxSize        int64         // maximum size of the cache in bytes; 0 means no limit
 	maxAge         time.Duration // maximum age of objects; 0 means no limit
 	shutdownCtx    context.Context
-	shutdownCancel context.CancelFunc
 
-	jwtValidator    *jwt.Validator    // nil unless -jwt-issuer flag is set
+	jwtValidator    *ijwt.Validator   // nil unless jwtIssuer is set
+	jwtIssuer       string            // issuer URL for JWTs
 	jwtClaims       map[string]string // claims required for any JWT to start a session
 	globalJWTClaims map[string]string // additional claims required to write to global namespace
 
@@ -334,27 +356,30 @@ type server struct {
 
 	lastUsage atomic.Pointer[usageStats]
 
-	// Metrics
-	ActiveGets     expvar.Int `type:"gauge" name:"active_gets" help:"currently pending get requests; should usually be zero"`
-	ActivePuts     expvar.Int `type:"gauge" name:"active_puts" help:"currently pending put requests; should usually be zero"`
-	Gets           expvar.Int `type:"counter" name:"gets" help:"total number of gocache get requests"` // gets = getHits + getErrs + implicit misses
-	GetBytes       expvar.Int `type:"counter" name:"get_bytes" help:"total bytes fetched from gocache gets that were cache hits"`
-	GetHits        expvar.Int `type:"counter" name:"get_hits" help:"total number of successful gocache get requests"`
-	GetAccessBumps expvar.Int `type:"counter" name:"get_access_bumps" help:"number of times a get request updated the access time of object"`
-	GetHitsInline  expvar.Int `type:"counter" name:"get_hits_inline" help:"cache hits served from inline database storage (small objects)"`
-	GetErrs        expvar.Int `type:"counter" name:"get_errs" help:"number of gocache get request errors"`
-	Puts           expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
-	PutErrs        expvar.Int `type:"counter" name:"put_errs" help:"number of gocache put request errors"`
-	PutsDup        expvar.Int `type:"counter" name:"puts_dup" help:"total number of gocache put requests that are duplicates of a mapping we already had"`
-	PutsBytes      expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
-	PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
-	BlobCount      expvar.Int `type:"gauge" name:"blob_count" help:"number of blobs currently stored in the cache"`
-	BlobBytes      expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
-	EvictedBlobs   expvar.Int `type:"counter" name:"evicted_blobs" help:"number of blobs evicted from the cache"`
-	EvictedBytes   expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes evicted from the cache"`
-	Sessions       expvar.Int `type:"gauge" name:"sessions" help:"number of active authenticated sessions"`
-	Auths          expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
-	AuthErrs       expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
+	// Metrics. Exported fields for reflection, but within a private struct
+	// field to control the gocached Server API surface.
+	m struct {
+		ActiveGets     expvar.Int `type:"gauge" name:"active_gets" help:"currently pending get requests; should usually be zero"`
+		ActivePuts     expvar.Int `type:"gauge" name:"active_puts" help:"currently pending put requests; should usually be zero"`
+		Gets           expvar.Int `type:"counter" name:"gets" help:"total number of gocache get requests"` // gets = getHits + getErrs + implicit misses
+		GetBytes       expvar.Int `type:"counter" name:"get_bytes" help:"total bytes fetched from gocache gets that were cache hits"`
+		GetHits        expvar.Int `type:"counter" name:"get_hits" help:"total number of successful gocache get requests"`
+		GetAccessBumps expvar.Int `type:"counter" name:"get_access_bumps" help:"number of times a get request updated the access time of object"`
+		GetHitsInline  expvar.Int `type:"counter" name:"get_hits_inline" help:"cache hits served from inline database storage (small objects)"`
+		GetErrs        expvar.Int `type:"counter" name:"get_errs" help:"number of gocache get request errors"`
+		Puts           expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
+		PutErrs        expvar.Int `type:"counter" name:"put_errs" help:"number of gocache put request errors"`
+		PutsDup        expvar.Int `type:"counter" name:"puts_dup" help:"total number of gocache put requests that are duplicates of a mapping we already had"`
+		PutsBytes      expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
+		PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
+		BlobCount      expvar.Int `type:"gauge" name:"blob_count" help:"number of blobs currently stored in the cache"`
+		BlobBytes      expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
+		EvictedBlobs   expvar.Int `type:"counter" name:"evicted_blobs" help:"number of blobs evicted from the cache"`
+		EvictedBytes   expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes evicted from the cache"`
+		Sessions       expvar.Int `type:"gauge" name:"sessions" help:"number of active authenticated sessions"`
+		Auths          expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
+		AuthErrs       expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
+	}
 }
 
 // sessionData corresponds to a specific access token, and is only used if JWT
@@ -387,14 +412,13 @@ type stats struct {
 	PutsNanos      int64
 }
 
-func (srv *server) now() time.Time {
-	if srv.clock != nil {
-		return srv.clock()
-	}
-	return time.Now()
+func (srv *Server) now() time.Time {
+	return srv.clock()
 }
 
-func (srv *server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
+// ServeHTTPDebug serves debug HTTP endpoints. It is unauthenticated, so should
+// only be used on a separate debug listener.
+func (srv *Server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 	if srv.verbose {
 		srv.logf("ServeHTTPDebug: %s %s", r.Method, r.RequestURI)
 	}
@@ -429,7 +453,8 @@ func (srv *server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (srv *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP implements gocached's API via [http.Handler].
+func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if srv.verbose {
 		srv.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
 	}
@@ -495,32 +520,32 @@ func (srv *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "not found", http.StatusNotFound)
 }
 
-func (srv *server) getSessionData(token string) (*sessionData, bool) {
+func (srv *Server) getSessionData(token string) (*sessionData, bool) {
 	srv.sessionsMu.Lock()
 	defer srv.sessionsMu.Unlock()
 	sessionData, ok := srv.sessions[token]
 	return sessionData, ok
 }
 
-func (srv *server) addSessionData(token string, sessionData *sessionData) {
+func (srv *Server) addSessionData(token string, sessionData *sessionData) {
 	srv.sessionsMu.Lock()
 	defer srv.sessionsMu.Unlock()
 	srv.sessions[token] = sessionData
-	srv.Sessions.Add(1)
+	srv.m.Sessions.Add(1)
 }
 
-func (srv *server) processRequestStats(req *stats, sessionData *sessionData) {
-	srv.Gets.Add(req.Gets)
-	srv.GetBytes.Add(req.GetBytes)
-	srv.GetHits.Add(req.GetHits)
-	srv.GetAccessBumps.Add(req.GetAccessBumps)
-	srv.GetHitsInline.Add(req.GetHitsInline)
-	srv.GetErrs.Add(req.GetErrs)
-	srv.Puts.Add(req.Puts)
-	srv.PutErrs.Add(req.PutErrs)
-	srv.PutsDup.Add(req.PutsDup)
-	srv.PutsBytes.Add(req.PutsBytes)
-	srv.PutsInline.Add(req.PutsInline)
+func (srv *Server) processRequestStats(req *stats, sessionData *sessionData) {
+	srv.m.Gets.Add(req.Gets)
+	srv.m.GetBytes.Add(req.GetBytes)
+	srv.m.GetHits.Add(req.GetHits)
+	srv.m.GetAccessBumps.Add(req.GetAccessBumps)
+	srv.m.GetHitsInline.Add(req.GetHitsInline)
+	srv.m.GetErrs.Add(req.GetErrs)
+	srv.m.Puts.Add(req.Puts)
+	srv.m.PutErrs.Add(req.PutErrs)
+	srv.m.PutsDup.Add(req.PutsDup)
+	srv.m.PutsBytes.Add(req.PutsBytes)
+	srv.m.PutsInline.Add(req.PutsInline)
 
 	if sessionData != nil {
 		sessionData.mu.Lock()
@@ -569,9 +594,9 @@ func validHex(x string) bool {
 // we do a DB write to update it.
 const relAtimeSeconds = 60 * 60 * 24 // 1 day
 
-func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request, stats *stats) {
-	srv.ActiveGets.Add(1)
-	defer srv.ActiveGets.Add(-1)
+func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats *stats) {
+	srv.m.ActiveGets.Add(1)
+	defer srv.m.ActiveGets.Add(-1)
 
 	start := srv.now()
 	defer func() {
@@ -680,7 +705,7 @@ func (srv *server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 // exists but is not stored in SQLite.
 //
 // It returns (nil, nil) on miss.
-func (srv *server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string) (rc io.ReadCloser, err error) {
+func (srv *Server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string) (rc io.ReadCloser, err error) {
 	if len(sha256hex) != sha256.Size*2 {
 		return nil, fmt.Errorf("invalid sha256hex %q", sha256hex)
 	}
@@ -697,9 +722,9 @@ func (srv *server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string) 
 	return f, nil
 }
 
-func (s *server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats) {
-	s.ActivePuts.Add(1)
-	defer s.ActivePuts.Add(-1)
+func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats) {
+	s.m.ActivePuts.Add(1)
+	defer s.m.ActivePuts.Add(-1)
 
 	start := s.now()
 	defer func() {
@@ -814,20 +839,20 @@ func (s *server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats)
 // handleTokenExchange handles POST /auth/exchange-token requests to exchange
 // a JWT for an access token. Each access token represents a session that will
 // last for one hour and have cache stats associated with it.
-func (srv *server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
+func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		JWT string `json:"jwt"`
 	}
 	// JWTs are often sent in HTTP headers, so 4KiB should ~always be enough.
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&req); err != nil {
-		srv.AuthErrs.Add(1)
+		srv.m.AuthErrs.Add(1)
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	jwtClaims, err := srv.jwtValidator.Validate(r.Context(), req.JWT)
 	if err != nil {
-		srv.AuthErrs.Add(1)
+		srv.m.AuthErrs.Add(1)
 		if srv.verbose {
 			srv.logf("token exchange: JWT validation error: %v", err)
 		}
@@ -837,7 +862,7 @@ func (srv *server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 
 	globalNSWrite, err := srv.evaluateClaims(jwtClaims)
 	if err != nil {
-		srv.AuthErrs.Add(1)
+		srv.m.AuthErrs.Add(1)
 		if srv.verbose {
 			srv.logf("token exchange: %v", err)
 		}
@@ -861,15 +886,15 @@ func (srv *server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		srv.AuthErrs.Add(1)
+		srv.m.AuthErrs.Add(1)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	srv.Auths.Add(1)
+	srv.m.Auths.Add(1)
 }
 
-func (srv *server) evaluateClaims(claims map[string]any) (globalNSWrite bool, _ error) {
+func (srv *Server) evaluateClaims(claims map[string]any) (globalNSWrite bool, _ error) {
 	if missing := findMissingClaims(srv.jwtClaims, claims); len(missing) > 0 {
 		return false, fmt.Errorf("got claims %v; missing required claims: %v", claims, missing)
 	}
@@ -883,8 +908,12 @@ func (srv *server) evaluateClaims(claims map[string]any) (globalNSWrite bool, _ 
 	return false, nil
 }
 
-func findMissingClaims(wantClaims map[string]string, gotClaims map[string]any) map[string]string {
-	missing := make(map[string]string)
+func findMissingClaims(wantClaims map[string]string, gotClaims map[string]any) map[string]any {
+	if wantClaims == nil {
+		return nil
+	}
+
+	missing := make(map[string]any)
 	for k, want := range wantClaims {
 		if got, ok := gotClaims[k]; !ok || got != want {
 			missing[k] = want
@@ -893,7 +922,7 @@ func findMissingClaims(wantClaims map[string]string, gotClaims map[string]any) m
 	return missing
 }
 
-func (srv *server) handleSessionStats(w http.ResponseWriter, sessionData *sessionData) {
+func (srv *Server) handleSessionStats(w http.ResponseWriter, sessionData *sessionData) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(sessionData.stats); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -901,12 +930,12 @@ func (srv *server) handleSessionStats(w http.ResponseWriter, sessionData *sessio
 	}
 }
 
-func (s *server) sha256Filepath(hash [sha256.Size]byte) string {
+func (s *Server) sha256Filepath(hash [sha256.Size]byte) string {
 	hex := fmt.Sprintf("%x", hash)
 	return filepath.Join(s.dir, hex[:2], hex)
 }
 
-func (s *server) writeDiskBlob(size int64, r io.Reader) (err error) {
+func (s *Server) writeDiskBlob(size int64, r io.Reader) (err error) {
 	nowUnix := s.now().Unix()
 	tf, err := os.CreateTemp(s.dir, fmt.Sprintf("upload-%d-*", nowUnix))
 	if err != nil {
@@ -987,7 +1016,7 @@ var standardDurs = []time.Duration{
 	math.MaxInt64,
 }
 
-func (s *server) usageStats() (_ *usageStats, err error) {
+func (s *Server) usageStats() (_ *usageStats, err error) {
 	defer func() {
 		if err != nil {
 			s.logf("usageStats error: %v", err)
@@ -1053,8 +1082,8 @@ func (s *server) usageStats() (_ *usageStats, err error) {
 
 	s.lastUsage.Store(st)
 	all := st.All()
-	s.BlobCount.Set(all.Count)
-	s.BlobBytes.Set(all.Size)
+	s.m.BlobCount.Set(all.Count)
+	s.m.BlobBytes.Set(all.Size)
 	return st, nil
 }
 
@@ -1064,7 +1093,7 @@ type cleanCandidate struct {
 	BlobSize int64 // size of the blob, in bytes
 }
 
-func (s *server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanCandidate, error) {
+func (s *Server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanCandidate, error) {
 	now := s.now()
 	nowUnix := now.Unix()
 	cutoff := now.Add(-olderThan).Unix()
@@ -1098,7 +1127,7 @@ func (s *server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanC
 	return candidates, nil
 }
 
-func (srv *server) deleteBlobs(blobIDs ...int64) error {
+func (srv *Server) deleteBlobs(blobIDs ...int64) error {
 	srv.sqliteWriteMu.Lock()
 	defer srv.sqliteWriteMu.Unlock()
 
@@ -1133,13 +1162,13 @@ func (srv *server) deleteBlobs(blobIDs ...int64) error {
 		return err
 	}
 
-	srv.EvictedBlobs.Add(int64(len(blobIDs)))
-	srv.EvictedBytes.Add(sumBytes)
+	srv.m.EvictedBlobs.Add(int64(len(blobIDs)))
+	srv.m.EvictedBytes.Add(sumBytes)
 
 	return nil
 }
 
-func (srv *server) cleanOldObjects(us *usageStats) (countAndSize, error) {
+func (srv *Server) cleanOldObjects(us *usageStats) (countAndSize, error) {
 	var zero countAndSize
 	var ret countAndSize
 
@@ -1224,7 +1253,7 @@ func (srv *server) cleanOldObjects(us *usageStats) (countAndSize, error) {
 	return ret, nil
 }
 
-func (srv *server) runCleanLoop() {
+func (srv *Server) runCleanLoop() {
 	for {
 		select {
 		case <-srv.shutdownCtx.Done():
@@ -1251,7 +1280,7 @@ func (srv *server) runCleanLoop() {
 	}
 }
 
-func (srv *server) runCleanSessionsLoop() {
+func (srv *Server) runCleanSessionsLoop() {
 	for {
 		select {
 		case <-srv.shutdownCtx.Done():
@@ -1266,11 +1295,13 @@ func (srv *server) runCleanSessionsLoop() {
 			if time.Now().After(metadata.expiry) {
 				delete(srv.sessions, token)
 				deleted++
-				srv.Sessions.Add(-1)
+				srv.m.Sessions.Add(-1)
 			}
 		}
 		srv.sessionsMu.Unlock()
-		srv.logf("cleaned up %d/%d access tokens", deleted, count)
+		if count > 0 {
+			srv.logf("cleaned up %d/%d access tokens", deleted, count)
+		}
 	}
 }
 
@@ -1295,7 +1326,7 @@ func bytesFmt(n int64) string {
 	return fmt.Sprintf("%d bytes", n)
 }
 
-func (srv *server) serveUsage(w http.ResponseWriter, r *http.Request) {
+func (srv *Server) serveUsage(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		// For side effect of updating lastUsage.
 		_, err := srv.usageStats()
@@ -1333,7 +1364,7 @@ func (srv *server) serveUsage(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "</table>\n")
 }
 
-func (srv *server) serveSessions(w http.ResponseWriter, r *http.Request) {
+func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "bad method", http.StatusMethodNotAllowed)
 		return
@@ -1356,7 +1387,7 @@ func (srv *server) serveSessions(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<html><body><h1>gocached sessions</h1>\n")
-	fmt.Fprintf(w, "<p>JWT issuer: %s</p>\n", *jwtIssuer)
+	fmt.Fprintf(w, "<p>JWT issuer: %s</p>\n", srv.jwtIssuer)
 	fmt.Fprintf(w, "<p>JWT claims required: %v</p>\n", srv.jwtClaims)
 	fmt.Fprintf(w, "<p>JWT global write claims required: %v</p>\n", srv.globalJWTClaims)
 	fmt.Fprintf(w, "<p>Number of sessions: %d</p>\n", len(sessions))
