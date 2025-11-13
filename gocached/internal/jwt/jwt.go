@@ -1,3 +1,6 @@
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
+
 package jwt
 
 import (
@@ -5,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -31,9 +33,9 @@ var (
 // public signing keys via the path defined by [oidcConfigWellKnownPath], and
 // the audience should be a value specific to the trust boundary that gocached
 // resides within.
-func NewJWTValidator(issuer, audience string) *Validator {
+func NewJWTValidator(logf func(format string, args ...any), issuer, audience string) *Validator {
 	return &Validator{
-		Logf:   log.Printf,
+		logf:   logf,
 		issuer: issuer,
 		parser: jwt.NewParser(
 			jwt.WithValidMethods(supportedAlgorithms),
@@ -63,7 +65,7 @@ func (v *Validator) RunUpdateJWKSLoop(ctx context.Context) error {
 // Validator provides methods for validating JWTs. Use [NewJWTValidator] to
 // construct a working Validator.
 type Validator struct {
-	Logf   func(format string, args ...any)
+	logf   func(format string, args ...any)
 	issuer string
 	parser *jwt.Parser
 
@@ -127,13 +129,13 @@ func (v *Validator) runUpdateJWKSLoop(ctx context.Context) {
 			// Non-fatal; in practice, the most recent keys will normally
 			// still be valid for a long time, but JWT validation will start
 			// erroring more loudly than this if not.
-			v.Logf("jwt: failed to update JWKS: %v", err)
+			v.logf("jwt: failed to update JWKS: %v", err)
 		}
 	}
 }
 
 func (v *Validator) updateJWKS(ctx context.Context) error {
-	v.Logf("jwt: fetching JWKS from issuer %q", v.issuer)
+	v.logf("jwt: fetching JWKS from issuer %q", v.issuer)
 	u, err := url.Parse(v.issuer)
 	if err != nil {
 		return fmt.Errorf("failed to parse issuer URL %q: %w", v.issuer, err)
