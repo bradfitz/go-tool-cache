@@ -354,31 +354,37 @@ type Server struct {
 	// laziness for now.
 	sqliteWriteMu sync.Mutex
 
+	// atimesWG tracks goroutines that are periodically attempting to update
+	// access times. Used in tests.
+	atimesWG sync.WaitGroup
+
 	lastUsage atomic.Pointer[usageStats]
 
 	// Metrics. Exported fields for reflection, but within a private struct
 	// field to control the gocached Server API surface.
 	m struct {
-		ActiveGets     expvar.Int `type:"gauge" name:"active_gets" help:"currently pending get requests; should usually be zero"`
-		ActivePuts     expvar.Int `type:"gauge" name:"active_puts" help:"currently pending put requests; should usually be zero"`
-		Gets           expvar.Int `type:"counter" name:"gets" help:"total number of gocache get requests"` // gets = getHits + getErrs + implicit misses
-		GetBytes       expvar.Int `type:"counter" name:"get_bytes" help:"total bytes fetched from gocache gets that were cache hits"`
-		GetHits        expvar.Int `type:"counter" name:"get_hits" help:"total number of successful gocache get requests"`
-		GetAccessBumps expvar.Int `type:"counter" name:"get_access_bumps" help:"number of times a get request updated the access time of object"`
-		GetHitsInline  expvar.Int `type:"counter" name:"get_hits_inline" help:"cache hits served from inline database storage (small objects)"`
-		GetErrs        expvar.Int `type:"counter" name:"get_errs" help:"number of gocache get request errors"`
-		Puts           expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
-		PutErrs        expvar.Int `type:"counter" name:"put_errs" help:"number of gocache put request errors"`
-		PutsDup        expvar.Int `type:"counter" name:"puts_dup" help:"total number of gocache put requests that are duplicates of a mapping we already had"`
-		PutsBytes      expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
-		PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
-		BlobCount      expvar.Int `type:"gauge" name:"blob_count" help:"number of blobs currently stored in the cache"`
-		BlobBytes      expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
-		EvictedBlobs   expvar.Int `type:"counter" name:"evicted_blobs" help:"number of blobs evicted from the cache"`
-		EvictedBytes   expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes evicted from the cache"`
-		Sessions       expvar.Int `type:"gauge" name:"sessions" help:"number of active authenticated sessions"`
-		Auths          expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
-		AuthErrs       expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
+		ActiveGets           expvar.Int `type:"gauge" name:"active_gets" help:"currently pending get requests; should usually be zero"`
+		ActivePuts           expvar.Int `type:"gauge" name:"active_puts" help:"currently pending put requests; should usually be zero"`
+		Gets                 expvar.Int `type:"counter" name:"gets" help:"total number of gocache get requests"` // gets = getHits + getErrs + implicit misses
+		GetBytes             expvar.Int `type:"counter" name:"get_bytes" help:"total bytes fetched from gocache gets that were cache hits"`
+		GetHits              expvar.Int `type:"counter" name:"get_hits" help:"total number of successful gocache get requests"`
+		GetAccessBumps       expvar.Int `type:"counter" name:"get_access_bumps" help:"number of times a get request updated the access time of object"`
+		AccessBumpGoroutines expvar.Int `type:"gauge" name:"access_bump_goroutines" help:"number of goroutines currently updating access times asynchronously"`
+		AccessBumpTimeouts   expvar.Int `type:"counter" name:"access_bump_timeouts" help:"number of times an access time update goroutine timed out"`
+		GetHitsInline        expvar.Int `type:"counter" name:"get_hits_inline" help:"cache hits served from inline database storage (small objects)"`
+		GetErrs              expvar.Int `type:"counter" name:"get_errs" help:"number of gocache get request errors"`
+		Puts                 expvar.Int `type:"counter" name:"puts" help:"total number of gocache put requests"`
+		PutErrs              expvar.Int `type:"counter" name:"put_errs" help:"number of gocache put request errors"`
+		PutsDup              expvar.Int `type:"counter" name:"puts_dup" help:"total number of gocache put requests that are duplicates of a mapping we already had"`
+		PutsBytes            expvar.Int `type:"counter" name:"put_bytes" help:"total bytes added from gocache puts"`
+		PutsInline           expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
+		BlobCount            expvar.Int `type:"gauge" name:"blob_count" help:"number of blobs currently stored in the cache"`
+		BlobBytes            expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
+		EvictedBlobs         expvar.Int `type:"counter" name:"evicted_blobs" help:"number of blobs evicted from the cache"`
+		EvictedBytes         expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes evicted from the cache"`
+		Sessions             expvar.Int `type:"gauge" name:"sessions" help:"number of active authenticated sessions"`
+		Auths                expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
+		AuthErrs             expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
 	}
 }
 
@@ -644,16 +650,35 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	// This is similar to the Linux "relatime" behavior.
 	now := srv.now().Unix()
 	if accessTime < now-relAtimeSeconds {
-		// TODO(bradfitz): do this async? not worth blocking the caller.
-		// But we need a mechanism for tests to wait on async work.
-		srv.sqliteWriteMu.Lock()
-		_, err := srv.db.Exec("UPDATE Actions SET AccessTime = ? WHERE ActionID = ?", now, actionID)
-		srv.sqliteWriteMu.Unlock()
-		if err != nil {
-			srv.logf("Update AccessTime error: %v", err)
-			httpErr("internal server error", http.StatusInternalServerError)
-			return
-		}
+		// Update access time async; this is low priority compared to serving
+		// clients and can cause contention on the write mutex otherwise.
+		srv.m.AccessBumpGoroutines.Add(1)
+		srv.atimesWG.Go(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+			defer cancel()
+			defer srv.m.AccessBumpGoroutines.Add(-1)
+			for {
+				if srv.sqliteWriteMu.TryLock() {
+					_, err := srv.db.Exec("UPDATE Actions SET AccessTime = ? WHERE AccessTime < ? AND ActionID = ?", now, now, actionID)
+					srv.sqliteWriteMu.Unlock()
+					if err != nil && srv.verbose {
+						srv.logf("error updating access time for %q: %v", actionID, err)
+					}
+					return
+				}
+
+				select {
+				case <-ctx.Done():
+					if srv.verbose {
+						srv.logf("timed out updating access time for %q", actionID)
+					}
+					srv.m.AccessBumpTimeouts.Add(1)
+					return
+				case <-time.After(10 * time.Second):
+					// Retry.
+				}
+			}
+		})
 		stats.GetAccessBumps++
 	}
 

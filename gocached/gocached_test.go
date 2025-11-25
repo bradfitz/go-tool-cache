@@ -317,6 +317,8 @@ func TestServer(t *testing.T) {
 	st.wantGet(c3, testActionID, testOutputID, testObjectValue)
 	st.wantMetric(&st.srv.m.GetAccessBumps, 1)
 
+	st.srv.atimesWG.Wait()
+
 	// Get usage stats.
 	stats, err := st.srv.usageStats()
 	if err != nil {
