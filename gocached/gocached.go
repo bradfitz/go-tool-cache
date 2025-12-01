@@ -647,7 +647,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		// TODO(bradfitz): do this async? not worth blocking the caller.
 		// But we need a mechanism for tests to wait on async work.
 		srv.sqliteWriteMu.Lock()
-		_, err := srv.db.Exec("UPDATE Actions SET AccessTime = ? WHERE ActionID = ?", now, actionID)
+		_, err := srv.db.Exec("UPDATE Actions SET AccessTime = ? WHERE NamespaceID = ? AND ActionID = ?", now, namespaceID, actionID)
 		srv.sqliteWriteMu.Unlock()
 		if err != nil {
 			srv.logf("Update AccessTime error: %v", err)
