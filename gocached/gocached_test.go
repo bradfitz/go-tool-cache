@@ -697,3 +697,29 @@ func TestExchangeToken(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkFlushAccessTimes(b *testing.B) {
+	st := newServerTester(b)
+	s := st.srv
+
+	cl := st.mkClient()
+	var actionIDs []string
+	for n := range 5000 {
+		aid := fmt.Sprintf("abcd%04x", n)
+		st.wantPut(cl, aid, "def456", "data789")
+		actionIDs = append(actionIDs, aid)
+	}
+
+	for b.Loop() {
+		s.mu.Lock()
+		s.accessDirty = make(map[actionKey]int64)
+		for _, aid := range actionIDs {
+			s.accessDirty[actionKey{ActionID: aid}] = 123
+		}
+		s.mu.Unlock()
+
+		if err := s.flushAccessTimeBumpsWithErr(); err != nil {
+			b.Fatalf("flushAccessTimeBumpsWithErr: %v", err)
+		}
+	}
+}

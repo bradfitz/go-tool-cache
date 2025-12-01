@@ -53,6 +53,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -127,8 +128,9 @@ func openDB(dbDir string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	numConns := min(runtime.NumCPU(), 4)
+	db.SetMaxOpenConns(numConns)
+	db.SetMaxIdleConns(numConns)
 	db.SetConnMaxLifetime(0) // no limit
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
@@ -356,7 +358,9 @@ type Server struct {
 	// laziness for now.
 	//
 	// Lock ordering: sqliteWriteMu before mu.
-	sqliteWriteMu sync.Mutex
+	sqliteWriteMu        sync.Mutex
+	writeConn            *sql.Conn // nil until first used; single connection for writes
+	updateAccessTimeStmt *sql.Stmt // nil until first used; for updating access times on writeConn
 
 	lastUsage atomic.Pointer[usageStats]
 
@@ -771,14 +775,32 @@ func (srv *Server) flushAccessTimeBumpsWithErr() (ret error) {
 		return nil
 	}
 
-	tx, err := srv.db.Begin()
+	if srv.writeConn == nil {
+		var err error
+		srv.writeConn, err = srv.db.Conn(context.Background())
+		if err != nil {
+			return fmt.Errorf("getting writeConn: %w", err)
+		}
+	}
+
+	if srv.updateAccessTimeStmt == nil {
+		var err error
+		srv.updateAccessTimeStmt, err = srv.writeConn.PrepareContext(context.Background(), "UPDATE Actions SET AccessTime = ? WHERE NamespaceID = ? AND ActionID = ?")
+		if err != nil {
+			return fmt.Errorf("prepare updateAccessTimeStmt: %w", err)
+		}
+	}
+
+	tx, err := srv.writeConn.BeginTx(context.Background(), nil)
 	if err != nil {
 		return fmt.Errorf("begin Tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	txStmt := tx.Stmt(srv.updateAccessTimeStmt)
+
 	for action, accessTime := range srv.accessDirty {
-		_, err := tx.Exec("UPDATE Actions SET AccessTime = ? WHERE NamespaceID = ? AND ActionID = ?", accessTime, action.NamespaceID, action.ActionID)
+		_, err := txStmt.Exec(accessTime, action.NamespaceID, action.ActionID)
 		if err != nil {
 			return fmt.Errorf("updating access time for ns=%d,action=%q: %w", action.NamespaceID, action.ActionID, err)
 		}
