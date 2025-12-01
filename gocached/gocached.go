@@ -345,13 +345,17 @@ type Server struct {
 	jwtClaims       map[string]string // claims required for any JWT to start a session
 	globalJWTClaims map[string]string // additional claims required to write to global namespace
 
-	sessionsMu sync.RWMutex            // guards sessions
-	sessions   map[string]*sessionData // maps access token -> session data.
+	mu               sync.RWMutex            // guards following fields in this block
+	sessions         map[string]*sessionData // maps access token -> session data.
+	accessDirty      map[actionKey]int64     // action -> accessTime
+	accessFlushTimer *time.Timer             // nil if no flush is scheduled
 
 	// sqliteWriteMu serializes access to SQLite. In theory the SQLite driver
 	// should serialize access with our 5000ms busy timeout, but empirically we
 	// sometimes seen DB busy errors. Just serialize it explicitly out of
 	// laziness for now.
+	//
+	// Lock ordering: sqliteWriteMu before mu.
 	sqliteWriteMu sync.Mutex
 
 	lastUsage atomic.Pointer[usageStats]
@@ -521,15 +525,15 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *Server) getSessionData(token string) (*sessionData, bool) {
-	srv.sessionsMu.Lock()
-	defer srv.sessionsMu.Unlock()
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 	sessionData, ok := srv.sessions[token]
 	return sessionData, ok
 }
 
 func (srv *Server) addSessionData(token string, sessionData *sessionData) {
-	srv.sessionsMu.Lock()
-	defer srv.sessionsMu.Unlock()
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
 	srv.sessions[token] = sessionData
 	srv.m.Sessions.Add(1)
 }
@@ -574,6 +578,13 @@ func getHexSuffix(r *http.Request, prefix string) (hexSuffix string, ok bool) {
 		return "", false
 	}
 	return hexSuffix, true
+}
+
+// actionKey is the comparable value type for the (NamespaceID, ActionID)
+// primary key tuple used in the SQLite Actions table.
+type actionKey struct {
+	NamespaceID int // 0 for global
+	ActionID    string
 }
 
 func validHex(x string) bool {
@@ -625,10 +636,13 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	var smallData sql.NullString
 	var altObjectID string
 	var accessTime int64
-	namespaceID := 0 // global for now; TODO(bradfitz): support namespaces
+	var actionKey = actionKey{
+		NamespaceID: 0, // global for now; TODO(bradfitz): support namespac
+		ActionID:    actionID,
+	}
 	err := srv.db.QueryRow(
 		"SELECT b.SHA256, b.BlobSize, b.SmallData, a.AltOutputID, a.AccessTime FROM Actions a, Blobs b WHERE a.NameSpaceID = ? AND a.ActionID = ? AND a.BlobID = b.BlobID",
-		namespaceID, actionID).Scan(
+		actionKey.NamespaceID, actionKey.ActionID).Scan(
 		&sha256hex, &size, &smallData, &altObjectID, &accessTime)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -640,20 +654,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		return
 	}
 
-	// If it's been more than a day since the last access, update the access time.
-	// This is similar to the Linux "relatime" behavior.
-	now := srv.now().Unix()
-	if accessTime < now-relAtimeSeconds {
-		// TODO(bradfitz): do this async? not worth blocking the caller.
-		// But we need a mechanism for tests to wait on async work.
-		srv.sqliteWriteMu.Lock()
-		_, err := srv.db.Exec("UPDATE Actions SET AccessTime = ? WHERE NamespaceID = ? AND ActionID = ?", now, namespaceID, actionID)
-		srv.sqliteWriteMu.Unlock()
-		if err != nil {
-			srv.logf("Update AccessTime error: %v", err)
-			httpErr("internal server error", http.StatusInternalServerError)
-			return
-		}
+	if srv.maybeBumpAccessTime(actionKey, accessTime) {
 		stats.GetAccessBumps++
 	}
 
@@ -698,6 +699,96 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	stats.GetBytes += size
 	defer rc.Close()
 	io.Copy(w, rc)
+}
+
+// maybeBumpAccessTime reports whether it enqueued an access time bump for the
+// given actionKey, if the provided prior access time (unix seconds) is old
+// enough to warrant an update.
+func (srv *Server) maybeBumpAccessTime(actionKey actionKey, priorAccessTimeUnixSec int64) (didBump bool) {
+	now := srv.now().Unix()
+	if priorAccessTimeUnixSec > now-relAtimeSeconds {
+		return false
+	}
+	// If it's been more than a day since the last access, update the access time.
+	// This is similar to the Linux "relatime" behavior.
+	return srv.enqueueAccessTimeBump(actionKey)
+}
+
+// accessBatchSizeSoftLimit is the size of the accessDirty map at which
+// we stop kicking the timer can down the road and let the thing flush,
+// considering it large enough.
+const accessBatchSizeSoftLimit = 1000
+
+func (srv *Server) enqueueAccessTimeBump(action actionKey) (changed bool) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if _, ok := srv.accessDirty[action]; ok {
+		// Another caller already bumped this from old (over realTimeSeconds)
+		// to recent, so let that caller win, even if it's a few seconds old.
+		// Those few seconds don't matter much for cleaning purposes, and it's
+		// better for stats to only have one caller report the bump.
+		return false
+	}
+	if srv.accessDirty == nil {
+		srv.accessDirty = make(map[actionKey]int64)
+	}
+	srv.accessDirty[action] = srv.now().Unix()
+	if srv.accessFlushTimer == nil {
+		srv.accessFlushTimer = time.AfterFunc(5*time.Second, srv.flushAccessTimeBumps)
+	} else if len(srv.accessDirty) < accessBatchSizeSoftLimit {
+		srv.accessFlushTimer.Reset(5 * time.Second)
+	}
+	return true
+}
+
+// flushAccessTimeBumps writes any pending access time updates to the database.
+//
+// It doesn't return an error to it can be easily used as a time.AfterFunc
+// callback.
+func (srv *Server) flushAccessTimeBumps() {
+	srv.flushAccessTimeBumpsWithErr()
+}
+
+// flushAccessTimeBumpsWithErr is the same as flushAccessTimeBumps but returns
+// any error that's used only for the internal rescheduling defer logic.
+func (srv *Server) flushAccessTimeBumpsWithErr() (ret error) {
+	srv.sqliteWriteMu.Lock() // before srv.mu
+	defer srv.sqliteWriteMu.Unlock()
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	defer func() {
+		if ret != nil {
+			srv.logf("flushAccessTimeBumps error: %v", ret)
+			srv.accessFlushTimer = time.AfterFunc(5*time.Second, srv.flushAccessTimeBumps)
+		}
+	}()
+
+	srv.accessFlushTimer = nil
+
+	if len(srv.accessDirty) == 0 {
+		return nil
+	}
+
+	tx, err := srv.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin Tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	for action, accessTime := range srv.accessDirty {
+		_, err := tx.Exec("UPDATE Actions SET AccessTime = ? WHERE NamespaceID = ? AND ActionID = ?", accessTime, action.NamespaceID, action.ActionID)
+		if err != nil {
+			return fmt.Errorf("updating access time for ns=%d,action=%q: %w", action.NamespaceID, action.ActionID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+
+	srv.accessDirty = nil
+	return nil
 }
 
 // getObjectFromDiskOrPeer retrieves the object for the given actionID, either
@@ -1045,6 +1136,16 @@ func (s *Server) usageStats() (_ *usageStats, err error) {
 		slices.Sort(durs)
 	}
 
+	// Flush any pending access time bumps before computing usage stats.
+	s.mu.RLock()
+	shouldFlush := len(s.accessDirty) > 0
+	s.mu.RUnlock()
+	if shouldFlush {
+		// This acquires sqliteWriteMu, so we avoid that lock if there's nothing
+		// to do.
+		s.flushAccessTimeBumps()
+	}
+
 	now := s.now().Unix()
 	rows, err := s.db.Query(
 		"SELECT a.BlobID, a.AccessTime, b.BlobSize FROM Actions a LEFT JOIN Blobs b ON a.BlobID = b.BlobID")
@@ -1276,7 +1377,6 @@ func (srv *Server) runCleanLoop() {
 			srv.logf("cleaned %v", res)
 			srv.usageStats() // for side effect of updating lastUsage
 		}
-
 	}
 }
 
@@ -1288,7 +1388,7 @@ func (srv *Server) runCleanSessionsLoop() {
 		case <-time.After(time.Hour):
 		}
 
-		srv.sessionsMu.Lock()
+		srv.mu.Lock()
 		count := len(srv.sessions)
 		var deleted int
 		for token, metadata := range srv.sessions {
@@ -1298,7 +1398,7 @@ func (srv *Server) runCleanSessionsLoop() {
 				srv.m.Sessions.Add(-1)
 			}
 		}
-		srv.sessionsMu.Unlock()
+		srv.mu.Unlock()
 		if count > 0 {
 			srv.logf("cleaned up %d/%d access tokens", deleted, count)
 		}
@@ -1370,7 +1470,7 @@ func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	srv.sessionsMu.RLock()
+	srv.mu.RLock()
 	// Make a copy of all session data (excluding the mutex).
 	sessions := make([]*sessionData, 0, len(srv.sessions))
 	for _, v := range srv.sessions {
@@ -1383,7 +1483,7 @@ func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
 		})
 		v.mu.Unlock()
 	}
-	srv.sessionsMu.RUnlock()
+	srv.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<html><body><h1>gocached sessions</h1>\n")
