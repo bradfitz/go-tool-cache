@@ -31,6 +31,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-cmp/cmp"
+	"github.com/pierrec/lz4/v4"
 )
 
 // sha256OfEmpty is the SHA-256 hash of an empty string, used as a well-known
@@ -181,6 +182,23 @@ func (st *tester) wantGetMiss(c *cachers.HTTPClient, actionID string) {
 	}
 }
 
+// lz4Size returns the lz4-compressed size of data.
+func lz4Size(t testing.TB, data []byte) int64 {
+	t.Helper()
+	var buf bytes.Buffer
+	w := lz4.NewWriter(&buf)
+	if err := w.Apply(lz4.SizeOption(uint64(len(data)))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return int64(buf.Len())
+}
+
 func withClock(clk func() time.Time) ServerOption {
 	return func(cfg *Server) {
 		cfg.clock = clk
@@ -323,17 +341,19 @@ func TestServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("usageStats: %v", err)
 	}
+	bigStored := int64(len(testObjectValueBig)) // below lz4CompressThreshold, stored uncompressed
+	totalSize := int64(9) + bigStored           // 9 (inline "test data") + big + 0 (empty)
 	want := &usageStats{
 		MissingBlobRows: 0,
 		ActionsLE: map[time.Duration]countAndSize{
 			24 * time.Hour:   {Count: 1, Size: 9},
 			48 * time.Hour:   {Count: 1, Size: 9},
-			96 * time.Hour:   {Count: 3, Size: 1034},
-			168 * time.Hour:  {Count: 3, Size: 1034},
-			336 * time.Hour:  {Count: 3, Size: 1034},
-			720 * time.Hour:  {Count: 3, Size: 1034},
-			2160 * time.Hour: {Count: 3, Size: 1034},
-			math.MaxInt64:    {Count: 3, Size: 1034},
+			96 * time.Hour:   {Count: 3, Size: totalSize},
+			168 * time.Hour:  {Count: 3, Size: totalSize},
+			336 * time.Hour:  {Count: 3, Size: totalSize},
+			720 * time.Hour:  {Count: 3, Size: totalSize},
+			2160 * time.Hour: {Count: 3, Size: totalSize},
+			math.MaxInt64:    {Count: 3, Size: totalSize},
 		},
 	}
 	if diff := cmp.Diff(stats, want); diff != "" {
@@ -367,26 +387,26 @@ func TestCleanCandidates(t *testing.T) {
 			maxAge: 0,
 			limit:  100,
 			want: []cleanCandidate{
-				{BlobID: 1, Age: 3 * day, BlobSize: 1},
-				{BlobID: 2, Age: 2 * day, BlobSize: 2},
-				{BlobID: 3, Age: 1 * day, BlobSize: 3},
-				{BlobID: 4, Age: 0, BlobSize: smallObjectSize + 1},
+				{BlobID: 1, Age: 3 * day, StoredSize: 1},
+				{BlobID: 2, Age: 2 * day, StoredSize: 2},
+				{BlobID: 3, Age: 1 * day, StoredSize: 3},
+				{BlobID: 4, Age: 0, StoredSize: smallObjectSize + 1}, // below lz4CompressThreshold, stored uncompressed
 			},
 		},
 		{
 			maxAge: 25 * time.Hour,
 			limit:  100,
 			want: []cleanCandidate{
-				{BlobID: 1, Age: 3 * day, BlobSize: 1},
-				{BlobID: 2, Age: 2 * day, BlobSize: 2},
+				{BlobID: 1, Age: 3 * day, StoredSize: 1},
+				{BlobID: 2, Age: 2 * day, StoredSize: 2},
 			},
 		},
 		{
 			maxAge: 0,
 			limit:  2,
 			want: []cleanCandidate{
-				{BlobID: 1, Age: 3 * day, BlobSize: 1},
-				{BlobID: 2, Age: 2 * day, BlobSize: 2},
+				{BlobID: 1, Age: 3 * day, StoredSize: 1},
+				{BlobID: 2, Age: 2 * day, StoredSize: 2},
 			},
 		},
 	}
@@ -416,17 +436,21 @@ func TestCleanOldObjectsByAge(t *testing.T) {
 	st.wantPut(c1, "0003", "9903", "small")
 	smallLen := int64(len("small"))
 
+	stored1 := int64(smallObjectSize + 1)                                   // below lz4CompressThreshold, stored uncompressed
+	stored2 := lz4Size(t, []byte(strings.Repeat("x", smallObjectSize+2))) // at lz4CompressThreshold, lz4-compressed
+
 	st1 := st.usageStats()
-	if all, want := st1.All(), (countAndSize{Count: 3, Size: smallObjectSize*2 + 3 + smallLen}); all != want {
+	if all, want := st1.All(), (countAndSize{Count: 3, Size: stored1 + stored2 + smallLen}); all != want {
 		t.Errorf("usageStats: %v; want %v", all, want)
 	}
-	if got, want := st.diskFiles(), []string{"333092a3daf718ed8f38a94e302df139edd4e3b5da4239a497995683942cf28c", "c6d8e9905300876046729949cc95c2385221270d389176f7234fe7ac00c4e430"}; !slices.Equal(got, want) {
+	// First file is uncompressed (no .lz4 suffix), second is lz4-compressed.
+	if got, want := st.diskFiles(), []string{"333092a3daf718ed8f38a94e302df139edd4e3b5da4239a497995683942cf28c.lz4", "c6d8e9905300876046729949cc95c2385221270d389176f7234fe7ac00c4e430"}; !slices.Equal(got, want) {
 		t.Errorf("diskFiles: %v; want %v", got, want)
 	}
 
 	clean1 := st.cleanOldObjects()
-	if clean1.Count != 1 || clean1.Size != smallObjectSize+1 {
-		t.Errorf("cleanOldObjects got %v, want {Count: 1, Size: %d}", clean1, smallObjectSize+1)
+	if clean1.Count != 1 || clean1.Size != stored1 {
+		t.Errorf("cleanOldObjects got %v, want {Count: 1, Size: %d}", clean1, stored1)
 	}
 	clean2 := st.cleanOldObjects()
 	if clean2.Count != 0 || clean2.Size != 0 {
@@ -434,10 +458,10 @@ func TestCleanOldObjectsByAge(t *testing.T) {
 	}
 
 	st2 := st.usageStats()
-	if all, want := st2.All(), (countAndSize{Count: 2, Size: smallObjectSize + 2 + smallLen}); all != want {
+	if all, want := st2.All(), (countAndSize{Count: 2, Size: stored2 + smallLen}); all != want {
 		t.Errorf("usageStats after clean: %v; want %v", all, want)
 	}
-	if got, want := st.diskFiles(), []string{"333092a3daf718ed8f38a94e302df139edd4e3b5da4239a497995683942cf28c"}; !slices.Equal(got, want) {
+	if got, want := st.diskFiles(), []string{"333092a3daf718ed8f38a94e302df139edd4e3b5da4239a497995683942cf28c.lz4"}; !slices.Equal(got, want) {
 		t.Errorf("diskFiles after clean: %v; want %v", got, want)
 	}
 }
@@ -473,6 +497,120 @@ func TestCleanOldObjectsBySize(t *testing.T) {
 	}
 	if got, want := st.usageStats().All(), (countAndSize{Count: 2, Size: 7}); got != want {
 		t.Errorf("usageStats: %v; want %v", got, want)
+	}
+}
+
+func TestLZ4Storage(t *testing.T) {
+	st := newServerTester(t)
+	c := st.mkClient()
+
+	type testCase struct {
+		name     string
+		size     int
+		wantLZ4  bool // expect .lz4 file on disk
+		wantDisk bool // expect any disk file (false = inline in DB)
+	}
+	tests := []testCase{
+		{"empty", 0, false, false},
+		{"tiny_1b", 1, false, false},
+		{"inline_max", smallObjectSize, false, false},
+		{"disk_no_lz4", smallObjectSize + 1, false, true},           // on disk but below lz4CompressThreshold
+		{"disk_at_lz4_threshold", lz4CompressThreshold, true, true}, // smallest lz4-compressed disk blob
+		{"disk_2k", 2048, true, true},
+		{"disk_64k", 64 << 10, true, true},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actionID := fmt.Sprintf("%04x", i+0x10)
+			outputID := fmt.Sprintf("%04x", i+0x90)
+
+			data := make([]byte, tt.size)
+			if len(data) > 0 {
+				data[0] = 'X'
+				data[len(data)-1] = 'X'
+			}
+			val := string(data)
+
+			// PUT
+			st.wantPut(c, actionID, outputID, val)
+
+			// GET via client (sends Accept-Encoding: lz4) — verify round-trip.
+			c2 := st.mkClient() // fresh client, no disk cache
+			st.wantGet(c2, actionID, outputID, val)
+
+			// Raw HTTP GET with Accept-Encoding: lz4
+			req, _ := http.NewRequest("GET", st.hs.URL+"/action/"+actionID, nil)
+			req.Header.Set("Want-Object", "1")
+			req.Header.Set("Accept-Encoding", "lz4")
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("raw GET: %v", err)
+			}
+			body, _ := io.ReadAll(res.Body)
+			res.Body.Close()
+
+			if tt.wantLZ4 {
+				if got := res.Header.Get("Content-Encoding"); got != "lz4" {
+					t.Errorf("Accept lz4: Content-Encoding = %q, want %q", got, "lz4")
+				}
+				if got := res.Header.Get("X-Uncompressed-Length"); got != fmt.Sprint(tt.size) {
+					t.Errorf("Accept lz4: X-Uncompressed-Length = %q, want %q", got, fmt.Sprint(tt.size))
+				}
+				if got := res.Header.Get("Content-Length"); got == fmt.Sprint(tt.size) {
+					t.Errorf("Accept lz4: Content-Length = %q, should be compressed (smaller)", got)
+				}
+			} else {
+				if got := res.Header.Get("Content-Encoding"); got != "" {
+					t.Errorf("Accept lz4: Content-Encoding = %q, want empty", got)
+				}
+				if got := res.Header.Get("X-Uncompressed-Length"); got != "" {
+					t.Errorf("Accept lz4: X-Uncompressed-Length = %q, want empty", got)
+				}
+				// Uncompressed: body should be the raw data.
+				if string(body) != val {
+					t.Errorf("Accept lz4: body length = %d, want %d", len(body), len(val))
+				}
+			}
+
+			// Raw HTTP GET without Accept-Encoding: lz4 — server must decompress.
+			req2, _ := http.NewRequest("GET", st.hs.URL+"/action/"+actionID, nil)
+			req2.Header.Set("Want-Object", "1")
+			// Deliberately no Accept-Encoding.
+			res2, err := http.DefaultClient.Do(req2)
+			if err != nil {
+				t.Fatalf("raw GET (no lz4): %v", err)
+			}
+			body2, _ := io.ReadAll(res2.Body)
+			res2.Body.Close()
+
+			if got := res2.Header.Get("Content-Encoding"); got != "" {
+				t.Errorf("No Accept lz4: Content-Encoding = %q, want empty", got)
+			}
+			if got := res2.Header.Get("Content-Length"); got != fmt.Sprint(tt.size) {
+				t.Errorf("No Accept lz4: Content-Length = %q, want %q", got, fmt.Sprint(tt.size))
+			}
+			if string(body2) != val {
+				t.Errorf("No Accept lz4: body length = %d, want %d", len(body2), len(val))
+			}
+		})
+	}
+
+	// Verify disk state: expect exactly one plain file (the disk_no_lz4 case)
+	// and the rest with .lz4 suffix.
+	var plain, compressed int
+	for _, f := range st.diskFiles() {
+		if strings.HasSuffix(f, ".lz4") {
+			compressed++
+		} else {
+			plain++
+		}
+	}
+	if plain != 1 {
+		t.Errorf("disk files: got %d plain (non-lz4), want 1", plain)
+	}
+	if compressed != 3 {
+		t.Errorf("disk files: got %d .lz4, want 3", compressed)
 	}
 }
 
