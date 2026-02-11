@@ -1,0 +1,145 @@
+package cachers
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
+	"testing"
+
+	"github.com/pierrec/lz4/v4"
+)
+
+func lz4Compress(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := lz4.NewWriter(&buf)
+	if err := w.Apply(lz4.SizeOption(uint64(len(data)))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	compressed := buf.Bytes()
+
+	// Verify the lz4 frame header contains the uncompressed content size
+	// at bytes [6:14] (little-endian uint64), after the 4-byte magic number
+	// and 2-byte FLG+BD descriptor.
+	if len(compressed) < 14 {
+		t.Fatalf("compressed output too short: %d bytes", len(compressed))
+	}
+	gotSize := binary.LittleEndian.Uint64(compressed[6:14])
+	if gotSize != uint64(len(data)) {
+		t.Fatalf("lz4 frame content size = %d, want %d", gotSize, len(data))
+	}
+
+	return compressed
+}
+
+func TestHTTPClientGetLZ4(t *testing.T) {
+	const (
+		testActionID = "aabbccdd"
+		testOutputID = "eeff0011"
+	)
+	testData := []byte("hello, this is cached build output data for testing")
+
+	tests := []struct {
+		name     string
+		compress bool
+		oldProto bool
+	}{
+		{"new_protocol_uncompressed", false, false},
+		{"new_protocol_lz4", true, false},
+		{"old_protocol_uncompressed", false, true},
+		{"old_protocol_lz4", true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotAcceptEncoding []string
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotAcceptEncoding = append(gotAcceptEncoding, r.Header.Get("Accept-Encoding"))
+
+				switch {
+				case tt.oldProto && r.URL.Path == "/action/"+testActionID:
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(ActionValue{
+						OutputID: testOutputID,
+						Size:     int64(len(testData)),
+					})
+
+				case tt.oldProto && r.URL.Path == "/output/"+testOutputID:
+					body := testData
+					if tt.compress {
+						body = lz4Compress(t, testData)
+						w.Header().Set("Content-Encoding", "lz4")
+						w.Header().Set("X-Uncompressed-Length", strconv.Itoa(len(testData)))
+					}
+					w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+					w.Write(body)
+
+				case !tt.oldProto && r.URL.Path == "/action/"+testActionID:
+					w.Header().Set("Content-Type", "application/octet-stream")
+					w.Header().Set("Go-Output-Id", testOutputID)
+					body := testData
+					if tt.compress {
+						body = lz4Compress(t, testData)
+						w.Header().Set("Content-Encoding", "lz4")
+						w.Header().Set("X-Uncompressed-Length", strconv.Itoa(len(testData)))
+					}
+					w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+					w.Write(body)
+
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer ts.Close()
+
+			hc := &HTTPClient{
+				BaseURL: ts.URL,
+				Disk:    &DiskCache{Dir: t.TempDir()},
+			}
+
+			outputID, diskPath, err := hc.Get(context.Background(), testActionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if outputID != testOutputID {
+				t.Errorf("outputID = %q, want %q", outputID, testOutputID)
+			}
+			if diskPath == "" {
+				t.Fatal("diskPath is empty")
+			}
+
+			got, err := os.ReadFile(diskPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, testData) {
+				t.Errorf("disk content = %q, want %q", got, testData)
+			}
+
+			// Verify Accept-Encoding: lz4 was sent on all requests.
+			if len(gotAcceptEncoding) == 0 {
+				t.Fatal("no requests received by server")
+			}
+			for i, ae := range gotAcceptEncoding {
+				if ae != "lz4" {
+					t.Errorf("request %d: Accept-Encoding = %q, want %q", i, ae, "lz4")
+				}
+			}
+			if tt.oldProto && len(gotAcceptEncoding) != 2 {
+				t.Errorf("old protocol: got %d requests, want 2", len(gotAcceptEncoding))
+			}
+		})
+	}
+}

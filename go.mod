@@ -6,6 +6,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/go-cmp v0.7.0
+	github.com/pierrec/lz4/v4 v4.1.25
 	github.com/prometheus/client_golang v1.23.0
 	github.com/prometheus/client_model v0.6.2
 	modernc.org/sqlite v1.38.2

@@ -8,6 +8,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 // ActionValue is the JSON value returned by the cacher server for an GET /action request.
@@ -56,6 +59,28 @@ func tryReadErrorMessage(res *http.Response) []byte {
 	return msg
 }
 
+// responseBody returns the response body and the uncompressed content length.
+// If the response has Content-Encoding: lz4, the body is wrapped with an lz4
+// decompressor and the uncompressed length is read from X-Uncompressed-Length.
+// For uncompressed responses, Content-Length is used directly.
+func responseBody(res *http.Response) (body io.Reader, uncompressedLength int64, err error) {
+	if res.Header.Get("Content-Encoding") == "lz4" {
+		sizeStr := res.Header.Get("X-Uncompressed-Length")
+		if sizeStr == "" {
+			return nil, 0, fmt.Errorf("lz4-compressed response missing X-Uncompressed-Length header")
+		}
+		size, err := strconv.ParseInt(sizeStr, 10, 64)
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid X-Uncompressed-Length %q: %v", sizeStr, err)
+		}
+		return lz4.NewReader(res.Body), size, nil
+	}
+	if res.ContentLength == -1 {
+		return nil, 0, fmt.Errorf("no Content-Length from server")
+	}
+	return res.Body, res.ContentLength, nil
+}
+
 func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPath string, err error) {
 	outputID, diskPath, err = c.Disk.Get(ctx, actionID)
 	if err == nil && outputID != "" {
@@ -66,6 +91,8 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	if c.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	}
+
+	req.Header.Set("Accept-Encoding", "lz4")
 
 	// Set a header to indicate we want the object and metadata in one response.
 	// Prior to 2025-08-09, the protocol was two separate requests. Rather than
@@ -98,10 +125,11 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 		if outputID == "" {
 			return "", "", fmt.Errorf("missing Go-Output-Id header in response")
 		}
-		if res.ContentLength == -1 {
-			return "", "", fmt.Errorf("no Content-Length from server")
+		body, size, err := responseBody(res)
+		if err != nil {
+			return "", "", err
 		}
-		diskPath, err = c.Disk.Put(ctx, actionID, outputID, res.ContentLength, res.Body)
+		diskPath, err = c.Disk.Put(ctx, actionID, outputID, size, body)
 
 	case "application/json": // old two-hop protocol
 		var av ActionValue
@@ -116,6 +144,7 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 			putBody = bytes.NewReader(nil)
 		} else {
 			req, _ = http.NewRequestWithContext(ctx, "GET", c.BaseURL+"/output/"+outputID, nil)
+			req.Header.Set("Accept-Encoding", "lz4")
 			res, err = c.httpClient().Do(req)
 			if err != nil {
 				return "", "", err
@@ -130,10 +159,10 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 				log.Printf("error GET /output/%s: %v, %s", outputID, res.Status, msg)
 				return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
 			}
-			if res.ContentLength == -1 {
-				return "", "", fmt.Errorf("no Content-Length from server")
+			putBody, _, err = responseBody(res)
+			if err != nil {
+				return "", "", err
 			}
-			putBody = res.Body
 		}
 		diskPath, err = c.Disk.Put(ctx, actionID, outputID, av.Size, putBody)
 	}
