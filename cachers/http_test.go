@@ -143,3 +143,51 @@ func TestHTTPClientGetLZ4(t *testing.T) {
 		})
 	}
 }
+
+// TestHTTPClientPutServerRejectsBody verifies that Put still writes to disk
+// when the server returns 403 without reading the request body.
+func TestHTTPClientPutServerRejectsBody(t *testing.T) {
+	const (
+		testActionID = "aabbccdd"
+		testOutputID = "eeff0011"
+	)
+
+	largeBody := bytes.Repeat([]byte("x"), 512<<10)
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{"empty", nil},
+		{"small", []byte("hello, this is cached build output data for testing")},
+		{"512k", largeBody},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Return 403 immediately without reading the request body.
+				http.Error(w, "forbidden", http.StatusForbidden)
+			}))
+			defer ts.Close()
+
+			hc := &HTTPClient{
+				BaseURL: ts.URL,
+				Disk:    &DiskCache{Dir: t.TempDir()},
+			}
+
+			diskPath, err := hc.Put(context.Background(), testActionID, testOutputID, int64(len(tt.data)), bytes.NewReader(tt.data))
+			if diskPath == "" {
+				t.Fatalf("diskPath is empty; err = %v", err)
+			}
+
+			got, err := os.ReadFile(diskPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, tt.data) {
+				t.Errorf("disk content length = %d, want %d", len(got), len(tt.data))
+			}
+		})
+	}
+}

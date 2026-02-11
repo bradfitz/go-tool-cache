@@ -171,16 +171,23 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 }
 
 func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, _ error) {
+	// Buffer the body so disk and HTTP can read from independent copies.
+	// This avoids a race between our code and net/http's write loop when
+	// the server responds (e.g. 403) before consuming the full request body.
+	var buf []byte
+	if size > 0 {
+		var err error
+		buf, err = io.ReadAll(body)
+		if err != nil {
+			return "", err
+		}
+	}
+
 	// Write to disk locally as we write it remotely, as we need to guarantee
 	// it's on disk locally for the caller.
-	pr, pw := io.Pipe()
 	diskPutCh := make(chan any, 1)
 	go func() {
-		var putBody io.Reader = pr
-		if size == 0 {
-			putBody = bytes.NewReader(nil)
-		}
-		diskPath, err := c.Disk.Put(ctx, actionID, outputID, size, putBody)
+		diskPath, err := c.Disk.Put(ctx, actionID, outputID, size, bytes.NewReader(buf))
 		if err != nil {
 			diskPutCh <- err
 		} else {
@@ -188,36 +195,33 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		}
 	}()
 
-	var putBody io.Reader
-	if size == 0 {
-		// Special case the empty file so NewRequest sets "Content-Length: 0",
-		// as opposed to thinking we didn't set it and not being able to sniff its size
-		// from the type.
-		putBody = bytes.NewReader(nil)
-	} else {
-		putBody = io.TeeReader(body, pw)
-	}
-	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, putBody)
+	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, bytes.NewReader(buf))
 	req.ContentLength = size
 	if c.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	}
 	res, err := c.httpClient().Do(req)
-	pw.Close()
+	var httpErr error
 	if err != nil {
 		log.Printf("error PUT /%s/%s: %v", actionID, outputID, err)
-		return "", err
+		httpErr = err
+	} else {
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusNoContent {
+			msg := tryReadErrorMessage(res)
+			log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)
+			httpErr = fmt.Errorf("unexpected PUT /%s/%s status %v", actionID, outputID, res.Status)
+		}
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusNoContent {
-		msg := tryReadErrorMessage(res)
-		log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)
-		return "", fmt.Errorf("unexpected PUT /%s/%s status %v", actionID, outputID, res.Status)
+	// Wait for the disk write regardless of HTTP result.
+	select {
+	case v := <-diskPutCh:
+		if diskErr, ok := v.(error); ok {
+			log.Printf("HTTPClient.Put local disk error: %v", diskErr)
+			return "", diskErr
+		}
+		return v.(string), httpErr
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
-	v := <-diskPutCh
-	if err, ok := v.(error); ok {
-		log.Printf("HTTPClient.Put local disk error: %v", err)
-		return "", err
-	}
-	return v.(string), nil
 }
