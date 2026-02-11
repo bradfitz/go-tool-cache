@@ -60,6 +60,7 @@ import (
 	"time"
 
 	ijwt "github.com/bradfitz/go-tool-cache/gocached/internal/jwt"
+	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -73,6 +74,12 @@ const (
 	// smaller.
 	smallObjectSize = 1 << 10
 
+	// lz4CompressThreshold is the minimum blob size at which we lz4-compress
+	// before storing on disk. Intentionally two bytes above smallObjectSize so
+	// there's a real gap (disk blobs that aren't lz4-compressed), preventing
+	// assumptions that the two thresholds are equal while keeping them close.
+	lz4CompressThreshold = smallObjectSize + 2
+
 	// tokenPrefix is the prefix for all gocached access tokens.
 	tokenPrefix = "gocached-token-"
 
@@ -81,7 +88,7 @@ const (
 	gocachedAudience = "gocached"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -105,12 +112,13 @@ CREATE INDEX IF NOT EXISTS idx_actions_access ON Actions(AccessTime);
 CREATE INDEX IF NOT EXISTS idx_actions_blobid ON Actions(BlobID);
 
 CREATE TABLE IF NOT EXISTS Blobs (
-  BlobID       INTEGER PRIMARY KEY AUTOINCREMENT,
-  SHA256       TEXT NOT NULL,
-  BlobSize     INTEGER NOT NULL, -- size in bytes, either inline or on disk
-  SmallData    BLOB, -- NULL if stored on disk
+  BlobID            INTEGER PRIMARY KEY AUTOINCREMENT,
+  SHA256            TEXT NOT NULL,
+  StoredSize        INTEGER NOT NULL, -- bytes stored: len(SmallData) if inline, file size on disk (possibly lz4)
+  UncompressedSize  INTEGER NOT NULL, -- original uncompressed content size
+  SmallData         BLOB,
 
-  CHECK (SmalLData IS NULL OR length(SmallData) = BlobSize)
+  CHECK (SmallData IS NULL OR length(SmallData) = StoredSize)
 ) STRICT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_blobs_sha256 ON Blobs(SHA256);
@@ -123,6 +131,19 @@ CREATE TABLE IF NOT EXISTS Namespaces (
 
 func openDB(dbDir string) (*sql.DB, error) {
 	dbPath := filepath.Join(dbDir, fmt.Sprintf("gocached-v%d.db", schemaVersion))
+
+	// If the v4 DB doesn't exist but v3 does, migrate it.
+	if schemaVersion == 4 {
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			v3Path := filepath.Join(dbDir, "gocached-v3.db")
+			if _, err := os.Stat(v3Path); err == nil {
+				if err := migrateV3ToV4(dbDir, v3Path, dbPath); err != nil {
+					return nil, fmt.Errorf("migrating v3→v4: %w", err)
+				}
+			}
+		}
+	}
+
 	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
@@ -134,6 +155,76 @@ func openDB(dbDir string) (*sql.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// migrateV3ToV4 copies the v3 database to a temp file, runs the v3→v4
+// migration on it, then atomically renames it to the v4 path. This is
+// crash-safe: if anything fails, the original v3 DB is untouched.
+func migrateV3ToV4(dbDir, v3Path, v4Path string) error {
+	// Checkpoint the v3 WAL so the main .db file is self-contained before
+	// we copy it. Without this, data sitting in gocached-v3.db-wal would
+	// be silently lost.
+	v3DB, err := sql.Open("sqlite", "file:"+v3Path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fmt.Errorf("opening v3 for checkpoint: %w", err)
+	}
+	_, err = v3DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	v3DB.Close()
+	if err != nil {
+		return fmt.Errorf("checkpointing v3 WAL: %w", err)
+	}
+
+	// Copy v3 to a temp file in the same directory (for same-filesystem rename).
+	tmpFile, err := os.CreateTemp(dbDir, "gocached-v4-migrate-*.db")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		// Clean up temp file on failure.
+		os.Remove(tmpPath)
+	}()
+
+	src, err := os.Open(v3Path)
+	if err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if _, err := io.Copy(tmpFile, src); err != nil {
+		src.Close()
+		tmpFile.Close()
+		return err
+	}
+	src.Close()
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	// Open the temp DB and run the migration.
+	tmpDB, err := sql.Open("sqlite", "file:"+tmpPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE Blobs RENAME COLUMN BlobSize TO StoredSize`,
+		`ALTER TABLE Blobs ADD COLUMN UncompressedSize INTEGER NOT NULL DEFAULT 0`,
+		`UPDATE Blobs SET UncompressedSize = StoredSize WHERE UncompressedSize = 0`,
+		`PRAGMA wal_checkpoint(TRUNCATE)`,
+	} {
+		if _, err := tmpDB.Exec(stmt); err != nil {
+			tmpDB.Close()
+			return fmt.Errorf("migration statement %q: %w", stmt, err)
+		}
+	}
+	if err := tmpDB.Close(); err != nil {
+		return err
+	}
+
+	// Atomic rename on same filesystem.
+	if err := os.Rename(tmpPath, v4Path); err != nil {
+		return err
+	}
+	return nil
 }
 
 // start initializes the server, including defaults and background goroutines.
@@ -632,7 +723,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	}
 
 	var sha256hex string
-	var size int64
+	var storedSize, uncompressedSize int64
 	var smallData sql.NullString
 	var altObjectID string
 	var accessTime int64
@@ -641,9 +732,9 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		ActionID:    actionID,
 	}
 	err := srv.db.QueryRow(
-		"SELECT b.SHA256, b.BlobSize, b.SmallData, a.AltOutputID, a.AccessTime FROM Actions a, Blobs b WHERE a.NameSpaceID = ? AND a.ActionID = ? AND a.BlobID = b.BlobID",
+		"SELECT b.SHA256, b.StoredSize, b.UncompressedSize, b.SmallData, a.AltOutputID, a.AccessTime FROM Actions a, Blobs b WHERE a.NameSpaceID = ? AND a.ActionID = ? AND a.BlobID = b.BlobID",
 		actionKey.NamespaceID, actionKey.ActionID).Scan(
-		&sha256hex, &size, &smallData, &altObjectID, &accessTime)
+		&sha256hex, &storedSize, &uncompressedSize, &smallData, &altObjectID, &accessTime)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -661,19 +752,33 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	stats.GetHits++
 
 	outputID := cmp.Or(altObjectID, sha256hex)
+	isLZ4 := storedSize != uncompressedSize
+	clientAcceptsLZ4 := requestAcceptsEncoding(r, "lz4")
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprint(size))
 	w.Header().Set("Go-Output-Id", outputID)
 
-	if r.Method == "HEAD" || size == 0 {
+	if smallData.Valid || !isLZ4 {
+		// Inline, empty, or legacy uncompressed: Content-Length is the stored size.
+		w.Header().Set("Content-Length", fmt.Sprint(storedSize))
+	} else if isLZ4 && clientAcceptsLZ4 {
+		// Disk lz4 + client accepts lz4: stream raw compressed file.
+		w.Header().Set("Content-Encoding", "lz4")
+		w.Header().Set("Content-Length", fmt.Sprint(storedSize))
+		w.Header().Set("X-Uncompressed-Length", fmt.Sprint(uncompressedSize))
+	} else {
+		// Disk lz4 + client doesn't accept lz4: decompress for client.
+		w.Header().Set("Content-Length", fmt.Sprint(uncompressedSize))
+	}
+
+	if r.Method == "HEAD" || (storedSize == 0 && uncompressedSize == 0) {
 		return
 	}
 
 	if smallData.Valid {
 		// For small outputs stored inline in the database, we can return them directly.
 		stats.GetHitsInline++
-		stats.GetBytes += size
+		stats.GetBytes += storedSize
 		io.WriteString(w, smallData.String)
 		return
 	}
@@ -681,9 +786,9 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	// Otherwise, for large objects that we know about, we can try to get them
 	// from our local disk or a peer.
 
-	rc, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex)
+	rc, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex, isLZ4)
 	if err != nil {
-		srv.logf("Get object error: %v", actionID, err)
+		srv.logf("Get object error: %v", err)
 		httpErr("Get object error", http.StatusInternalServerError)
 		return
 	}
@@ -696,9 +801,16 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	stats.GetBytes += size
 	defer rc.Close()
-	io.Copy(w, rc)
+
+	if isLZ4 && !clientAcceptsLZ4 {
+		// Client doesn't accept lz4; decompress on the fly.
+		stats.GetBytes += uncompressedSize
+		io.Copy(w, lz4.NewReader(rc))
+	} else {
+		stats.GetBytes += storedSize
+		io.Copy(w, rc)
+	}
 }
 
 // maybeBumpAccessTime reports whether it enqueued an access time bump for the
@@ -795,12 +907,17 @@ func (srv *Server) flushAccessTimeBumpsWithErr() (ret error) {
 // from disk or a peer. This is used after a local DB lookup discovers the content
 // exists but is not stored in SQLite.
 //
+// If isLZ4 is true, the .lz4 suffixed path is opened; otherwise the plain path.
+//
 // It returns (nil, nil) on miss.
-func (srv *Server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string) (rc io.ReadCloser, err error) {
+func (srv *Server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string, isLZ4 bool) (rc io.ReadCloser, err error) {
 	if len(sha256hex) != sha256.Size*2 {
 		return nil, fmt.Errorf("invalid sha256hex %q", sha256hex)
 	}
 	diskPath := filepath.Join(srv.dir, sha256hex[:2], sha256hex)
+	if isLZ4 {
+		diskPath += ".lz4"
+	}
 	f, err := os.Open(diskPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -839,6 +956,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats)
 	hasher := sha256.New()
 	hashingBody := io.TeeReader(r.Body, hasher)
 
+	storedSize := r.ContentLength
+	uncompressedSize := r.ContentLength
+
 	var smallData []byte
 	if r.ContentLength <= smallObjectSize {
 		// Store small objects inline in the database.
@@ -856,26 +976,27 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats)
 			return
 		}
 	} else {
-		// For larger objects, we store them on disk.
-		if err := s.writeDiskBlob(r.ContentLength, hashingBody); err != nil {
+		// For larger objects, we store them on disk (lz4 compressed).
+		diskSize, err := s.writeDiskBlob(r.ContentLength, hashingBody)
+		if err != nil {
 			s.logf("Write disk blob error: %v", err)
 			http.Error(w, "Write disk blob error", http.StatusInternalServerError)
 			return
 		}
+		storedSize = diskSize
 	}
 
 	sha256hex := fmt.Sprintf("%x", hasher.Sum(nil))
-	blobSize := r.ContentLength
 
 	s.sqliteWriteMu.Lock()
 	defer s.sqliteWriteMu.Unlock()
 
 	var blobID int64
-	err := s.db.QueryRow(`INSERT INTO Blobs (SHA256, BlobSize, SmallData)
-		VALUES (?, ?, ?)
+	err := s.db.QueryRow(`INSERT INTO Blobs (SHA256, StoredSize, UncompressedSize, SmallData)
+		VALUES (?, ?, ?, ?)
 		ON CONFLICT(SHA256) DO UPDATE SET SHA256=excluded.SHA256
 		RETURNING BlobID;
-`, sha256hex, blobSize, smallData).Scan(&blobID)
+`, sha256hex, storedSize, uncompressedSize, smallData).Scan(&blobID)
 	if err != nil {
 		s.logf("Blobs insert error: %v", err)
 		stats.PutErrs++
@@ -1026,11 +1147,13 @@ func (s *Server) sha256Filepath(hash [sha256.Size]byte) string {
 	return filepath.Join(s.dir, hex[:2], hex)
 }
 
-func (s *Server) writeDiskBlob(size int64, r io.Reader) (err error) {
+func (s *Server) writeDiskBlob(size int64, r io.Reader) (diskSize int64, err error) {
+	compress := size >= lz4CompressThreshold
+
 	nowUnix := s.now().Unix()
 	tf, err := os.CreateTemp(s.dir, fmt.Sprintf("upload-%d-*", nowUnix))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() {
 		if err == nil {
@@ -1039,30 +1162,61 @@ func (s *Server) writeDiskBlob(size int64, r io.Reader) (err error) {
 		tf.Close()
 		os.Remove(tf.Name())
 	}()
+
 	hasher := sha256.New()
-	n, err := io.Copy(tf, io.LimitReader(io.TeeReader(r, hasher), size+1))
+	lr := io.LimitReader(io.TeeReader(r, hasher), size+1)
+
+	var dst io.Writer = tf
+	var lzw *lz4.Writer
+	if compress {
+		lzw = lz4.NewWriter(tf)
+		if err := lzw.Apply(lz4.SizeOption(uint64(size))); err != nil {
+			return 0, err
+		}
+		dst = lzw
+	}
+
+	n, err := io.Copy(dst, lr)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if n != size {
-		return fmt.Errorf("wrote %d bytes; wanted %d", n, size)
+		return 0, fmt.Errorf("wrote %d bytes; wanted %d", n, size)
+	}
+	if lzw != nil {
+		if err := lzw.Close(); err != nil {
+			return 0, err
+		}
 	}
 	if err := tf.Close(); err != nil {
-		return err
+		return 0, err
 	}
+
+	fi, err := os.Stat(tf.Name())
+	if err != nil {
+		return 0, err
+	}
+	diskSize = fi.Size()
+
 	var hash [sha256.Size]byte
 	hasher.Sum(hash[:0])
 
 	target := s.sha256Filepath(hash)
-	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
-		return err
+	if compress {
+		target += ".lz4"
 	}
-	return os.Rename(tf.Name(), target)
+	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(tf.Name(), target); err != nil {
+		return 0, err
+	}
+	return diskSize, nil
 }
 
 type countAndSize struct {
 	Count int64 // number of actions
-	Size  int64 // total size of all actions' blobs (even if shared by other actions)
+	Size  int64 // total stored size in bytes (after compression, if any) of all actions' blobs, even if shared by other actions
 }
 
 func (cs countAndSize) String() string {
@@ -1074,6 +1228,7 @@ func (cs countAndSize) String() string {
 
 type usageStats struct {
 	// ActionsLE is a histogram of the actions in the DB by their access time.
+	// Sizes reflect stored size on disk (after any compression).
 	//
 	// The key is a Prometheus-style histogram "less than" value. That is, if
 	// there are map keys for 24h and 48h, the latter includes the sum of the
@@ -1148,18 +1303,18 @@ func (s *Server) usageStats() (_ *usageStats, err error) {
 
 	now := s.now().Unix()
 	rows, err := s.db.Query(
-		"SELECT a.BlobID, a.AccessTime, b.BlobSize FROM Actions a LEFT JOIN Blobs b ON a.BlobID = b.BlobID")
+		"SELECT a.BlobID, a.AccessTime, b.StoredSize FROM Actions a LEFT JOIN Blobs b ON a.BlobID = b.BlobID")
 	if err != nil {
 		return nil, fmt.Errorf("query Actions: %w", err)
 	}
 	var blobID int64
 	var accessTime int64
-	var blobSize sql.NullInt64
+	var storedSize sql.NullInt64
 	for rows.Next() {
-		if err := rows.Scan(&blobID, &accessTime, &blobSize); err != nil {
+		if err := rows.Scan(&blobID, &accessTime, &storedSize); err != nil {
 			return nil, fmt.Errorf("rows.Scan: %w", err)
 		}
-		if !blobSize.Valid {
+		if !storedSize.Valid {
 			st.MissingBlobRows++
 			continue
 		}
@@ -1172,7 +1327,7 @@ func (s *Server) usageStats() (_ *usageStats, err error) {
 			if dur < d {
 				was := st.ActionsLE[d]
 				was.Count++
-				was.Size += blobSize.Int64
+				was.Size += storedSize.Int64
 				st.ActionsLE[d] = was
 			}
 		}
@@ -1189,9 +1344,9 @@ func (s *Server) usageStats() (_ *usageStats, err error) {
 }
 
 type cleanCandidate struct {
-	BlobID   int64
-	Age      time.Duration
-	BlobSize int64 // size of the blob, in bytes
+	BlobID     int64
+	Age        time.Duration
+	StoredSize int64 // size of the blob as stored, in bytes (compressed if lz4)
 }
 
 func (s *Server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanCandidate, error) {
@@ -1200,7 +1355,7 @@ func (s *Server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanC
 	cutoff := now.Add(-olderThan).Unix()
 
 	rows, err := s.db.Query(`
-		SELECT b.BlobID, MAX(a.AccessTime), b.BlobSize
+		SELECT b.BlobID, MAX(a.AccessTime), b.StoredSize
 		FROM Blobs b LEFT JOIN Actions a ON b.BlobID = a.BlobID
 		GROUP BY b.BlobID
 		HAVING MAX(a.AccessTime) <= ?
@@ -1215,7 +1370,7 @@ func (s *Server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanC
 	var accessTime int64
 	for rows.Next() {
 		var c cleanCandidate
-		if err := rows.Scan(&c.BlobID, &accessTime, &c.BlobSize); err != nil {
+		if err := rows.Scan(&c.BlobID, &accessTime, &c.StoredSize); err != nil {
 			return nil, fmt.Errorf("rows.Scan: %w", err)
 		}
 		c.Age = time.Duration(nowUnix-accessTime) * time.Second
@@ -1241,11 +1396,11 @@ func (srv *Server) deleteBlobs(blobIDs ...int64) error {
 	var sumBytes int64
 	for _, blobID := range blobIDs {
 		var sha256Hex string
-		var blobSize int64
-		if err := tx.QueryRow("SELECT SHA256, BlobSize FROM Blobs WHERE BlobID = ?", blobID).Scan(&sha256Hex, &blobSize); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		var storedSize int64
+		if err := tx.QueryRow("SELECT SHA256, StoredSize FROM Blobs WHERE BlobID = ?", blobID).Scan(&sha256Hex, &storedSize); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("querying blob SHA256: %w", err)
 		}
-		sumBytes += blobSize
+		sumBytes += storedSize
 		if _, err := tx.Exec("DELETE FROM Blobs WHERE BlobID = ?", blobID); err != nil {
 			return fmt.Errorf("deleting blob: %w", err)
 		}
@@ -1254,7 +1409,12 @@ func (srv *Server) deleteBlobs(blobIDs ...int64) error {
 		}
 		var hash [sha256.Size]byte
 		if _, err := hex.Decode(hash[:], []byte(sha256Hex)); err == nil {
-			if err := os.Remove(srv.sha256Filepath(hash)); err != nil && !os.IsNotExist(err) {
+			base := srv.sha256Filepath(hash)
+			// Try removing both lz4 and plain paths; one or neither may exist.
+			if err := os.Remove(base + ".lz4"); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("removing disk file: %w", err)
+			}
+			if err := os.Remove(base); err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("removing disk file: %w", err)
 			}
 		}
@@ -1302,7 +1462,7 @@ func (srv *Server) cleanOldObjects(us *usageStats) (countAndSize, error) {
 			var sumSize int64
 			for _, c := range candidates {
 				blobIDs = append(blobIDs, c.BlobID)
-				sumSize += c.BlobSize
+				sumSize += c.StoredSize
 			}
 			if err := srv.deleteBlobs(blobIDs...); err != nil {
 				return zero, fmt.Errorf("deleting old blobs: %v", err)
@@ -1329,7 +1489,7 @@ func (srv *Server) cleanOldObjects(us *usageStats) (countAndSize, error) {
 		}
 		for _, c := range candidates {
 			blobIDs = append(blobIDs, c.BlobID)
-			batchBytes += c.BlobSize
+			batchBytes += c.StoredSize
 			if batchBytes >= toClean {
 				break
 			}
@@ -1411,6 +1571,19 @@ func durFmt(d time.Duration) string {
 		return fmt.Sprintf("%dd", days)
 	}
 	return d.String()
+}
+
+// requestAcceptsEncoding reports whether r's Accept-Encoding header includes
+// the given encoding. It handles optional quality parameters (e.g.
+// "gzip;q=1.0, lz4;q=0.5") by stripping them before comparison.
+func requestAcceptsEncoding(r *http.Request, encoding string) bool {
+	for part := range strings.SplitSeq(r.Header.Get("Accept-Encoding"), ",") {
+		name, _, _ := strings.Cut(strings.TrimSpace(part), ";")
+		if strings.EqualFold(strings.TrimSpace(name), encoding) {
+			return true
+		}
+	}
+	return false
 }
 
 func bytesFmt(n int64) string {
