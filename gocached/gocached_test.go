@@ -206,6 +206,7 @@ func newServerTester(t testing.TB, extraOpts ...ServerOption) *tester {
 	st.srv = srv
 
 	st.hs = httptest.NewServer(st.srv)
+	t.Cleanup(func() { st.srv.Close() })
 	t.Cleanup(st.hs.Close)
 
 	return st

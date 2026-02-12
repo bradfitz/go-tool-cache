@@ -138,6 +138,7 @@ func openDB(dbDir string) (*sql.DB, error) {
 
 // start initializes the server, including defaults and background goroutines.
 func (srv *Server) start() error {
+	srv.shutdownCtx, srv.shutdownCancel = context.WithCancel(context.Background())
 	if srv.dir == "" {
 		d, err := os.UserCacheDir()
 		if err != nil {
@@ -327,6 +328,13 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 	return srv, nil
 }
 
+// Close shuts down the server, stopping background goroutines and closing the
+// database.
+func (srv *Server) Close() error {
+	srv.shutdownCancel()
+	return srv.db.Close()
+}
+
 // Server implements a gocached server. Use [NewServer] to create and start a
 // valid instance.
 type Server struct {
@@ -339,6 +347,7 @@ type Server struct {
 	maxSize        int64         // maximum size of the cache in bytes; 0 means no limit
 	maxAge         time.Duration // maximum age of objects; 0 means no limit
 	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 
 	jwtValidator    *ijwt.Validator   // nil unless jwtIssuer is set
 	jwtIssuer       string            // issuer URL for JWTs

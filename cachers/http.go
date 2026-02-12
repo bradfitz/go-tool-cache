@@ -125,7 +125,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 		if outputID == "" {
 			return "", "", fmt.Errorf("missing Go-Output-Id header in response")
 		}
-		body, size, err := responseBody(res)
+		var body io.Reader
+		var size int64
+		body, size, err = responseBody(res)
 		if err != nil {
 			return "", "", err
 		}
