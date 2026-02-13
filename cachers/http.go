@@ -37,6 +37,11 @@ type HTTPClient struct {
 	// AccessToken optionally specifies a Bearer access token to include
 	// in requests to the server.
 	AccessToken string
+
+	// BestEffortHTTP, when true, makes all HTTP errors non-fatal.
+	// Get returns a cache miss and Put returns the local disk result,
+	// silently ignoring any HTTP failures (connection errors, server errors, etc.).
+	BestEffortHTTP bool
 }
 
 func (c *HTTPClient) httpClient() *http.Client {
@@ -103,6 +108,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 
 	res, err := c.httpClient().Do(req)
 	if err != nil {
+		if c.BestEffortHTTP {
+			return "", "", nil
+		}
 		return "", "", err
 	}
 	defer res.Body.Close()
@@ -113,6 +121,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	if res.StatusCode != http.StatusOK {
 		msg := tryReadErrorMessage(res)
 		log.Printf("error GET /action/%s: %v, %s", actionID, res.Status, msg)
+		if c.BestEffortHTTP {
+			return "", "", nil
+		}
 		return "", "", fmt.Errorf("unexpected GET /action/%s status %v", actionID, res.Status)
 	}
 
@@ -149,6 +160,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 			req.Header.Set("Accept-Encoding", "lz4")
 			res, err = c.httpClient().Do(req)
 			if err != nil {
+				if c.BestEffortHTTP {
+					return "", "", nil
+				}
 				return "", "", err
 			}
 			defer res.Body.Close()
@@ -159,6 +173,9 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 			if res.StatusCode != http.StatusOK {
 				msg := tryReadErrorMessage(res)
 				log.Printf("error GET /output/%s: %v, %s", outputID, res.Status, msg)
+				if c.BestEffortHTTP {
+					return "", "", nil
+				}
 				return "", "", fmt.Errorf("unexpected GET /output/%s status %v", outputID, res.Status)
 			}
 			putBody, _, err = responseBody(res)
@@ -221,6 +238,9 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		if diskErr, ok := v.(error); ok {
 			log.Printf("HTTPClient.Put local disk error: %v", diskErr)
 			return "", diskErr
+		}
+		if c.BestEffortHTTP {
+			return v.(string), nil
 		}
 		return v.(string), httpErr
 	case <-ctx.Done():
