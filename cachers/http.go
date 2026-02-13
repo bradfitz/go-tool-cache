@@ -9,7 +9,10 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 
+	"github.com/bradfitz/go-tool-cache/consts"
 	"github.com/pierrec/lz4/v4"
 )
 
@@ -42,6 +45,11 @@ type HTTPClient struct {
 	// Get returns a cache miss and Put returns the local disk result,
 	// silently ignoring any HTTP failures (connection errors, server errors, etc.).
 	BestEffortHTTP bool
+
+	// serverCaps records capabilities discovered from the server's
+	// Gocached-Cap response header. Keys are capability tokens
+	// (e.g. "putlz4"); values are always true.
+	serverCaps sync.Map
 }
 
 func (c *HTTPClient) httpClient() *http.Client {
@@ -49,6 +57,25 @@ func (c *HTTPClient) httpClient() *http.Client {
 		return c.HTTPClient
 	}
 	return http.DefaultClient
+}
+
+// noteServerCaps records any capabilities declared by the server in the
+// Gocached-Cap response header.
+func (c *HTTPClient) noteServerCaps(res *http.Response) {
+	for _, v := range res.Header.Values(consts.CapHeader) {
+		for tok := range strings.SplitSeq(v, ",") {
+			if cap := strings.TrimSpace(tok); cap != "" {
+				if _, ok := c.serverCaps.Load(cap); !ok {
+					c.serverCaps.Store(cap, true)
+				}
+			}
+		}
+	}
+}
+
+func (c *HTTPClient) serverHasCap(cap string) bool {
+	_, ok := c.serverCaps.Load(cap)
+	return ok
 }
 
 // tryDrainResponse reads and throws away a small bounded amount of data from
@@ -115,6 +142,7 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	}
 	defer res.Body.Close()
 	defer tryDrainResponse(res)
+	c.noteServerCaps(res)
 	if res.StatusCode == http.StatusNotFound {
 		return "", "", nil
 	}
@@ -167,6 +195,7 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 			}
 			defer res.Body.Close()
 			defer tryDrainResponse(res)
+			c.noteServerCaps(res)
 			if res.StatusCode == http.StatusNotFound {
 				return "", "", nil
 			}
@@ -214,8 +243,31 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		}
 	}()
 
-	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, bytes.NewReader(buf))
-	req.ContentLength = size
+	var reqBody io.Reader = bytes.NewReader(buf)
+	reqContentLength := size
+	compressPut := size > 0 && c.serverHasCap(consts.CapPutLZ4)
+	if compressPut {
+		var cbuf bytes.Buffer
+		lzw := lz4.NewWriter(&cbuf)
+		if err := lzw.Apply(lz4.SizeOption(uint64(size))); err != nil {
+			return "", err
+		}
+		if _, err := lzw.Write(buf); err != nil {
+			return "", err
+		}
+		if err := lzw.Close(); err != nil {
+			return "", err
+		}
+		reqBody = bytes.NewReader(cbuf.Bytes())
+		reqContentLength = int64(cbuf.Len())
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, reqBody)
+	req.ContentLength = reqContentLength
+	if compressPut {
+		req.Header.Set("Content-Encoding", "lz4")
+		req.Header.Set("X-Uncompressed-Length", strconv.FormatInt(size, 10))
+	}
 	if c.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	}
@@ -226,6 +278,7 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		httpErr = err
 	} else {
 		defer res.Body.Close()
+		c.noteServerCaps(res)
 		if res.StatusCode != http.StatusNoContent {
 			msg := tryReadErrorMessage(res)
 			log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)

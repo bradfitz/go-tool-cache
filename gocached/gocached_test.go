@@ -614,6 +614,84 @@ func TestLZ4Storage(t *testing.T) {
 	}
 }
 
+// roundTripFunc is an http.RoundTripper implemented as a function.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestCompressPuts(t *testing.T) {
+	st := newServerTester(t)
+
+	// Track whether PUT requests are sent with lz4 compression on the wire.
+	var putLZ4Count atomic.Int32
+	c := st.mkClient()
+	c.HTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method == "PUT" && req.Header.Get("Content-Encoding") == "lz4" {
+				putLZ4Count.Add(1)
+			}
+			return http.DefaultTransport.RoundTrip(req)
+		}),
+	}
+
+	// The first Put goes out uncompressed because the client hasn't
+	// yet seen a Gocached-Cap response. The Put response itself
+	// carries Gocached-Cap: putlz4, so subsequent puts are compressed.
+	st.wantPut(c, "0010", "9010", "first-put")
+	if n := putLZ4Count.Load(); n != 0 {
+		t.Fatalf("expected 0 lz4 puts before cap discovery, got %d", n)
+	}
+
+	// Now the client knows the server supports putlz4.
+	tests := []struct {
+		name string
+		val  string
+	}{
+		{"empty", ""},
+		{"small_inline", "hello"},
+		{"inline_max", strings.Repeat("a", smallObjectSize)},
+		{"disk_no_lz4", strings.Repeat("b", smallObjectSize+1)},
+		{"disk_lz4_threshold", strings.Repeat("c", lz4CompressThreshold)},
+		{"disk_large", strings.Repeat("d", 4096)},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			actionID := fmt.Sprintf("%04x", i+0x20)
+			outputID := fmt.Sprintf("%04x", i+0xa0)
+
+			st.wantPut(c, actionID, outputID, tt.val)
+
+			// Get from a fresh client to verify the server correctly
+			// decompressed the lz4 wire body and stored the original data.
+			cFresh := st.mkClient()
+			st.wantGet(cFresh, actionID, outputID, tt.val)
+		})
+	}
+
+	// All puts with size > 0 should have been lz4-compressed on the wire.
+	// "empty" has size=0 and is not compressed.
+	wantLZ4 := int32(len(tests) - 1) // all except "empty"
+	if n := putLZ4Count.Load(); n != wantLZ4 {
+		t.Errorf("expected %d lz4 puts after cap discovery, got %d", wantLZ4, n)
+	}
+
+	// Verify dedup: same content from a fresh client (no caps, sends
+	// uncompressed) and the cap-aware client (sends compressed) produces
+	// the same blob (same SHA-256).
+	cNoCaps := st.mkClient()
+	largeVal := strings.Repeat("e", 4096)
+
+	st.wantPut(cNoCaps, "aa01", "bb01", largeVal)
+	st.wantPut(c, "aa02", "bb01", largeVal)
+
+	cFresh := st.mkClient()
+	st.wantGet(cFresh, "aa01", "bb01", largeVal)
+	st.wantGet(cFresh, "aa02", "bb01", largeVal)
+}
+
 func TestClientConnReuse(t *testing.T) {
 	st := newServerTester(t)
 

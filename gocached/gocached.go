@@ -54,11 +54,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/bradfitz/go-tool-cache/consts"
 	ijwt "github.com/bradfitz/go-tool-cache/gocached/internal/jwt"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
@@ -563,6 +565,8 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		srv.logf("ServeHTTP: %s %s", r.Method, r.RequestURI)
 	}
 
+	w.Header().Set(consts.CapHeader, consts.CapPutLZ4)
+
 	var sessionData *sessionData // remains nil for unauthenticated requests.
 	reqStats := &stats{}
 	defer func() {
@@ -962,14 +966,37 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats)
 		return
 	}
 
-	hasher := sha256.New()
-	hashingBody := io.TeeReader(r.Body, hasher)
+	// Determine the body reader and content size. If the client sent
+	// lz4-compressed data, wrap the body with a decompressor and use the
+	// uncompressed size for all downstream logic (hashing, inline vs disk
+	// decisions, etc.). The server will re-compress when writing to disk.
+	// The goal is reducing bytes on the wire, not saving CPU, so the
+	// decompress-then-recompress round trip is fine.
+	var bodyReader io.Reader = r.Body
+	contentSize := r.ContentLength
+	if r.Header.Get("Content-Encoding") == "lz4" {
+		sizeStr := r.Header.Get("X-Uncompressed-Length")
+		if sizeStr == "" {
+			http.Error(w, "lz4-compressed PUT missing X-Uncompressed-Length", http.StatusBadRequest)
+			return
+		}
+		var err error
+		contentSize, err = strconv.ParseInt(sizeStr, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid X-Uncompressed-Length", http.StatusBadRequest)
+			return
+		}
+		bodyReader = lz4.NewReader(r.Body)
+	}
 
-	storedSize := r.ContentLength
-	uncompressedSize := r.ContentLength
+	hasher := sha256.New()
+	hashingBody := io.TeeReader(bodyReader, hasher)
+
+	storedSize := contentSize
+	uncompressedSize := contentSize
 
 	var smallData []byte
-	if r.ContentLength <= smallObjectSize {
+	if contentSize <= smallObjectSize {
 		// Store small objects inline in the database.
 		var err error
 		smallData, err = io.ReadAll(hashingBody)
@@ -978,15 +1005,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats)
 			http.Error(w, "Read content error", http.StatusInternalServerError)
 			return
 		}
-		if int64(len(smallData)) != r.ContentLength {
-			// This check is redundant with net/http's validation, but
-			// for extra clarity.
+		if int64(len(smallData)) != contentSize {
 			http.Error(w, "bad content length", http.StatusInternalServerError)
 			return
 		}
 	} else {
 		// For larger objects, we store them on disk (lz4 compressed).
-		diskSize, err := s.writeDiskBlob(r.ContentLength, hashingBody)
+		diskSize, err := s.writeDiskBlob(contentSize, hashingBody)
 		if err != nil {
 			s.logf("Write disk blob error: %v", err)
 			http.Error(w, "Write disk blob error", http.StatusInternalServerError)
@@ -1049,7 +1074,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats)
 	}
 
 	stats.Puts++
-	stats.PutsBytes += r.ContentLength
+	stats.PutsBytes += contentSize
 	if smallData != nil {
 		stats.PutsInline++
 	}
