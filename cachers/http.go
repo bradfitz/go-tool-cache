@@ -120,7 +120,16 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 	}
 	if res.StatusCode != http.StatusOK {
 		msg := tryReadErrorMessage(res)
-		log.Printf("error GET /action/%s: %v, %s", actionID, res.Status, msg)
+		if c.BestEffortHTTP && res.StatusCode == http.StatusUnauthorized {
+			// Known error code that will repeatedly happen, so avoid
+			// filling the logs with these errors.
+			//
+			// 401: can happen when gocached restarts during a session, as it
+			// doesn't persist access tokens.
+			// TODO(tomhjp): make the client retry auth in the background.
+		} else {
+			log.Printf("error GET /action/%s: %v, %s", actionID, res.Status, msg)
+		}
 		if c.BestEffortHTTP {
 			return "", "", nil
 		}
@@ -228,7 +237,20 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 		defer res.Body.Close()
 		if res.StatusCode != http.StatusNoContent {
 			msg := tryReadErrorMessage(res)
-			log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)
+			if c.BestEffortHTTP && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) {
+				// Known error codes that will repeatedly happen, so avoid
+				// filling the logs with these errors.
+				//
+				// 401: can happen when gocached restarts during a session, as it
+				// doesn't persist access tokens.
+				// TODO(tomhjp): make the client retry auth in the background.
+				//
+				// 403: can happen when authed with a JWT that didn't grant global
+				// write permissions.
+				// TODO(tomhjp): support namespaces so all sessions can safely write.
+			} else {
+				log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)
+			}
 			httpErr = fmt.Errorf("unexpected PUT /%s/%s status %v", actionID, outputID, res.Status)
 		}
 	}
