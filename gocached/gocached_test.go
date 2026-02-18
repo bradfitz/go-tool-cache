@@ -436,7 +436,7 @@ func TestCleanOldObjectsByAge(t *testing.T) {
 	st.wantPut(c1, "0003", "9903", "small")
 	smallLen := int64(len("small"))
 
-	stored1 := int64(smallObjectSize + 1)                                   // below lz4CompressThreshold, stored uncompressed
+	stored1 := int64(smallObjectSize + 1)                                 // below lz4CompressThreshold, stored uncompressed
 	stored2 := lz4Size(t, []byte(strings.Repeat("x", smallObjectSize+2))) // at lz4CompressThreshold, lz4-compressed
 
 	st1 := st.usageStats()
@@ -834,5 +834,31 @@ func TestExchangeToken(t *testing.T) {
 				t.Errorf("expected non-zero puts in session stats")
 			}
 		})
+	}
+}
+
+func BenchmarkFlushAccessTimes(b *testing.B) {
+	st := newServerTester(b, WithVerbose(false))
+	s := st.srv
+
+	cl := st.mkClient()
+	var actionIDs []string
+	for n := range 5000 {
+		aid := fmt.Sprintf("abcd%04x", n)
+		st.wantPut(cl, aid, "def456", "data789")
+		actionIDs = append(actionIDs, aid)
+	}
+
+	for b.Loop() {
+		s.mu.Lock()
+		s.accessDirty = make(map[actionKey]int64)
+		for _, aid := range actionIDs {
+			s.accessDirty[actionKey{ActionID: aid}] = 123
+		}
+		s.mu.Unlock()
+
+		if err := s.flushAccessTimeBumpsWithErr(); err != nil {
+			b.Fatalf("flushAccessTimeBumpsWithErr: %v", err)
+		}
 	}
 }
