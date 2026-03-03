@@ -722,8 +722,11 @@ func TestExchangeToken(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			issuer, createJWT := startOIDCServer(t, privateKey.Public())
 			st := newServerTester(t,
-				WithJWTAuth(issuer, wantClaims),
-				WithGlobalNamespaceJWTClaims(wantGlobalClaims),
+				WithJWTAuth(JWTIssuerConfig{
+					Issuer:            issuer,
+					RequiredClaims:    wantClaims,
+					GlobalWriteClaims: wantGlobalClaims,
+				}),
 			)
 
 			// Generate JWT.
@@ -835,6 +838,175 @@ func TestExchangeToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMultiIssuerAuth(t *testing.T) {
+	// Generate separate keys for each issuer.
+	keyA, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("error generating key A: %v", err)
+	}
+	keyB, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("error generating key B: %v", err)
+	}
+	keyC, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("error generating key C: %v", err)
+	}
+
+	issuerA, createJWTA := startOIDCServer(t, keyA.Public())
+	issuerB, createJWTB := startOIDCServer(t, keyB.Public())
+	issuerC, createJWTC := startOIDCServer(t, keyC.Public())
+
+	st := newServerTester(t,
+		WithJWTAuth(
+			JWTIssuerConfig{
+				Issuer:         issuerA,
+				RequiredClaims: map[string]string{"sub": "userA"},
+				GlobalWriteClaims: map[string]string{
+					"sub": "userA",
+					"ref": "refs/heads/main",
+				},
+			},
+			JWTIssuerConfig{
+				Issuer:         issuerB,
+				RequiredClaims: map[string]string{"sub": "userB"},
+				GlobalWriteClaims: map[string]string{
+					"sub": "userB",
+					"ref": "refs/heads/main",
+				},
+			},
+		),
+	)
+
+	makeJWTBody := func(jwtString string) []byte {
+		body, err := json.Marshal(map[string]any{"jwt": jwtString})
+		if err != nil {
+			t.Fatalf("error marshaling request body: %v", err)
+		}
+		return body
+	}
+
+	exchangeToken := func(jwtBody []byte) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest("POST", st.hs.URL+"/auth/exchange-token", bytes.NewReader(jwtBody))
+		if err != nil {
+			t.Fatalf("error creating request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("error making request: %v", err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("error reading response body: %v", err)
+		}
+		if resp.StatusCode == http.StatusOK {
+			var d struct {
+				AccessToken string `json:"access_token"`
+			}
+			if err := json.Unmarshal(body, &d); err != nil {
+				t.Fatalf("error decoding response body: %v", err)
+			}
+			return resp, d.AccessToken
+		}
+		return resp, ""
+	}
+
+	baseClaims := func(iss string) jwt.MapClaims {
+		return jwt.MapClaims{
+			"iss": iss,
+			"aud": gocachedAudience,
+			"nbf": jwt.NewNumericDate(time.Now().Add(-time.Minute)),
+			"exp": jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		}
+	}
+
+	// Issuer A: valid read-only token.
+	t.Run("issuerA_read", func(t *testing.T) {
+		claims := baseClaims(issuerA)
+		claims["sub"] = "userA"
+		resp, accessToken := exchangeToken(makeJWTBody(createJWTA(claims, keyA)))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: want %d, got %d", http.StatusOK, resp.StatusCode)
+		}
+		if accessToken == "" {
+			t.Fatal("expected access token")
+		}
+
+		cl := st.mkClient()
+		cl.AccessToken = accessToken
+		st.wantGetMiss(cl, "aabb01")
+	})
+
+	// Issuer A: valid write token.
+	t.Run("issuerA_write", func(t *testing.T) {
+		claims := baseClaims(issuerA)
+		claims["sub"] = "userA"
+		claims["ref"] = "refs/heads/main"
+		resp, accessToken := exchangeToken(makeJWTBody(createJWTA(claims, keyA)))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: want %d, got %d", http.StatusOK, resp.StatusCode)
+		}
+		cl := st.mkClient()
+		cl.AccessToken = accessToken
+		st.wantPut(cl, "aabb02", "ccdd02", "hello-from-A")
+		st.wantGet(cl, "aabb02", "ccdd02", "hello-from-A")
+	})
+
+	// Issuer B: valid read-only token.
+	t.Run("issuerB_read", func(t *testing.T) {
+		claims := baseClaims(issuerB)
+		claims["sub"] = "userB"
+		resp, accessToken := exchangeToken(makeJWTBody(createJWTB(claims, keyB)))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: want %d, got %d", http.StatusOK, resp.StatusCode)
+		}
+		if accessToken == "" {
+			t.Fatal("expected access token")
+		}
+		cl := st.mkClient()
+		cl.AccessToken = accessToken
+		// Can read data written by issuer A.
+		st.wantGet(cl, "aabb02", "ccdd02", "hello-from-A")
+	})
+
+	// Issuer B: valid write token.
+	t.Run("issuerB_write", func(t *testing.T) {
+		claims := baseClaims(issuerB)
+		claims["sub"] = "userB"
+		claims["ref"] = "refs/heads/main"
+		resp, accessToken := exchangeToken(makeJWTBody(createJWTB(claims, keyB)))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("unexpected status code: want %d, got %d", http.StatusOK, resp.StatusCode)
+		}
+		cl := st.mkClient()
+		cl.AccessToken = accessToken
+		st.wantPut(cl, "aabb03", "ccdd03", "hello-from-B")
+		st.wantGet(cl, "aabb03", "ccdd03", "hello-from-B")
+	})
+
+	// Issuer B: wrong required claims (sub doesn't match).
+	t.Run("issuerB_wrong_sub", func(t *testing.T) {
+		claims := baseClaims(issuerB)
+		claims["sub"] = "userA" // issuer B requires sub=userB
+		resp, _ := exchangeToken(makeJWTBody(createJWTB(claims, keyB)))
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unexpected status code: want %d, got %d", http.StatusUnauthorized, resp.StatusCode)
+		}
+	})
+
+	// Issuer C: not configured, should be rejected.
+	t.Run("issuerC_rejected", func(t *testing.T) {
+		claims := baseClaims(issuerC)
+		claims["sub"] = "userC"
+		resp, _ := exchangeToken(makeJWTBody(createJWTC(claims, keyC)))
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unexpected status code: want %d, got %d", http.StatusUnauthorized, resp.StatusCode)
+		}
+	})
 }
 
 func BenchmarkFlushAccessTimes(b *testing.B) {

@@ -61,6 +61,7 @@ import (
 	"time"
 
 	ijwt "github.com/bradfitz/go-tool-cache/gocached/internal/jwt"
+	"github.com/bradfitz/go-tool-cache/gocached/logger"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -274,13 +275,19 @@ func (srv *Server) start() error {
 		srv.logf("gocached: cleaned %v", res)
 	}
 
-	if srv.jwtIssuer != "" {
-		srv.jwtValidator = ijwt.NewJWTValidator(srv.logf, srv.jwtIssuer, gocachedAudience)
+	if len(srv.jwtIssuers) > 0 {
+		issuerURLs := make([]string, 0, len(srv.jwtIssuers))
+		for iss := range srv.jwtIssuers {
+			issuerURLs = append(issuerURLs, iss)
+		}
+		srv.jwtValidator = ijwt.NewJWTValidator(srv.logf, gocachedAudience, issuerURLs)
 		if err := srv.jwtValidator.RunUpdateJWKSLoop(srv.shutdownCtx); err != nil {
 			return fmt.Errorf("failed to fetch JWKS for JWT validator: %w", err)
 		}
 
-		srv.logf("gocached: using JWT issuer %q with claims %v, global claims %v", srv.jwtIssuer, srv.jwtClaims, srv.globalJWTClaims)
+		for iss, entry := range srv.jwtIssuers {
+			srv.logf("gocached: using JWT issuer %q with required claims %v, global write claims %v", iss, entry.requiredClaims, entry.globalWriteClaims)
+		}
 
 		go srv.runCleanSessionsLoop()
 	}
@@ -351,11 +358,9 @@ func WithVerbose(verbose bool) ServerOption {
 	}
 }
 
-type logf func(format string, args ...any)
-
 // WithLogf sets a custom logging function for the server. Defaults to
 // [log.Printf].
-func WithLogf(logf logf) ServerOption {
+func WithLogf(logf logger.Logf) ServerOption {
 	return func(srv *Server) {
 		srv.logf = logf
 	}
@@ -378,24 +383,40 @@ func WithMaxAge(maxAge time.Duration) ServerOption {
 	}
 }
 
-// WithJWTAuth enables JWT-based authentication for the server. The issuer must
-// be a reachable HTTP(S) server that serves its JWKS via a URL discoverable at
-// /.well-known/openid-configuration, and any JWT presented to the server must
-// exactly match the provided claims to start a session. No requests are allowed
-// without authentication if JWT auth is enabled.
-func WithJWTAuth(issuer string, claims map[string]string) ServerOption {
-	return func(srv *Server) {
-		srv.jwtIssuer = issuer
-		srv.jwtClaims = claims
-	}
+// JWTIssuerConfig configures a single OIDC issuer for JWT-based authentication.
+type JWTIssuerConfig struct {
+	// Issuer is the OIDC issuer URL. It must be a reachable HTTP(S) server
+	// that serves its JWKS via a URL discoverable at
+	// /.well-known/openid-configuration.
+	Issuer string
+
+	// RequiredClaims are claims that any JWT from this issuer must have to
+	// start a session. All key-value pairs must match exactly.
+	RequiredClaims map[string]string
+
+	// GlobalWriteClaims are claims that a JWT from this issuer must have to
+	// write to the cache's global namespace. It should be a superset of
+	// RequiredClaims.
+	GlobalWriteClaims map[string]string
 }
 
-// WithGlobalNamespaceJWTClaims sets additional claims that a JWT must have to
-// write to the cache's global namespace. It should be a superset of the claims
-// provided to [WithJWTAuth].
-func WithGlobalNamespaceJWTClaims(claims map[string]string) ServerOption {
+// WithJWTAuth enables JWT-based authentication for the server. Each issuer must
+// be a reachable HTTP(S) server that serves its JWKS via a URL discoverable at
+// /.well-known/openid-configuration, and any JWT presented to the server must
+// exactly match the issuer's required claims to start a session. No requests are
+// allowed without authentication if JWT auth is enabled. It can be called multiple
+// times; configs accumulate.
+func WithJWTAuth(issuers ...JWTIssuerConfig) ServerOption {
 	return func(srv *Server) {
-		srv.globalJWTClaims = claims
+		if srv.jwtIssuers == nil {
+			srv.jwtIssuers = make(map[string]*jwtIssuerConfig)
+		}
+		for _, ic := range issuers {
+			srv.jwtIssuers[ic.Issuer] = &jwtIssuerConfig{
+				requiredClaims:    ic.RequiredClaims,
+				globalWriteClaims: ic.GlobalWriteClaims,
+			}
+		}
 	}
 }
 
@@ -445,7 +466,7 @@ type Server struct {
 	db             *sql.DB
 	dir            string // for SQLite DB + large blobs
 	verbose        bool
-	logf           logf
+	logf           logger.Logf
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
 	metricsHandler http.Handler
 	maxSize        int64         // maximum size of the cache in bytes; 0 means no limit
@@ -453,10 +474,8 @@ type Server struct {
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 
-	jwtValidator    *ijwt.Validator   // nil unless jwtIssuer is set
-	jwtIssuer       string            // issuer URL for JWTs
-	jwtClaims       map[string]string // claims required for any JWT to start a session
-	globalJWTClaims map[string]string // additional claims required to write to global namespace
+	jwtValidator *ijwt.Validator             // nil unless jwtIssuers is non-empty
+	jwtIssuers   map[string]*jwtIssuerConfig // keyed by issuer URL
 
 	mu               sync.RWMutex            // guards following fields in this block
 	sessions         map[string]*sessionData // maps access token -> session data.
@@ -499,6 +518,12 @@ type Server struct {
 		Auths          expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
 		AuthErrs       expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
 	}
+}
+
+// jwtIssuerConfig holds per-issuer claim requirements for JWT auth.
+type jwtIssuerConfig struct {
+	requiredClaims    map[string]string
+	globalWriteClaims map[string]string
 }
 
 // sessionData corresponds to a specific access token, and is only used if JWT
@@ -1149,11 +1174,17 @@ func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *Server) evaluateClaims(claims map[string]any) (globalNSWrite bool, _ error) {
-	if missing := findMissingClaims(srv.jwtClaims, claims); len(missing) > 0 {
+	iss, _ := claims["iss"].(string)
+	cfg, ok := srv.jwtIssuers[iss]
+	if !ok {
+		return false, fmt.Errorf("got claims %v; unknown issuer %q", claims, iss)
+	}
+
+	if missing := findMissingClaims(cfg.requiredClaims, claims); len(missing) > 0 {
 		return false, fmt.Errorf("got claims %v; missing required claims: %v", claims, missing)
 	}
 
-	if missing := findMissingClaims(srv.globalJWTClaims, claims); len(missing) == 0 {
+	if missing := findMissingClaims(cfg.globalWriteClaims, claims); len(missing) == 0 {
 		return true, nil
 	} else if srv.verbose {
 		srv.logf("token exchange: missing global namespace write claims: %v", missing)
@@ -1702,9 +1733,11 @@ func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<html><body><h1>gocached sessions</h1>\n")
-	fmt.Fprintf(w, "<p>JWT issuer: %s</p>\n", srv.jwtIssuer)
-	fmt.Fprintf(w, "<p>JWT claims required: %v</p>\n", srv.jwtClaims)
-	fmt.Fprintf(w, "<p>JWT global write claims required: %v</p>\n", srv.globalJWTClaims)
+	for iss, cfg := range srv.jwtIssuers {
+		fmt.Fprintf(w, "<p>JWT issuer: %s</p>\n", iss)
+		fmt.Fprintf(w, "<p>JWT claims required: %v</p>\n", cfg.requiredClaims)
+		fmt.Fprintf(w, "<p>JWT global write claims required: %v</p>\n", cfg.globalWriteClaims)
+	}
 	fmt.Fprintf(w, "<p>Number of sessions: %d</p>\n", len(sessions))
 
 	fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")

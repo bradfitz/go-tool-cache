@@ -6,6 +6,7 @@ package jwt
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bradfitz/go-tool-cache/gocached/logger"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -26,30 +28,64 @@ var (
 	supportedAlgorithms = []string{"HS256", "RS256", "ES256"}
 )
 
+// issuer holds the per-issuer state: its own JWT parser and signing keys.
+type issuer struct {
+	iss         string
+	parser      *jwt.Parser
+	signingKeys atomic.Value // []jose.JSONWebKey
+}
+
+// keyFunc is how github.com/golang-jwt/jwt gets the public key it needs to
+// verify a JWT signature. Each issuer entry only checks its own keys.
+func (ie *issuer) keyFunc(t *jwt.Token) (any, error) {
+	var kid string
+	if v, ok := t.Header["kid"]; ok {
+		kid, _ = v.(string)
+	}
+	if kid == "" {
+		return nil, fmt.Errorf("no kid found in token header")
+	}
+
+	signingKeys := ie.signingKeys.Load().([]jose.JSONWebKey)
+	for _, k := range signingKeys {
+		if k.KeyID == kid {
+			return k.Key, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unknown key ID: %s", kid)
+}
+
 // NewJWTValidator constructs a [Validator] for validating JWTs. Must call
 // [RunUpdateJWKSLoop] before validating any JWTs. Every JWT must exactly match
-// the provided issuer and audience values in its "iss" and "aud" claims
-// respectively. The issuer must be a reachable HTTP server that serves the JWT
-// public signing keys via the path defined by [oidcConfigWellKnownPath], and
-// the audience should be a value specific to the trust boundary that gocached
-// resides within.
-func NewJWTValidator(logf func(format string, args ...any), issuer, audience string) *Validator {
+// one of the provided issuers and the audience value in its "iss" and "aud"
+// claims respectively. Each issuer must be a reachable HTTP server that serves
+// the JWT public signing keys via the path defined by [oidcConfigWellKnownPath],
+// and the audience should be a value specific to the trust boundary that
+// gocached resides within.
+func NewJWTValidator(logf logger.Logf, audience string, issuerURLs []string) *Validator {
+	var issuers []*issuer
+	for _, iss := range issuerURLs {
+		issuers = append(issuers, &issuer{
+			iss: iss,
+			parser: jwt.NewParser(
+				jwt.WithValidMethods(supportedAlgorithms),
+				jwt.WithIssuer(iss),
+				jwt.WithAudience(audience),
+				jwt.WithLeeway(10*time.Second),
+				jwt.WithIssuedAt(),
+			),
+		})
+	}
 	return &Validator{
-		logf:   logf,
-		issuer: issuer,
-		parser: jwt.NewParser(
-			jwt.WithValidMethods(supportedAlgorithms),
-			jwt.WithIssuer(issuer),
-			jwt.WithAudience(audience),
-			jwt.WithLeeway(10*time.Second),
-			jwt.WithIssuedAt(),
-		),
+		logf:    logf,
+		issuers: issuers,
 	}
 }
 
 // RunUpdateJWKSLoop fetches the JWKS synchronously once to surface any config
 // errors early, and then starts a background goroutine that periodically fetches
-// the JWKS from the issuer to keep the signing keys up to date. Must be called
+// the JWKS from all issuers to keep the signing keys up to date. Must be called
 // before validating any JWTs.
 func (v *Validator) RunUpdateJWKSLoop(ctx context.Context) error {
 	// Initial fetch to error early on misconfiguration.
@@ -65,56 +101,43 @@ func (v *Validator) RunUpdateJWKSLoop(ctx context.Context) error {
 // Validator provides methods for validating JWTs. Use [NewJWTValidator] to
 // construct a working Validator.
 type Validator struct {
-	logf   func(format string, args ...any)
-	issuer string
-	parser *jwt.Parser
-
-	signingKeys atomic.Value // []jose.JSONWebKey
+	logf    logger.Logf
+	issuers []*issuer
 
 	// TODO(tomhjp): metrics
 }
 
 // Validate returns an error if the provided JWT fails validation for an invalid
-// signature or standard claim (iss, aud, iat, nbf, exp). It returns the token's
-// verified claims if validation succeeds. The caller should then make policy
-// decisions based on other claims such as "sub" or other custom claims.
+// signature or standard claim (iss, aud, iat, nbf, exp). It tries each
+// configured issuer and returns the verified claims from the first successful
+// parse. If all issuers fail, it returns the last error.
 func (v *Validator) Validate(ctx context.Context, jwtString string) (map[string]any, error) {
-	tk, err := v.parser.Parse(jwtString, v.keyFunc)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse token: %w", err)
-	}
-
-	if !tk.Valid {
-		return nil, fmt.Errorf("invalid token")
-	}
-
-	gotClaims, ok := tk.Claims.(jwt.MapClaims)
-	if !ok {
-		return nil, fmt.Errorf("unexpected claims type: %T", tk.Claims)
-	}
-
-	return gotClaims, nil
-}
-
-// keyFunc is how github.com/golang-jwt/jwt gets the public key it needs to
-// verify a JWT signature.
-func (v *Validator) keyFunc(t *jwt.Token) (any, error) {
-	var kid string
-	if v, ok := t.Header["kid"]; ok {
-		kid, _ = v.(string)
-	}
-	if kid == "" {
-		return nil, fmt.Errorf("no kid found in token header")
-	}
-
-	signingKeys := v.signingKeys.Load().([]jose.JSONWebKey)
-	for _, k := range signingKeys {
-		if k.KeyID == kid {
-			return k.Key, nil
+	var lastErr error
+	for _, ie := range v.issuers {
+		tk, err := ie.parser.Parse(jwtString, ie.keyFunc)
+		if err != nil {
+			lastErr = err
+			continue
 		}
+
+		if !tk.Valid {
+			lastErr = fmt.Errorf("invalid token")
+			continue
+		}
+
+		gotClaims, ok := tk.Claims.(jwt.MapClaims)
+		if !ok {
+			lastErr = fmt.Errorf("unexpected claims type: %T", tk.Claims)
+			continue
+		}
+
+		return gotClaims, nil
 	}
 
-	return nil, fmt.Errorf("unknown key ID: %s", kid)
+	if lastErr != nil {
+		return nil, fmt.Errorf("failed to parse token: %w", lastErr)
+	}
+	return nil, fmt.Errorf("no issuers configured")
 }
 
 func (v *Validator) runUpdateJWKSLoop(ctx context.Context) {
@@ -135,10 +158,20 @@ func (v *Validator) runUpdateJWKSLoop(ctx context.Context) {
 }
 
 func (v *Validator) updateJWKS(ctx context.Context) error {
-	v.logf("jwt: fetching JWKS from issuer %q", v.issuer)
-	u, err := url.Parse(v.issuer)
+	var errs []error
+	for _, ie := range v.issuers {
+		if err := ie.updateJWKS(ctx, v.logf); err != nil {
+			errs = append(errs, fmt.Errorf("issuer %q: %w", ie.iss, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (ie *issuer) updateJWKS(ctx context.Context, logf logger.Logf) error {
+	logf("jwt: fetching JWKS from issuer %q", ie.iss)
+	u, err := url.Parse(ie.iss)
 	if err != nil {
-		return fmt.Errorf("failed to parse issuer URL %q: %w", v.issuer, err)
+		return fmt.Errorf("failed to parse issuer URL %q: %w", ie.iss, err)
 	}
 
 	u.Path = path.Join(u.Path, oidcConfigWellKnownPath)
@@ -174,7 +207,7 @@ func (v *Validator) updateJWKS(ctx context.Context) error {
 		signingKeys = append(signingKeys, k)
 	}
 
-	v.signingKeys.Store(signingKeys)
+	ie.signingKeys.Store(signingKeys)
 	return nil
 }
 
