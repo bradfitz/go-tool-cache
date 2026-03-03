@@ -6,13 +6,17 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"maps"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bradfitz/go-tool-cache/gocached"
@@ -55,7 +59,11 @@ func main() {
 	flag.Var(&globalJWTClaims, "global-jwt-claim", "an additional claim in the form x=y that a JWT must have to allow writing to the cache's global namespace; may be specified more than once")
 	flag.Parse()
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	opts := []gocached.ServerOption{
+		gocached.WithShutdownCtx(ctx),
 		gocached.WithDir(*dir),
 		gocached.WithVerbose(*verbose),
 		gocached.WithMaxSize(int64(*maxSize) << 30),
@@ -92,6 +100,25 @@ func main() {
 		}()
 	}
 
+	ln, err := net.Listen("tcp", *listen)
+	if err != nil {
+		log.Fatalf("listen: %v", err)
+	}
+
+	httpSrv := &http.Server{Handler: srv}
+	go func() {
+		<-ctx.Done()
+		log.Printf("gocached: shutting down...")
+		httpSrv.Close()
+	}()
+
 	log.Printf("gocached: listening on %s ...", *listen)
-	log.Fatal(http.ListenAndServe(*listen, srv))
+	if err := httpSrv.Serve(ln); err != http.ErrServerClosed {
+		log.Fatalf("serve: %v", err)
+	}
+
+	if err := srv.Close(); err != nil {
+		log.Fatalf("close: %v", err)
+	}
+	log.Printf("gocached: shutdown complete")
 }

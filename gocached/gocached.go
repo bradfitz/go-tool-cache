@@ -89,7 +89,7 @@ const (
 	gocachedAudience = "gocached"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -128,19 +128,45 @@ CREATE TABLE IF NOT EXISTS Namespaces (
   NamespaceID INTEGER PRIMARY KEY AUTOINCREMENT,
   Namespace   TEXT NOT NULL UNIQUE CHECK (Namespace = lower(Namespace))
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS Sessions (
+  SessionID      TEXT PRIMARY KEY,
+  Claims         TEXT    NOT NULL DEFAULT '{}',
+  LastUsed       INTEGER NOT NULL DEFAULT 0,
+  Gets           INTEGER NOT NULL DEFAULT 0,
+  GetBytes       INTEGER NOT NULL DEFAULT 0,
+  GetHits        INTEGER NOT NULL DEFAULT 0,
+  GetAccessBumps INTEGER NOT NULL DEFAULT 0,
+  GetHitsInline  INTEGER NOT NULL DEFAULT 0,
+  GetNanos       INTEGER NOT NULL DEFAULT 0,
+  GetErrs        INTEGER NOT NULL DEFAULT 0,
+  Puts           INTEGER NOT NULL DEFAULT 0,
+  PutErrs        INTEGER NOT NULL DEFAULT 0,
+  PutsDup        INTEGER NOT NULL DEFAULT 0,
+  PutsBytes      INTEGER NOT NULL DEFAULT 0,
+  PutsInline     INTEGER NOT NULL DEFAULT 0,
+  PutsNanos      INTEGER NOT NULL DEFAULT 0,
+  CreateTime     INTEGER NOT NULL DEFAULT 0
+) STRICT;
 `
 
 func openDB(dbDir string) (*sql.DB, error) {
 	dbPath := filepath.Join(dbDir, fmt.Sprintf("gocached-v%d.db", schemaVersion))
 
-	// If the v4 DB doesn't exist but v3 does, migrate it.
-	if schemaVersion == 4 {
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			v3Path := filepath.Join(dbDir, "gocached-v3.db")
-			if _, err := os.Stat(v3Path); err == nil {
-				if err := migrateV3ToV4(dbDir, v3Path, dbPath); err != nil {
-					return nil, fmt.Errorf("migrating v3→v4: %w", err)
-				}
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		// Try migrating from v4 first, then v3→v4→v5.
+		v4Path := filepath.Join(dbDir, "gocached-v4.db")
+		v3Path := filepath.Join(dbDir, "gocached-v3.db")
+		if _, err := os.Stat(v4Path); err == nil {
+			if err := migrateV4ToV5(dbDir, v4Path, dbPath); err != nil {
+				return nil, fmt.Errorf("migrating v4→v5: %w", err)
+			}
+		} else if _, err := os.Stat(v3Path); err == nil {
+			if err := migrateV3ToV4(dbDir, v3Path, v4Path); err != nil {
+				return nil, fmt.Errorf("migrating v3→v4: %w", err)
+			}
+			if err := migrateV4ToV5(dbDir, v4Path, dbPath); err != nil {
+				return nil, fmt.Errorf("migrating v4→v5: %w", err)
 			}
 		}
 	}
@@ -229,6 +255,85 @@ func migrateV3ToV4(dbDir, v3Path, v4Path string) error {
 	return nil
 }
 
+// migrateV4ToV5 copies the v4 database to a temp file, creates the Sessions
+// table, then atomically renames it to the v5 path.
+func migrateV4ToV5(dbDir, v4Path, v5Path string) error {
+	v4DB, err := sql.Open("sqlite", "file:"+v4Path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fmt.Errorf("opening v4 for checkpoint: %w", err)
+	}
+	_, err = v4DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	v4DB.Close()
+	if err != nil {
+		return fmt.Errorf("checkpointing v4 WAL: %w", err)
+	}
+
+	tmpFile, err := os.CreateTemp(dbDir, "gocached-v5-migrate-*.db")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		os.Remove(tmpPath)
+	}()
+
+	src, err := os.Open(v4Path)
+	if err != nil {
+		tmpFile.Close()
+		return err
+	}
+	if _, err := io.Copy(tmpFile, src); err != nil {
+		src.Close()
+		tmpFile.Close()
+		return err
+	}
+	src.Close()
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	tmpDB, err := sql.Open("sqlite", "file:"+tmpPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return err
+	}
+	_, err = tmpDB.Exec(`CREATE TABLE IF NOT EXISTS Sessions (
+		SessionID      TEXT PRIMARY KEY,
+		Claims         TEXT    NOT NULL DEFAULT '{}',
+		LastUsed       INTEGER NOT NULL DEFAULT 0,
+		Gets           INTEGER NOT NULL DEFAULT 0,
+		GetBytes       INTEGER NOT NULL DEFAULT 0,
+		GetHits        INTEGER NOT NULL DEFAULT 0,
+		GetAccessBumps INTEGER NOT NULL DEFAULT 0,
+		GetHitsInline  INTEGER NOT NULL DEFAULT 0,
+		GetNanos       INTEGER NOT NULL DEFAULT 0,
+		GetErrs        INTEGER NOT NULL DEFAULT 0,
+		Puts           INTEGER NOT NULL DEFAULT 0,
+		PutErrs        INTEGER NOT NULL DEFAULT 0,
+		PutsDup        INTEGER NOT NULL DEFAULT 0,
+		PutsBytes      INTEGER NOT NULL DEFAULT 0,
+		PutsInline     INTEGER NOT NULL DEFAULT 0,
+		PutsNanos      INTEGER NOT NULL DEFAULT 0,
+		CreateTime     INTEGER NOT NULL DEFAULT 0
+	) STRICT`)
+	if err != nil {
+		tmpDB.Close()
+		return fmt.Errorf("creating Sessions table: %w", err)
+	}
+	_, err = tmpDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	if err != nil {
+		tmpDB.Close()
+		return fmt.Errorf("checkpointing migrated DB: %w", err)
+	}
+	if err := tmpDB.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpPath, v5Path); err != nil {
+		return err
+	}
+	return nil
+}
+
 // start initializes the server, including defaults and background goroutines.
 func (srv *Server) start() error {
 	srv.shutdownCtx, srv.shutdownCancel = context.WithCancel(srv.shutdownCtx)
@@ -272,6 +377,10 @@ func (srv *Server) start() error {
 		return fmt.Errorf("clean old objects: %w", err)
 	} else if res.Count > 0 {
 		srv.logf("gocached: cleaned %v", res)
+	}
+
+	if err := srv.loadPersistedSessions(); err != nil {
+		return fmt.Errorf("loading persisted sessions: %w", err)
 	}
 
 	if srv.jwtIssuer != "" {
@@ -323,6 +432,48 @@ func (srv *Server) registerMetrics(reg *prometheus.Registry) {
 			}
 		}
 	}
+}
+
+// loadPersistedSessions reads all rows from the Sessions table into the
+// in-memory persistedSessions map.
+func (srv *Server) loadPersistedSessions() error {
+	rows, err := srv.db.Query(`SELECT SessionID, Claims, LastUsed, Gets, GetBytes, GetHits, GetAccessBumps,
+		GetHitsInline, GetNanos, GetErrs, Puts, PutErrs, PutsDup, PutsBytes, PutsInline, PutsNanos, CreateTime
+		FROM Sessions`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	for rows.Next() {
+		var sid, claimsJSON string
+		var lastUsed, createTime int64
+		var s stats
+		if err := rows.Scan(&sid, &claimsJSON, &lastUsed,
+			&s.Gets, &s.GetBytes, &s.GetHits, &s.GetAccessBumps,
+			&s.GetHitsInline, &s.GetNanos, &s.GetErrs,
+			&s.Puts, &s.PutErrs, &s.PutsDup, &s.PutsBytes, &s.PutsInline, &s.PutsNanos,
+			&createTime); err != nil {
+			return err
+		}
+		if lastUsed != 0 {
+			s.LastUsed = time.Unix(lastUsed, 0).UTC()
+		}
+		var claims map[string]any
+		if err := json.Unmarshal([]byte(claimsJSON), &claims); err != nil {
+			srv.logf("loadPersistedSessions: bad claims JSON for %s: %v", sid, err)
+			claims = map[string]any{}
+		}
+		srv.persistedSessions[sid] = &persistedSession{
+			claims:     claims,
+			stats:      s,
+			createTime: time.Unix(createTime, 0).UTC(),
+		}
+	}
+	return rows.Err()
 }
 
 // ServerOption configures a gocached Server.
@@ -404,10 +555,11 @@ func WithGlobalNamespaceJWTClaims(claims map[string]string) ServerOption {
 // the OS user cache directory under $XDG_CACHE_HOME/gocached or equivalent.
 func NewServer(opts ...ServerOption) (*Server, error) {
 	srv := &Server{
-		shutdownCtx: context.Background(),
-		logf:        log.Printf,
-		sessions:    make(map[string]*sessionData),
-		clock:       time.Now,
+		shutdownCtx:       context.Background(),
+		logf:              log.Printf,
+		sessions:          make(map[string]*sessionData),
+		persistedSessions: make(map[string]*persistedSession),
+		clock:             time.Now,
 	}
 	for _, opt := range opts {
 		opt(srv)
@@ -425,6 +577,10 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 // database.
 func (srv *Server) Close() error {
 	srv.shutdownCancel()
+
+	// Flush all active session stats to DB before closing.
+	srv.flushAllSessionStats()
+
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
@@ -458,10 +614,11 @@ type Server struct {
 	jwtClaims       map[string]string // claims required for any JWT to start a session
 	globalJWTClaims map[string]string // additional claims required to write to global namespace
 
-	mu               sync.RWMutex            // guards following fields in this block
-	sessions         map[string]*sessionData // maps access token -> session data.
-	accessDirty      map[actionKey]int64     // action -> accessTime
-	accessFlushTimer *time.Timer             // nil if no flush is scheduled
+	mu                sync.RWMutex                    // guards following fields in this block
+	sessions          map[string]*sessionData         // maps access token -> session data.
+	persistedSessions map[string]*persistedSession    // session ID -> persisted data
+	accessDirty       map[actionKey]int64             // action -> accessTime
+	accessFlushTimer  *time.Timer                     // nil if no flush is scheduled
 
 	// sqliteWriteMu serializes access to SQLite. In theory the SQLite driver
 	// should serialize access with our 5000ms busy timeout, but empirically we
@@ -504,12 +661,70 @@ type Server struct {
 // sessionData corresponds to a specific access token, and is only used if JWT
 // auth is enabled.
 type sessionData struct {
+	sessionID     string         // Deterministic ID computed from JWT grouping claims.
 	expiry        time.Time      // Session valid until.
 	globalNSWrite bool           // Whether this session can write to the cache's global namespace.
 	claims        map[string]any // Claims from the JWT used to create this session, stored for debug.
 
 	mu    sync.Mutex // Guards stats.
 	stats stats
+}
+
+// persistedSession holds session data that has been flushed to SQLite or loaded
+// on startup. The claims are stored so that custom group_by queries can re-hash.
+type persistedSession struct {
+	claims     map[string]any
+	stats      stats
+	createTime time.Time
+}
+
+// defaultGroupingClaims are the JWT claims used to compute a session's
+// deterministic ID. Multiple access tokens whose JWTs match on all these
+// claims map to the same logical session.
+var defaultGroupingClaims = []string{
+	"aud", "check_run_id", "iss", "job_workflow_ref", "job_workflow_sha",
+	"ref", "repository", "repository_id", "run_id", "sha",
+}
+
+// sessionIDFromClaims computes a deterministic hex session ID by extracting the
+// given grouping claims from the JWT claims map, serialising them as canonical
+// JSON (Go's encoding/json sorts map keys), and SHA-256 hashing the result.
+func sessionIDFromClaims(claims map[string]any, groupBy []string) string {
+	m := make(map[string]any, len(groupBy))
+	for _, k := range groupBy {
+		if v, ok := claims[k]; ok {
+			m[k] = v
+		}
+	}
+	b, _ := json.Marshal(m) // encoding/json sorts map keys
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+// addStats returns the field-by-field sum of two stats values, taking the
+// maximum of LastUsed.
+func addStats(a, b stats) stats {
+	r := stats{
+		Gets:           a.Gets + b.Gets,
+		GetBytes:       a.GetBytes + b.GetBytes,
+		GetHits:        a.GetHits + b.GetHits,
+		GetAccessBumps: a.GetAccessBumps + b.GetAccessBumps,
+		GetHitsInline:  a.GetHitsInline + b.GetHitsInline,
+		GetNanos:       a.GetNanos + b.GetNanos,
+		GetErrs:        a.GetErrs + b.GetErrs,
+		Puts:           a.Puts + b.Puts,
+		PutErrs:        a.PutErrs + b.PutErrs,
+		PutsDup:        a.PutsDup + b.PutsDup,
+		PutsBytes:      a.PutsBytes + b.PutsBytes,
+		PutsInline:     a.PutsInline + b.PutsInline,
+		PutsNanos:      a.PutsNanos + b.PutsNanos,
+	}
+	if a.LastUsed.After(b.LastUsed) {
+		r.LastUsed = a.LastUsed
+	} else {
+		r.LastUsed = b.LastUsed
+	}
+	return r
 }
 
 // stats holds per-request or per-session stats which get rolled up into server
@@ -633,7 +848,7 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if sessionData != nil && r.URL.Path == "/session/stats" {
-		srv.handleSessionStats(w, sessionData)
+		srv.handleSessionStats(w, sessionData, r)
 		return
 	}
 	http.Error(w, "not found", http.StatusNotFound)
@@ -1124,14 +1339,28 @@ func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sid := sessionIDFromClaims(jwtClaims, defaultGroupingClaims)
+
 	const ttl = time.Hour
 	// 52 base32 characters, 256 bits of entropy.
 	accessToken := tokenPrefix + strings.ToLower(rand.Text()+rand.Text())
 	srv.addSessionData(accessToken, &sessionData{
+		sessionID:     sid,
 		expiry:        srv.now().UTC().Add(ttl),
 		globalNSWrite: globalNSWrite,
 		claims:        jwtClaims,
 	})
+
+	// Ensure the persisted session exists in memory and DB.
+	srv.mu.Lock()
+	if _, ok := srv.persistedSessions[sid]; !ok {
+		srv.persistedSessions[sid] = &persistedSession{
+			claims:     jwtClaims,
+			createTime: srv.now().UTC(),
+		}
+	}
+	srv.mu.Unlock()
+	srv.upsertSessionRow(sid, jwtClaims)
 
 	resp := map[string]any{
 		"access_token": accessToken,
@@ -1176,11 +1405,128 @@ func findMissingClaims(wantClaims map[string]string, gotClaims map[string]any) m
 	return missing
 }
 
-func (srv *Server) handleSessionStats(w http.ResponseWriter, sessionData *sessionData) {
+func (srv *Server) handleSessionStats(w http.ResponseWriter, sd *sessionData, r *http.Request) {
+	groupBy := defaultGroupingClaims
+	if q := r.URL.Query().Get("group_by"); q != "" {
+		groupBy = strings.Split(q, ",")
+	}
+	targetSID := sessionIDFromClaims(sd.claims, groupBy)
+
+	var combined stats
+
+	// Sum from persisted sessions.
+	srv.mu.RLock()
+	for sid, ps := range srv.persistedSessions {
+		reSID := sessionIDFromClaims(ps.claims, groupBy)
+		if reSID == targetSID {
+			_ = sid
+			combined = addStats(combined, ps.stats)
+		}
+	}
+	// Sum from active in-memory sessions.
+	for _, s := range srv.sessions {
+		reSID := sessionIDFromClaims(s.claims, groupBy)
+		if reSID == targetSID {
+			s.mu.Lock()
+			combined = addStats(combined, s.stats)
+			s.mu.Unlock()
+		}
+	}
+	srv.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(sessionData.stats); err != nil {
+	if err := json.NewEncoder(w).Encode(combined); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+}
+
+// upsertSessionRow inserts or updates a session row with claims only (no
+// stats). Called during token exchange.
+func (srv *Server) upsertSessionRow(sessionID string, claims map[string]any) {
+	claimsJSON, _ := json.Marshal(claims)
+	srv.sqliteWriteMu.Lock()
+	defer srv.sqliteWriteMu.Unlock()
+	_, err := srv.db.Exec(`INSERT INTO Sessions (SessionID, Claims, CreateTime)
+		VALUES (?, ?, ?)
+		ON CONFLICT(SessionID) DO UPDATE SET Claims = excluded.Claims`,
+		sessionID, string(claimsJSON), srv.now().Unix())
+	if err != nil {
+		srv.logf("upsertSessionRow: %v", err)
+	}
+}
+
+// upsertSessionStatsDB additively flushes delta stats to the Sessions table.
+func (srv *Server) upsertSessionStatsDB(sessionID string, delta stats) {
+	srv.sqliteWriteMu.Lock()
+	defer srv.sqliteWriteMu.Unlock()
+	_, err := srv.db.Exec(`INSERT INTO Sessions
+		(SessionID, LastUsed, Gets, GetBytes, GetHits, GetAccessBumps, GetHitsInline, GetNanos, GetErrs,
+		 Puts, PutErrs, PutsDup, PutsBytes, PutsInline, PutsNanos)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(SessionID) DO UPDATE SET
+			LastUsed       = max(Sessions.LastUsed, excluded.LastUsed),
+			Gets           = Sessions.Gets + excluded.Gets,
+			GetBytes       = Sessions.GetBytes + excluded.GetBytes,
+			GetHits        = Sessions.GetHits + excluded.GetHits,
+			GetAccessBumps = Sessions.GetAccessBumps + excluded.GetAccessBumps,
+			GetHitsInline  = Sessions.GetHitsInline + excluded.GetHitsInline,
+			GetNanos       = Sessions.GetNanos + excluded.GetNanos,
+			GetErrs        = Sessions.GetErrs + excluded.GetErrs,
+			Puts           = Sessions.Puts + excluded.Puts,
+			PutErrs        = Sessions.PutErrs + excluded.PutErrs,
+			PutsDup        = Sessions.PutsDup + excluded.PutsDup,
+			PutsBytes      = Sessions.PutsBytes + excluded.PutsBytes,
+			PutsInline     = Sessions.PutsInline + excluded.PutsInline,
+			PutsNanos      = Sessions.PutsNanos + excluded.PutsNanos`,
+		sessionID, delta.LastUsed.Unix(),
+		delta.Gets, delta.GetBytes, delta.GetHits, delta.GetAccessBumps, delta.GetHitsInline, delta.GetNanos, delta.GetErrs,
+		delta.Puts, delta.PutErrs, delta.PutsDup, delta.PutsBytes, delta.PutsInline, delta.PutsNanos)
+	if err != nil {
+		srv.logf("upsertSessionStatsDB: %v", err)
+	}
+}
+
+// flushSessionStats copies stats from a sessionData into the in-memory
+// persistedSessions map and the SQLite Sessions table.
+func (srv *Server) flushSessionStats(sd *sessionData) {
+	sd.mu.Lock()
+	delta := sd.stats
+	sd.stats = stats{} // reset after copying
+	sd.mu.Unlock()
+
+	if delta == (stats{}) {
+		return
+	}
+
+	sid := sd.sessionID
+	srv.mu.Lock()
+	ps, ok := srv.persistedSessions[sid]
+	if !ok {
+		ps = &persistedSession{
+			claims:     sd.claims,
+			createTime: srv.now().UTC(),
+		}
+		srv.persistedSessions[sid] = ps
+	}
+	ps.stats = addStats(ps.stats, delta)
+	srv.mu.Unlock()
+
+	srv.upsertSessionStatsDB(sid, delta)
+}
+
+// flushAllSessionStats flushes stats from all active sessions. Called during
+// shutdown.
+func (srv *Server) flushAllSessionStats() {
+	srv.mu.RLock()
+	sessions := make([]*sessionData, 0, len(srv.sessions))
+	for _, sd := range srv.sessions {
+		sessions = append(sessions, sd)
+	}
+	srv.mu.RUnlock()
+
+	for _, sd := range sessions {
+		srv.flushSessionStats(sd)
 	}
 }
 
@@ -1590,19 +1936,26 @@ func (srv *Server) runCleanSessionsLoop() {
 		case <-time.After(time.Hour):
 		}
 
+		// Collect expired sessions.
 		srv.mu.Lock()
 		count := len(srv.sessions)
-		var deleted int
-		for token, metadata := range srv.sessions {
-			if time.Now().After(metadata.expiry) {
+		var expired []*sessionData
+		for token, sd := range srv.sessions {
+			if srv.now().After(sd.expiry) {
+				expired = append(expired, sd)
 				delete(srv.sessions, token)
-				deleted++
 				srv.m.Sessions.Add(-1)
 			}
 		}
 		srv.mu.Unlock()
+
+		// Flush stats from expired sessions outside of the lock.
+		for _, sd := range expired {
+			srv.flushSessionStats(sd)
+		}
+
 		if count > 0 {
-			srv.logf("cleaned up %d/%d access tokens", deleted, count)
+			srv.logf("cleaned up %d/%d access tokens", len(expired), count)
 		}
 	}
 }
@@ -1679,48 +2032,82 @@ func (srv *Server) serveUsage(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "</table>\n")
 }
 
+type groupedSession struct {
+	claims           map[string]any
+	stats            stats
+	activeTokenCount int
+}
+
 func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "bad method", http.StatusMethodNotAllowed)
 		return
 	}
 
+	groupBy := defaultGroupingClaims
+	if q := r.URL.Query().Get("group_by"); q != "" {
+		groupBy = strings.Split(q, ",")
+	}
+
+	grouped := make(map[string]*groupedSession)
+
 	srv.mu.RLock()
-	// Make a copy of all session data (excluding the mutex).
-	sessions := make([]*sessionData, 0, len(srv.sessions))
-	for _, v := range srv.sessions {
-		v.mu.Lock()
-		sessions = append(sessions, &sessionData{
-			expiry:        v.expiry,
-			globalNSWrite: v.globalNSWrite,
-			claims:        v.claims,
-			stats:         v.stats,
-		})
-		v.mu.Unlock()
+	// First pass: persisted sessions.
+	for _, ps := range srv.persistedSessions {
+		sid := sessionIDFromClaims(ps.claims, groupBy)
+		gs, ok := grouped[sid]
+		if !ok {
+			gs = &groupedSession{claims: ps.claims}
+			grouped[sid] = gs
+		}
+		gs.stats = addStats(gs.stats, ps.stats)
+	}
+	// Second pass: active in-memory sessions.
+	for _, sd := range srv.sessions {
+		sid := sessionIDFromClaims(sd.claims, groupBy)
+		gs, ok := grouped[sid]
+		if !ok {
+			gs = &groupedSession{claims: sd.claims}
+			grouped[sid] = gs
+		}
+		sd.mu.Lock()
+		gs.stats = addStats(gs.stats, sd.stats)
+		sd.mu.Unlock()
+		gs.activeTokenCount++
 	}
 	srv.mu.RUnlock()
+
+	// Sort by last used (descending).
+	type entry struct {
+		sid string
+		gs  *groupedSession
+	}
+	entries := make([]entry, 0, len(grouped))
+	for sid, gs := range grouped {
+		entries = append(entries, entry{sid, gs})
+	}
+	slices.SortFunc(entries, func(a, b entry) int {
+		return a.gs.stats.LastUsed.Compare(b.gs.stats.LastUsed)
+	})
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<html><body><h1>gocached sessions</h1>\n")
 	fmt.Fprintf(w, "<p>JWT issuer: %s</p>\n", srv.jwtIssuer)
 	fmt.Fprintf(w, "<p>JWT claims required: %v</p>\n", srv.jwtClaims)
 	fmt.Fprintf(w, "<p>JWT global write claims required: %v</p>\n", srv.globalJWTClaims)
-	fmt.Fprintf(w, "<p>Number of sessions: %d</p>\n", len(sessions))
+	fmt.Fprintf(w, "<p>Number of grouped sessions: %d</p>\n", len(entries))
 
 	fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")
-	fmt.Fprintf(w, "<tr><th>Last used</th><th>Expiry time</th><th>Global write</th><th>Stats</th><th>Claims</th></tr>\n")
-	slices.SortFunc(sessions, func(a, b *sessionData) int {
-		return a.stats.LastUsed.Compare(b.stats.LastUsed)
-	})
-	for _, d := range slices.Backward(sessions) {
+	fmt.Fprintf(w, "<tr><th>Last used</th><th>Active tokens</th><th>Stats</th><th>Claims</th></tr>\n")
+	for _, e := range slices.Backward(entries) {
 		lastUsed := "never"
-		if !d.stats.LastUsed.IsZero() {
-			lastUsed = durFmt(time.Since(d.stats.LastUsed)) + " ago"
+		if !e.gs.stats.LastUsed.IsZero() {
+			lastUsed = durFmt(time.Since(e.gs.stats.LastUsed)) + " ago"
 		}
-		statsJSON, _ := json.MarshalIndent(d.stats, "", "  ")
-		claimsJSON, _ := json.MarshalIndent(d.claims, "", "  ")
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%v</td><td><pre>%s</pre></td><td><pre>%s</pre></td></tr>\n",
-			lastUsed, d.expiry.Format(time.RFC3339), d.globalNSWrite, statsJSON, claimsJSON)
+		statsJSON, _ := json.MarshalIndent(e.gs.stats, "", "  ")
+		claimsJSON, _ := json.MarshalIndent(e.gs.claims, "", "  ")
+		fmt.Fprintf(w, "<tr><td>%s</td><td>%d</td><td><pre>%s</pre></td><td><pre>%s</pre></td></tr>\n",
+			lastUsed, e.gs.activeTokenCount, statsJSON, claimsJSON)
 	}
 	fmt.Fprintf(w, "</table>\n")
 }
