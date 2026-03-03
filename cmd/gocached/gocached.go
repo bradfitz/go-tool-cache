@@ -71,10 +71,11 @@ func main() {
 		maps.Copy(globalClaims, jwtClaims)
 		maps.Copy(globalClaims, globalJWTClaims)
 
-		opts = append(opts,
-			gocached.WithJWTAuth(*jwtIssuer, jwtClaims),
-			gocached.WithGlobalNamespaceJWTClaims(globalClaims),
-		)
+		opts = append(opts, gocached.WithJWTAuth(gocached.JWTIssuerConfig{
+			Issuer:            *jwtIssuer,
+			RequiredClaims:    jwtClaims,
+			GlobalWriteClaims: globalClaims,
+		}))
 	}
 
 	srv, err := gocached.NewServer(opts...)
