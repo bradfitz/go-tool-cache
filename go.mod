@@ -3,6 +3,7 @@ module github.com/bradfitz/go-tool-cache
 go 1.24.0
 
 require (
+	github.com/bradfitz/parentdeath v0.0.0-20260315043412-764506aeb900
 	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/google/go-cmp v0.7.0

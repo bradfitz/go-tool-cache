@@ -12,10 +12,12 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/bradfitz/go-tool-cache/gocached"
+	"github.com/bradfitz/parentdeath"
 	_ "modernc.org/sqlite"
 )
 
@@ -54,6 +56,11 @@ func main() {
 	flag.Var(&jwtClaims, "jwt-claim", "a claim in the form x=y that any JWT presented must have to start a session; may be specified more than once")
 	flag.Var(&globalJWTClaims, "global-jwt-claim", "an additional claim in the form x=y that a JWT must have to allow writing to the cache's global namespace; may be specified more than once")
 	flag.Parse()
+
+	parentdeath.Monitor(func() {
+		log.Printf("gocached: parent process died, exiting")
+		os.Exit(0)
+	})
 
 	opts := []gocached.ServerOption{
 		gocached.WithDir(*dir),
