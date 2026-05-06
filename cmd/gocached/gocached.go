@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -77,15 +76,27 @@ func main() {
 			log.Fatal("must specify --jwt-claim at least once when --jwt-issuer is set")
 		}
 
-		globalClaims := map[string]string{}
-		maps.Copy(globalClaims, jwtClaims)
-		maps.Copy(globalClaims, globalJWTClaims)
-
-		opts = append(opts, gocached.WithJWTAuth(gocached.JWTIssuerConfig{
-			Issuer:            *jwtIssuer,
-			RequiredClaims:    jwtClaims,
-			GlobalWriteClaims: globalClaims,
-		}))
+		opts = append(opts,
+			gocached.WithJWTAuth(*jwtIssuer),
+			gocached.WithNamespaceMapping(func(claims map[string]any) (gocached.Namespace, error) {
+				var ns gocached.Namespace
+				for k, want := range jwtClaims {
+					if got := claims[k]; got != want {
+						return "", fmt.Errorf("claim %q = %v, want %v", k, got, want)
+					}
+					if ns != "" {
+						ns += ","
+					}
+					ns += gocached.Namespace(fmt.Sprintf("%s=%s", k, want))
+				}
+				for k, want := range globalJWTClaims {
+					if got := claims[k]; got != want {
+						return ns, nil
+					}
+				}
+				return gocached.GlobalNamespace, nil
+			}),
+		)
 	}
 
 	srv, err := gocached.NewServer(opts...)
