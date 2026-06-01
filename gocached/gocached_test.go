@@ -614,6 +614,67 @@ func TestLZ4Storage(t *testing.T) {
 	}
 }
 
+func TestWALCheckpoint(t *testing.T) {
+	st := newServerTester(t)
+	ctx := context.Background()
+
+	walPath := filepath.Join(st.srv.dir, fmt.Sprintf("gocached-v%d.db-wal", schemaVersion))
+
+	// Generate enough write traffic for the WAL to be a few pages large.
+	// The exact number isn't important; we just want it big enough that
+	// "shrank to nearly empty" is a meaningful observation.
+	for i := range 500 {
+		if _, err := st.srv.db.ExecContext(ctx,
+			`INSERT INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime) VALUES (0, ?, 0, '', 0, 0)`,
+			fmt.Sprintf("%032x", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL: %v", err)
+	}
+	t.Logf("WAL before checkpoint: %d bytes", before.Size())
+	if before.Size() < 4096 {
+		// 500 row inserts should leave at least one full WAL page even after
+		// the periodic autocheckpoint reuses space in place. A tiny WAL here
+		// means the test isn't actually exercising the truncation path.
+		t.Fatalf("WAL only %d bytes before checkpoint; expected meaningful traffic", before.Size())
+	}
+
+	st.srv.updateDBSizeMetrics()
+	if got := st.srv.m.SQLiteWALBytes.Value(); got != before.Size() {
+		t.Errorf("sqlite_wal_bytes gauge before checkpoint: got %d, want %d", got, before.Size())
+	}
+	if got := st.srv.m.SQLiteDataBytes.Value(); got <= 0 {
+		t.Errorf("sqlite_data_bytes gauge: got %d, want > 0", got)
+	}
+
+	busy, log, ckpt, err := st.srv.checkpointTruncate(ctx)
+	if err != nil {
+		t.Fatalf("checkpointTruncate: %v", err)
+	}
+	if busy != 0 || log != ckpt {
+		t.Errorf("checkpoint not fully applied: busy=%d log=%d ckpt=%d", busy, log, ckpt)
+	}
+
+	after, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL after checkpoint: %v", err)
+	}
+	t.Logf("WAL after checkpoint: %d bytes", after.Size())
+	// TRUNCATE checkpoint with no concurrent readers truncates the WAL to 0.
+	if after.Size() != 0 {
+		t.Errorf("WAL not truncated: got %d bytes, want 0", after.Size())
+	}
+
+	st.srv.updateDBSizeMetrics()
+	if got := st.srv.m.SQLiteWALBytes.Value(); got != 0 {
+		t.Errorf("sqlite_wal_bytes gauge after checkpoint: got %d, want 0", got)
+	}
+}
+
 func TestClientConnReuse(t *testing.T) {
 	st := newServerTester(t)
 
