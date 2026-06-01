@@ -92,6 +92,27 @@ const (
 
 const schemaVersion = 4
 
+// walJournalSizeLimit caps the on-disk WAL size after a successful
+// checkpoint. It is set as a per-connection PRAGMA so that even SQLite's
+// built-in PASSIVE autocheckpoint, which would otherwise leave the file at
+// its high-water mark, truncates the WAL down to this size. Without it the
+// WAL can grow without bound under continuous write traffic and never
+// shrink, even when frames are being checkpointed in place.
+const walJournalSizeLimit = 1 << 30 // 1 GiB
+
+// checkpointInterval is how often [Server.runCheckpointLoop] runs a TRUNCATE
+// checkpoint in the background. SQLite's autocheckpoint only runs PASSIVE
+// checkpoints (which reuse WAL space in place but never shrink the file on
+// disk past walJournalSizeLimit); a periodic explicit TRUNCATE is what
+// actually keeps the file small in steady state.
+const checkpointInterval = time.Minute
+
+// dbSizeMetricsInterval is how often [Server.runDBSizeMetricsLoop] re-stats
+// the SQLite files to update the size gauges. It is intentionally shorter
+// than checkpointInterval so the gauge sees the WAL grow between checkpoints,
+// not just snap back to zero each minute.
+const dbSizeMetricsInterval = 15 * time.Second
+
 const schema = `
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS Actions (
@@ -146,7 +167,9 @@ func openDB(dbDir string) (*sql.DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_size_limit(%d)",
+		dbPath, walJournalSizeLimit)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +273,18 @@ func (srv *Server) start() error {
 	}
 	srv.db = db
 
+	// Run a TRUNCATE checkpoint up front, before any other reader can pin a
+	// snapshot. If the WAL on disk is large (e.g. from a prior version of
+	// gocached that lacked the periodic checkpointer), this is what actually
+	// shrinks it.
+	ckCtx, ckCancel := context.WithTimeout(srv.shutdownCtx, 2*time.Minute)
+	if busy, log, ckpt, err := srv.checkpointTruncate(ckCtx); err != nil {
+		srv.logf("startup wal_checkpoint(TRUNCATE) error: %v", err)
+	} else {
+		srv.logf("startup wal_checkpoint(TRUNCATE): busy=%d log=%d ckpt=%d", busy, log, ckpt)
+	}
+	ckCancel()
+
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -293,6 +328,8 @@ func (srv *Server) start() error {
 	}
 
 	go srv.runCleanLoop()
+	go srv.runCheckpointLoop()
+	go srv.runDBSizeMetricsLoop()
 
 	return nil
 }
@@ -457,6 +494,15 @@ func (srv *Server) Close() error {
 		err = errors.Join(err, srv.writeConn.Close())
 	}
 
+	// Final TRUNCATE checkpoint so the WAL doesn't linger on disk past
+	// shutdown. Use context.Background because srv.shutdownCtx has already
+	// been canceled.
+	ckCtx, ckCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	if _, _, _, ckErr := srv.checkpointTruncate(ckCtx); ckErr != nil {
+		err = errors.Join(err, fmt.Errorf("final wal_checkpoint: %w", ckErr))
+	}
+	ckCancel()
+
 	return errors.Join(err, srv.db.Close())
 }
 
@@ -517,6 +563,9 @@ type Server struct {
 		Sessions       expvar.Int `type:"gauge" name:"sessions" help:"number of active authenticated sessions"`
 		Auths          expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
 		AuthErrs       expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
+
+		SQLiteDataBytes expvar.Int `type:"gauge" name:"sqlite_data_bytes" help:"size in bytes of the SQLite main database file on disk"`
+		SQLiteWALBytes  expvar.Int `type:"gauge" name:"sqlite_wal_bytes" help:"size in bytes of the SQLite WAL file on disk; should stay bounded near walJournalSizeLimit"`
 	}
 }
 
@@ -1585,6 +1634,98 @@ func (srv *Server) cleanOldObjects(us *usageStats) (countAndSize, error) {
 	}
 
 	return ret, nil
+}
+
+// checkpointTruncate runs PRAGMA wal_checkpoint(TRUNCATE) and returns SQLite's
+// three result columns. A fully-applied checkpoint returns busy=0 and
+// logFrames==ckptFrames; otherwise some frames remain in the WAL because of a
+// concurrent reader pinning an older snapshot.
+func (srv *Server) checkpointTruncate(ctx context.Context) (busy, logFrames, ckptFrames int, err error) {
+	err = srv.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &ckptFrames)
+	return busy, logFrames, ckptFrames, err
+}
+
+// runCheckpointLoop periodically runs a TRUNCATE checkpoint to keep the WAL
+// bounded on disk. SQLite's autocheckpoint only runs PASSIVE checkpoints, which
+// reuse WAL space in place but never shrink the file; without this loop the WAL
+// can grow without bound under continuous traffic.
+func (srv *Server) runCheckpointLoop() {
+	t := time.NewTicker(checkpointInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-srv.shutdownCtx.Done():
+			return
+		case <-t.C:
+		}
+		ctx, cancel := context.WithTimeout(srv.shutdownCtx, 2*time.Minute)
+		busy, logFrames, ckptFrames, err := srv.checkpointTruncate(ctx)
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			srv.logf("wal_checkpoint(TRUNCATE) error: %v", err)
+			continue
+		}
+		if busy != 0 || logFrames != ckptFrames {
+			// A reader is pinning frames; we'll catch up next tick. Logged
+			// because persistent partial checkpoints mean walJournalSizeLimit
+			// is the only thing keeping the file bounded, and we'd want to
+			// investigate.
+			srv.logf("wal_checkpoint(TRUNCATE) partial: busy=%d log=%d ckpt=%d", busy, logFrames, ckptFrames)
+		} else if srv.verbose {
+			srv.logf("wal_checkpoint(TRUNCATE): log=%d ckpt=%d", logFrames, ckptFrames)
+		}
+		// Refresh the size gauges immediately so dashboards see the
+		// post-truncate values without waiting for the next sampler tick.
+		srv.updateDBSizeMetrics()
+	}
+}
+
+// dbPath returns the on-disk path of the SQLite main database file.
+// The WAL file is at dbPath() + "-wal".
+func (srv *Server) dbPath() string {
+	return filepath.Join(srv.dir, fmt.Sprintf("gocached-v%d.db", schemaVersion))
+}
+
+// updateDBSizeMetrics re-stats the SQLite files and updates the size gauges.
+// A missing WAL file (e.g. on a fresh DB before the first write flushes) is
+// reported as zero bytes. Other stat errors are logged but don't update the
+// gauge, so a transient filesystem hiccup leaves the last-known value visible.
+func (srv *Server) updateDBSizeMetrics() {
+	dbPath := srv.dbPath()
+	if fi, err := os.Stat(dbPath); err == nil {
+		srv.m.SQLiteDataBytes.Set(fi.Size())
+	} else {
+		srv.logf("stat %s: %v", dbPath, err)
+	}
+	walPath := dbPath + "-wal"
+	switch fi, err := os.Stat(walPath); {
+	case err == nil:
+		srv.m.SQLiteWALBytes.Set(fi.Size())
+	case errors.Is(err, os.ErrNotExist):
+		srv.m.SQLiteWALBytes.Set(0)
+	default:
+		srv.logf("stat %s: %v", walPath, err)
+	}
+}
+
+// runDBSizeMetricsLoop samples the SQLite file sizes more frequently than the
+// checkpoint loop runs, so the WAL gauge captures inter-checkpoint growth
+// rather than only the post-truncate values.
+func (srv *Server) runDBSizeMetricsLoop() {
+	t := time.NewTicker(dbSizeMetricsInterval)
+	defer t.Stop()
+	srv.updateDBSizeMetrics() // seed an initial sample at startup
+	for {
+		select {
+		case <-srv.shutdownCtx.Done():
+			return
+		case <-t.C:
+		}
+		srv.updateDBSizeMetrics()
+	}
 }
 
 func (srv *Server) runCleanLoop() {
