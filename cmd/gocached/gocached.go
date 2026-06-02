@@ -30,6 +30,8 @@ var (
 	maxSize = flag.Int("max-size-gb", 50, "maximum size of the cache in GiB; 0 means no limit")
 	maxAge  = flag.Int("max-age-days", 60, "maximum age of objects in the cache in days; 0 means no limit")
 
+	shardPrefixLen = flag.Int("shard-prefix-len", 2, "number of SHA256 hex characters per usage-stats shard key (valid 1..4); total shards = 16^n. Defaults to 2 (256 shards). Increase if a single shard's stats scan becomes too slow on a large DB")
+
 	jwtIssuer = flag.String("jwt-issuer", "", "the issuer to trust JWTs from; if set, all requests will require auth, and must set at least one -jwt-claim")
 	// See example GitHub token claims for what can be available:
 	// https://docs.github.com/en/actions/concepts/security/openid-connect
@@ -67,6 +69,7 @@ func main() {
 		gocached.WithVerbose(*verbose),
 		gocached.WithMaxSize(int64(*maxSize) << 30),
 		gocached.WithMaxAge(time.Duration(*maxAge) * 24 * time.Hour),
+		gocached.WithShardPrefixLen(*shardPrefixLen),
 	}
 
 	if *jwtIssuer != "" {

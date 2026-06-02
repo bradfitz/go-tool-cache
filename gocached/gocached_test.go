@@ -78,6 +78,13 @@ func (t *tester) mkClient() *cachers.HTTPClient {
 
 func (st *tester) usageStats() *usageStats {
 	st.t.Helper()
+	// Stats are maintained by an async per-shard stats loop in production. Tests
+	// need a deterministic aggregate, so flush pending access-time bumps and
+	// rotate every shard before reading.
+	st.srv.flushAccessTimeBumps()
+	if err := st.srv.scanAllShards(context.Background()); err != nil {
+		st.t.Fatalf("scanAllShards: %v", err)
+	}
 	stats, err := st.srv.usageStats()
 	if err != nil {
 		st.t.Fatalf("usageStats: %v", err)
@@ -85,13 +92,26 @@ func (st *tester) usageStats() *usageStats {
 	return stats
 }
 
+// cleanOldObjects runs cleanup until it's a no-op, so tests get a fully
+// drained eviction in one call. Updates the aggregate (via a forced shard
+// rescan) between batches so the cleanupTick's "are we over budget" check
+// sees the post-eviction state, not stale pre-eviction shard data.
 func (st *tester) cleanOldObjects() countAndSize {
 	st.t.Helper()
-	stats, err := st.srv.cleanOldObjects(st.usageStats())
-	if err != nil {
-		st.t.Fatalf("cleanOldObjects: %v", err)
+	var total countAndSize
+	ctx := context.Background()
+	for {
+		_ = st.usageStats()
+		res, err := st.srv.cleanupTick(ctx)
+		if err != nil {
+			st.t.Fatalf("cleanupTick: %v", err)
+		}
+		if res.Count == 0 {
+			return total
+		}
+		total.Count += res.Count
+		total.Size += res.Size
 	}
-	return stats
 }
 
 func (st *tester) diskFiles() []string {
@@ -205,6 +225,18 @@ func withClock(clk func() time.Time) ServerOption {
 	}
 }
 
+// withoutBackgroundLoops disables every periodic goroutine that start would
+// otherwise launch (stats loop, cleanup, checkpoint, DB-size metrics).
+// Tests need this because the mocked clock makes scannedAt collide across
+// concurrent scans, so a background scan can overwrite a freshly-PUT
+// shard with a stale-snapshot empty result. Tests drive scanShard /
+// cleanupTick / etc. synchronously instead.
+func withoutBackgroundLoops() ServerOption {
+	return func(cfg *Server) {
+		cfg.disableBackgroundLoops = true
+	}
+}
+
 func newServerTester(t testing.TB, extraOpts ...ServerOption) *tester {
 	st := &tester{
 		t:       t,
@@ -216,6 +248,13 @@ func newServerTester(t testing.TB, extraOpts ...ServerOption) *tester {
 		WithLogf(t.Logf),
 		WithVerbose(true),
 		withClock(st.now),
+		withoutBackgroundLoops(),
+		// Default to 16 shards instead of production's 256 to keep
+		// scanAllShards fast in tests (each shard is a separate SQL
+		// round-trip; on near-empty tables overhead dominates). Tests
+		// that need a specific shardPrefixLen pass WithShardPrefixLen
+		// in extraOpts to override.
+		WithShardPrefixLen(1),
 	}
 	srv, err := NewServer(append(opts, extraOpts...)...)
 	if err != nil {
@@ -336,11 +375,9 @@ func TestServer(t *testing.T) {
 	st.wantGet(c3, testActionID, testOutputID, testObjectValue)
 	st.wantMetric(&st.srv.m.GetAccessBumps, 1)
 
-	// Get usage stats.
-	stats, err := st.srv.usageStats()
-	if err != nil {
-		t.Fatalf("usageStats: %v", err)
-	}
+	// Get usage stats. The tester helper flushes pending access-time bumps
+	// and rotates every shard so the aggregate is deterministic.
+	stats := st.usageStats()
 	bigStored := int64(len(testObjectValueBig)) // below lz4CompressThreshold, stored uncompressed
 	totalSize := int64(9) + bigStored           // 9 (inline "test data") + big + 0 (empty)
 	want := &usageStats{
@@ -363,64 +400,204 @@ func TestServer(t *testing.T) {
 	st.advanceClock(relAtimeSeconds * 2 * time.Second) // advance clock by 2 days
 }
 
-func TestCleanCandidates(t *testing.T) {
+// TestEvictionQueryPlan is the lockdown test for the eviction query: it
+// runs EXPLAIN QUERY PLAN and asserts SQLite uses idx_actions_access and
+// never does a SCAN of the Actions table. INDEXED BY in the query already
+// forces this at runtime, but the test catches schema or query drift early
+// (and gives a concrete failure message instead of a runtime SQL error).
+func TestEvictionQueryPlan(t *testing.T) {
+	st := newServerTester(t)
+	row := st.srv.db.QueryRow("EXPLAIN QUERY PLAN "+evictionCandidateQuery, 0, 1)
+	var id, parent, notused int
+	var detail string
+	if err := row.Scan(&id, &parent, &notused, &detail); err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	t.Logf("plan: %s", detail)
+	if !strings.Contains(detail, "idx_actions_access") {
+		t.Errorf("plan does not use idx_actions_access: %q", detail)
+	}
+	if strings.Contains(detail, "SCAN Actions") || strings.Contains(detail, "SCAN TABLE Actions") {
+		t.Errorf("plan does a table scan of Actions: %q", detail)
+	}
+}
+
+func TestEvictOldestActions(t *testing.T) {
+	st := newServerTester(t)
+	ctx := context.Background()
+
+	// Four unique blobs (different content => different SHA256 => different
+	// BlobID), inserted 24h apart so AccessTime order matches insert order.
+	c := st.mkClient()
+	st.wantPut(c, "0001", "9901", "1")
+	st.advanceClock(24 * time.Hour)
+	st.wantPut(c, "0002", "9902", "22")
+	st.advanceClock(24 * time.Hour)
+	st.wantPut(c, "0003", "9903", "333")
+	st.advanceClock(24 * time.Hour)
+	st.wantPut(c, "0004", "9904", "4444")
+
+	// All four should still be on disk.
+	if got, want := len(st.diskFiles()), 0; got != want {
+		// All four are <= smallObjectSize, so they're inline in the DB,
+		// not on disk. Confirms the test isn't accidentally on the disk path.
+		t.Errorf("diskFiles before evict: %d, want %d (all should be inline)", got, want)
+	}
+
+	// Cutoff lets only the two oldest (1 and 22) through. limit=10 is generous.
+	res, err := st.srv.evictOldestActions(ctx, st.srv.now().Add(-25*time.Hour).Unix(), 10, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("evictOldestActions: %v", err)
+	}
+	// 1:1 blobs => evicting Actions evicts Blobs too.
+	if want := (countAndSize{Count: 2, Size: 3}); res != want {
+		t.Errorf("evict result = %+v, want %+v", res, want)
+	}
+
+	// Now no cutoff (math.MaxInt64) but limit=1: just the next-oldest ("333").
+	res, err = st.srv.evictOldestActions(ctx, math.MaxInt64, 1, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("evictOldestActions: %v", err)
+	}
+	if want := (countAndSize{Count: 1, Size: 3}); res != want {
+		t.Errorf("evict result = %+v, want %+v", res, want)
+	}
+}
+
+// TestActionLRUSharedBlob locks in the Action-LRU semantic on shared blobs:
+// when two Actions point at the same Blob, evicting the old Action leaves
+// the Blob alive (because the fresh Action still references it).
+func TestActionLRUSharedBlob(t *testing.T) {
+	st := newServerTester(t)
+	ctx := context.Background()
+
+	c := st.mkClient()
+	const content = "shared-blob-content"
+	// Two distinct ActionIDs but identical content => identical SHA256 =>
+	// the same BlobID. Action 0001 is inserted "two days ago", 0002 today.
+	st.wantPut(c, "0001", "9901", content)
+	st.advanceClock(48 * time.Hour)
+	st.wantPut(c, "0002", "9902", content)
+
+	// Evict everything older than 25h. Action-LRU: the old 0001 Action
+	// must go, but the Blob stays because 0002 still references it.
+	res, err := st.srv.evictOldestActions(ctx, st.srv.now().Add(-25*time.Hour).Unix(), 10, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("evictOldestActions: %v", err)
+	}
+	if got, want := res.Count, int64(0); got != want {
+		t.Errorf("evicted Blob count = %d, want %d (Blob still has a fresher Action)", got, want)
+	}
+	var actionCount int
+	if err := st.srv.db.QueryRow(`SELECT COUNT(*) FROM Actions`).Scan(&actionCount); err != nil {
+		t.Fatal(err)
+	}
+	if actionCount != 1 {
+		t.Errorf("Actions count after evict = %d, want 1 (0001 evicted, 0002 alive)", actionCount)
+	}
+	var blobCount int
+	if err := st.srv.db.QueryRow(`SELECT COUNT(*) FROM Blobs`).Scan(&blobCount); err != nil {
+		t.Fatal(err)
+	}
+	if blobCount != 1 {
+		t.Errorf("Blobs count after evict = %d, want 1 (Blob shared with 0002, stays)", blobCount)
+	}
+}
+
+func TestShardDeltaPUT(t *testing.T) {
 	st := newServerTester(t)
 
-	// Populate some data.
-	c1 := st.mkClient()
-	st.wantPut(c1, "0001", "9901", "1")
-	st.advanceClock(24 * time.Hour)
-	st.wantPut(c1, "0002", "9902", "22")
-	st.advanceClock(24 * time.Hour)
-	st.wantPut(c1, "0003", "9903", "333")
-	st.advanceClock(24 * time.Hour)
-	st.wantPut(c1, "0004", "9904", strings.Repeat("x", smallObjectSize+1))
-
-	const day = 24 * time.Hour
-
-	tests := []struct {
-		maxAge time.Duration
-		limit  int64
-		want   []cleanCandidate
-	}{
-		{
-			maxAge: 0,
-			limit:  100,
-			want: []cleanCandidate{
-				{BlobID: 1, Age: 3 * day, StoredSize: 1},
-				{BlobID: 2, Age: 2 * day, StoredSize: 2},
-				{BlobID: 3, Age: 1 * day, StoredSize: 3},
-				{BlobID: 4, Age: 0, StoredSize: smallObjectSize + 1}, // below lz4CompressThreshold, stored uncompressed
-			},
-		},
-		{
-			maxAge: 25 * time.Hour,
-			limit:  100,
-			want: []cleanCandidate{
-				{BlobID: 1, Age: 3 * day, StoredSize: 1},
-				{BlobID: 2, Age: 2 * day, StoredSize: 2},
-			},
-		},
-		{
-			maxAge: 0,
-			limit:  2,
-			want: []cleanCandidate{
-				{BlobID: 1, Age: 3 * day, StoredSize: 1},
-				{BlobID: 2, Age: 2 * day, StoredSize: 2},
-			},
-		},
+	// Before any PUT: delta is zero.
+	if c, b := st.srv.sumShardDeltas(); c != 0 || b != 0 {
+		t.Errorf("delta before PUT = (%d, %d), want (0, 0)", c, b)
 	}
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("maxAge=%v,limit=%d", tt.maxAge, tt.limit), func(t *testing.T) {
-			candidates, err := st.srv.cleanCandidates(tt.maxAge, tt.limit)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(candidates, tt.want); diff != "" {
-				t.Errorf("cleanCandidates mismatch (-got +want):\n%s", diff)
 
-			}
-		})
+	// Two PUTs of unique content. Each is small enough to be stored inline
+	// so StoredSize == len(content).
+	c := st.mkClient()
+	st.wantPut(c, "0001", "9901", "hello")
+	st.wantPut(c, "0002", "9902", "world!!")
+
+	if got, want := func() int64 { c, _ := st.srv.sumShardDeltas(); return c }(), int64(2); got != want {
+		t.Errorf("delta count after 2 PUTs = %d, want %d", got, want)
+	}
+	if got, want := func() int64 { _, b := st.srv.sumShardDeltas(); return b }(), int64(5+7); got != want {
+		t.Errorf("delta bytes after 2 PUTs = %d, want %d", got, want)
+	}
+
+	// Duplicate PUT (same actionID/outputID/content) goes through INSERT OR
+	// IGNORE: affected=0, so the delta must NOT advance.
+	st.wantPut(c, "0001", "9901", "hello")
+	if got, _ := st.srv.sumShardDeltas(); got != 2 {
+		t.Errorf("delta count after duplicate PUT = %d, want 2 (dup must not double-count)", got)
+	}
+}
+
+func TestShardDeltaZeroedAfterScan(t *testing.T) {
+	// The whole point of the preDelta dance in scanAndPersistShard is that
+	// once a shard is rescanned, anything that was reflected in the new
+	// persisted snapshot leaves the delta. Verify it: PUT, scanAllShards,
+	// delta == 0.
+	st := newServerTester(t)
+	c := st.mkClient()
+	st.wantPut(c, "0001", "9901", "hello")
+	st.wantPut(c, "0002", "9902", "world!!")
+
+	if cnt, b := st.srv.sumShardDeltas(); cnt == 0 && b == 0 {
+		t.Fatalf("delta is already zero before scan; test isn't exercising the post-scan zeroing")
+	}
+	if err := st.srv.scanAllShards(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if cnt, b := st.srv.sumShardDeltas(); cnt != 0 || b != 0 {
+		t.Errorf("delta after scanAllShards = (%d, %d), want (0, 0)", cnt, b)
+	}
+}
+
+func TestShardDeltaDrivesSizeCleanup(t *testing.T) {
+	// Dead-reckoning's reason for existing: cleanup must react to PUTs that
+	// happen between scans. Scenario: scan first so the persisted
+	// aggregate is at zero, then PUT enough to go over the limit *without*
+	// a scan, then assert cleanupTick fires.
+	st := newServerTester(t)
+	st.srv.maxSize = 8
+	ctx := context.Background()
+
+	// Empty cache: aggregate scanned, delta zero, cleanupTick no-op.
+	if err := st.srv.scanAllShards(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := st.srv.cleanupTick(ctx); err != nil || res.Count != 0 {
+		t.Fatalf("cleanupTick on empty: %+v, err=%v; want zero", res, err)
+	}
+
+	// PUT 10 bytes total. NO scanAllShards — the persisted aggregate still
+	// says zero. cleanupTick must consult the delta and decide to evict.
+	c := st.mkClient()
+	st.wantPut(c, "0001", "9901", "1")
+	st.advanceClock(time.Second)
+	st.wantPut(c, "0002", "9902", "22")
+	st.advanceClock(time.Second)
+	st.wantPut(c, "0003", "9903", "333")
+	st.advanceClock(time.Second)
+	st.wantPut(c, "0004", "9904", "4444")
+	st.advanceClock(time.Second)
+
+	if us := st.srv.lastUsage.Load(); us.All().Size != 0 {
+		t.Fatalf("persisted aggregate is non-zero (%v); the test premise (no scan yet) is broken", us.All())
+	}
+	if _, b := st.srv.sumShardDeltas(); b != 10 {
+		t.Fatalf("delta bytes = %d, want 10 (10 = 1+2+3+4)", b)
+	}
+	res, err := st.srv.cleanupTick(ctx)
+	if err != nil {
+		t.Fatalf("cleanupTick: %v", err)
+	}
+	// maxSize=8, delta-only total=10, so we need at least 2 bytes freed.
+	// The oldest are "1" (1B) and "22" (2B), summing to 3 ≥ 2 — stop after
+	// evicting both. Same as TestCleanOldObjectsBySize.
+	if want := (countAndSize{Count: 2, Size: 3}); res != want {
+		t.Errorf("cleanupTick result = %+v, want %+v", res, want)
 	}
 }
 
@@ -611,6 +788,277 @@ func TestLZ4Storage(t *testing.T) {
 	}
 	if compressed != 3 {
 		t.Errorf("disk files: got %d .lz4, want 3", compressed)
+	}
+}
+
+func TestShardPrefix(t *testing.T) {
+	// Verify the %0*x zero-padding contract: the width comes from the *
+	// argument and pads with leading zeros to that width. A typo (%0x,
+	// %x, %2x) would silently break shard keys.
+	cases := []struct {
+		prefixLen int
+		idx       int
+		want      shardPrefix
+	}{
+		{1, 0, "0"},
+		{1, 15, "f"},
+		{2, 0, "00"},
+		{2, 1, "01"},
+		{2, 15, "0f"},
+		{2, 16, "10"},
+		{2, 255, "ff"},
+		{3, 0, "000"},
+		{3, 16, "010"},
+		{3, 4095, "fff"},
+		{4, 0, "0000"},
+		{4, 65535, "ffff"},
+	}
+	for _, c := range cases {
+		srv := &Server{shardPrefixLen: c.prefixLen}
+		if got := srv.shardPrefix(c.idx); got != c.want {
+			t.Errorf("shardPrefix(prefixLen=%d, idx=%d) = %q, want %q",
+				c.prefixLen, c.idx, got, c.want)
+		}
+	}
+}
+
+func TestShardRange(t *testing.T) {
+	// shardRange's last-shard sentinel ("g" chars) is the easiest place for a
+	// future refactor to silently drop the final shard from the stats loop.
+	cases := []struct {
+		prefixLen      int
+		idx            int
+		wantLo, wantHi string
+	}{
+		// First shard: lo = all zeros prefix, hi = next prefix.
+		{1, 0, "0", "1"},
+		{2, 0, "00", "01"},
+		// Middle shard.
+		{2, 15, "0f", "10"},
+		{2, 16, "10", "11"},
+		// Last shard: hi is the "g"-sentinel that sorts after all hex.
+		{1, 15, "f", "g"},
+		{2, 255, "ff", "gg"},
+		{3, 4095, "fff", "ggg"},
+		{4, 65535, "ffff", "gggg"},
+	}
+	for _, c := range cases {
+		srv := &Server{shardPrefixLen: c.prefixLen}
+		gotLo, gotHi := srv.shardRange(c.idx)
+		if gotLo != c.wantLo || gotHi != c.wantHi {
+			t.Errorf("shardRange(prefixLen=%d, idx=%d) = (%q, %q), want (%q, %q)",
+				c.prefixLen, c.idx, gotLo, gotHi, c.wantLo, c.wantHi)
+		}
+	}
+}
+
+func TestLoadShardStats(t *testing.T) {
+	// Exercise the three branches that decide whether a persisted row gets
+	// kept or dropped: prefix-length mismatch, cohort mismatch, and a clean
+	// match. A dropped row stays in the table on disk but doesn't contribute
+	// to the in-memory aggregate.
+	// Override the tester default (shardPrefixLen=1) because this test
+	// asserts the wrong-prefix-length and wrong-cohort branches using
+	// 2-character prefixes.
+	st := newServerTester(t, WithShardPrefixLen(2))
+	ctx := context.Background()
+
+	if got := st.srv.numShards(); got != 256 {
+		t.Fatalf("numShards = %d, want 256", got)
+	}
+
+	// One clean shard scan so we have a row in BlobShardStats whose schema
+	// matches the current server.
+	if err := st.srv.scanAndPersistShard(ctx, 0); err != nil {
+		t.Fatalf("scanAndPersistShard: %v", err)
+	}
+
+	// Hand-write two more rows that should be rejected on the next load.
+	mustExec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := st.srv.db.ExecContext(ctx, query, args...); err != nil {
+			t.Fatalf("exec %q: %v", query, err)
+		}
+	}
+	mustExec(`INSERT INTO BlobShardStats (Prefix, ScannedAt, StatsJSON) VALUES (?, ?, ?)`,
+		"abc", 1, `{"ActionsLE":{}}`) // wrong prefix length
+	mustExec(`INSERT INTO BlobShardStats (Prefix, ScannedAt, StatsJSON) VALUES (?, ?, ?)`,
+		"01", 1, `{"ActionsLE":{"60000000000":{"Count":1,"Size":1}}}`) // wrong cohort set
+
+	if err := st.srv.loadShardStats(ctx); err != nil {
+		t.Fatalf("loadShardStats: %v", err)
+	}
+	if got, want := len(st.srv.shardStats), 1; got != want {
+		t.Errorf("shardStats has %d entries, want %d (only the clean prefix=00 row should survive)", got, want)
+	}
+	if _, ok := st.srv.shardStats["00"]; !ok {
+		t.Errorf("shardStats missing prefix=00")
+	}
+}
+
+func TestShardScanDurationPercentiles(t *testing.T) {
+	srv := &Server{
+		shardStats: map[shardPrefix]*shardSnapshot{
+			"00": {stats: &usageStats{QueryDuration: 10 * time.Millisecond}},
+			"01": {stats: &usageStats{QueryDuration: 20 * time.Millisecond}},
+			"02": {stats: &usageStats{QueryDuration: 30 * time.Millisecond}},
+			"03": {stats: &usageStats{QueryDuration: 40 * time.Millisecond}},
+			// Zero-duration shard is excluded so freshly-loaded-but-not-yet-
+			// observed entries don't skew the low percentile to zero.
+			"04": {stats: &usageStats{QueryDuration: 0}},
+		},
+	}
+	p25, p50, p90, n := srv.shardScanDurationPercentiles()
+	if n != 4 {
+		t.Errorf("n = %d, want 4 (zero-duration shard should be excluded)", n)
+	}
+	// With sorted = [10,20,30,40] ms and rank-index picks, p25 -> idx 1,
+	// p50 -> idx 2, p90 -> idx 3.
+	if p25 != 20*time.Millisecond {
+		t.Errorf("p25 = %v, want 20ms", p25)
+	}
+	if p50 != 30*time.Millisecond {
+		t.Errorf("p50 = %v, want 30ms", p50)
+	}
+	if p90 != 40*time.Millisecond {
+		t.Errorf("p90 = %v, want 40ms", p90)
+	}
+
+	empty := &Server{shardStats: map[shardPrefix]*shardSnapshot{}}
+	if p25, p50, p90, n := empty.shardScanDurationPercentiles(); p25 != 0 || p50 != 0 || p90 != 0 || n != 0 {
+		t.Errorf("empty server: got (%v, %v, %v, n=%d), want all zero", p25, p50, p90, n)
+	}
+}
+
+func TestShardFreshness(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	at := func(secsAgo int64) time.Time { return now.Add(-time.Duration(secsAgo) * time.Second) }
+
+	srv := &Server{
+		shardStats: map[shardPrefix]*shardSnapshot{
+			"00": {stats: &usageStats{}, scannedAt: at(10)},      // <= 1m
+			"01": {stats: &usageStats{}, scannedAt: at(200)},     // <= 5m
+			"02": {stats: &usageStats{}, scannedAt: at(800)},     // <= 15m
+			"03": {stats: &usageStats{}, scannedAt: at(3000)},    // <= 1h
+			"04": {stats: &usageStats{}, scannedAt: at(80_000)},  // <= 24h
+			"05": {stats: &usageStats{}, scannedAt: at(200_000)}, // older than 24h
+		},
+	}
+	counts, oldest, total := srv.shardFreshness(now)
+	if total != 6 {
+		t.Errorf("total = %d, want 6", total)
+	}
+	if got, want := oldest, at(200_000); !got.Equal(want) {
+		t.Errorf("oldest = %v, want %v", got, want)
+	}
+	want := map[time.Duration]int{
+		1 * time.Minute:  1, // just the 10s-old shard
+		5 * time.Minute:  2, // adds the 200s-old
+		15 * time.Minute: 3, // adds the 800s-old
+		1 * time.Hour:    4, // adds the 3000s-old
+		6 * time.Hour:    4, // unchanged (next is 80000s = ~22h)
+		24 * time.Hour:   5, // adds the 22h-old; the 200000s (~2.3d) one is still excluded
+	}
+	for d, c := range want {
+		if got := counts[d]; got != c {
+			t.Errorf("counts[%v] = %d, want %d", d, got, c)
+		}
+	}
+}
+
+func TestShardHealthGauges(t *testing.T) {
+	st := newServerTester(t)
+	ctx := context.Background()
+
+	// Before any scan: unscanned should equal numShards, oldest age 0.
+	body := scrapeMetrics(t, st)
+	if got, want := promGauge(t, body, "gocached_shard_stats_unscanned"), float64(st.srv.numShards()); got != want {
+		t.Errorf("unscanned before scan = %v, want %v", got, want)
+	}
+	if got := promGauge(t, body, "gocached_shard_stats_oldest_age_seconds"); got != 0 {
+		t.Errorf("oldest_age_seconds before scan = %v, want 0", got)
+	}
+
+	// Scan one shard at t=0, then advance the clock and re-scrape. The
+	// oldest-age gauge should reflect the advance; unscanned should drop by 1.
+	if err := st.srv.scanAndPersistShard(ctx, 0); err != nil {
+		t.Fatalf("scanAndPersistShard: %v", err)
+	}
+	st.advanceClock(90 * time.Second)
+
+	body = scrapeMetrics(t, st)
+	if got, want := promGauge(t, body, "gocached_shard_stats_unscanned"), float64(st.srv.numShards()-1); got != want {
+		t.Errorf("unscanned after 1 scan = %v, want %v", got, want)
+	}
+	if got, want := promGauge(t, body, "gocached_shard_stats_oldest_age_seconds"), float64(90); got != want {
+		t.Errorf("oldest_age_seconds after 90s advance = %v, want %v", got, want)
+	}
+}
+
+// scrapeMetrics returns the /metrics body served by the test server's
+// metrics handler.
+func scrapeMetrics(t *testing.T, st *tester) string {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	rec := httptest.NewRecorder()
+	st.srv.metricsHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
+// promGauge returns the value of the named gauge in a Prometheus text
+// exposition body, fatal-ing if the line isn't present. Matches lines like
+// "<name> <value>" but not commented HELP/TYPE lines.
+func promGauge(t *testing.T, body, name string) float64 {
+	t.Helper()
+	for line := range strings.Lines(body) {
+		line = strings.TrimRight(line, "\n")
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, " ")
+		if !ok || k != name {
+			continue
+		}
+		var f float64
+		if _, err := fmt.Sscanf(v, "%g", &f); err != nil {
+			t.Fatalf("parsing %q value %q: %v", name, v, err)
+		}
+		return f
+	}
+	t.Fatalf("metric %q not found in /metrics body:\n%s", name, body)
+	return 0
+}
+
+func TestServeUsage(t *testing.T) {
+	st := newServerTester(t)
+	c := st.mkClient()
+	st.wantPut(c, "0001", "9901", "hello")
+	// Force a scan pass so the freshness section has data to render.
+	if err := st.srv.scanAllShards(context.Background()); err != nil {
+		t.Fatalf("scanAllShards: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/usage", nil)
+	rec := httptest.NewRecorder()
+	st.srv.serveUsage(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	// Each new section should render at least its heading. Asserting on the
+	// headings (rather than exact bytes) lets the formatting tweak without
+	// breaking the test.
+	for _, want := range []string{
+		"Actions by access-time age",
+		"Shard scan freshness",
+		"Per-shard scan duration",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/usage body missing %q\nbody:\n%s", want, body)
+		}
 	}
 }
 

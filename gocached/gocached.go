@@ -55,6 +55,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,6 +114,48 @@ const checkpointInterval = time.Minute
 // not just snap back to zero each minute.
 const dbSizeMetricsInterval = 15 * time.Second
 
+// defaultShardPrefixLen is the [Server.shardPrefixLen] used when the option
+// is not set (zero value). 2 yields 256 shards ("00".."ff"), which keeps
+// individual scans fast even at hundreds of millions of rows.
+const defaultShardPrefixLen = 2
+
+// minShardPrefixLen is the minimum [Server.shardPrefixLen]. 1 yields 16
+// shards. Going to 0 (1 shard) would defeat the purpose of sharded
+// statistics, so we reject it.
+const minShardPrefixLen = 1
+
+// maxShardPrefixLen is the maximum [Server.shardPrefixLen]. 4 hex chars ->
+// 65,536 shards is more than we ever expect to need; higher values would
+// make the stats loop spend most of its time on shards with little or no
+// data, and would also blow up the size of the BlobShardStats table.
+const maxShardPrefixLen = 4
+
+// shardStatsMinInterval sets a defensive floor on how long [Server.runShardStatsLoop] will
+// sleep between iterations to ensure it never spins in a tight loop. [shardStalenessTarget]
+// dictates the interval in steady state.
+const shardStatsMinInterval = 2 * time.Second
+
+// cleanupTickInterval is how often [Server.runCleanLoop] wakes up to check
+// whether the cache is over its limits and, if so, evict one batch of
+// Actions. It's tight on purpose: each tick does at most cleanupBatchSize
+// deletes so the write transaction is short.
+const cleanupTickInterval = 1 * time.Second
+
+// cleanupBatchSize is the maximum number of Actions deleted in a single
+// [Server.evictOldestActions] call. Small enough that the write
+// transaction (including any file removals) holds the SQLite write lock
+// for only a brief moment, large enough that steady-state eviction keeps
+// up with realistic write traffic at ~cleanupBatchSize/cleanupTickInterval.
+const cleanupBatchSize = 200
+
+// shardStalenessTarget bounds how old any single shard's cohort histogram is
+// allowed to get. The stats loop sleeps until the oldest shard reaches this
+// age, then scans it; on a quiet cache that means scans naturally settle to
+// ~numShards/shardStalenessTarget per second instead of running continuously.
+// 10m drift on the 1d cohort is well under 1% error, which is negligible
+// compared to the day-granularity cohort cutoffs we record.
+const shardStalenessTarget = 10 * time.Minute
+
 const schema = `
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS Actions (
@@ -149,6 +192,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_blobs_sha256 ON Blobs(SHA256);
 CREATE TABLE IF NOT EXISTS Namespaces (
   NamespaceID INTEGER PRIMARY KEY AUTOINCREMENT,
   Namespace   TEXT NOT NULL UNIQUE CHECK (Namespace = lower(Namespace))
+) STRICT;
+
+-- BlobShardStats persists per-shard usage histograms across restarts so
+-- the server can serve PUTs with accurate global usage from right at startup,
+-- without blocking for minutes computing stats before serving can begin.
+-- There's one row per SHA256 prefix shard, refreshes one at a time in the background.
+CREATE TABLE IF NOT EXISTS BlobShardStats (
+  Prefix     TEXT PRIMARY KEY, -- "01".."ff" by default for shardPrefixLen=2; must be lowercase hex
+  ScannedAt  INTEGER NOT NULL, -- unix seconds
+  StatsJSON  TEXT NOT NULL     -- JSON-encoded [usageStats] of that shard
 ) STRICT;
 `
 
@@ -285,6 +338,33 @@ func (srv *Server) start() error {
 	}
 	ckCancel()
 
+	if srv.shardPrefixLen == 0 {
+		srv.shardPrefixLen = defaultShardPrefixLen
+	}
+	if srv.shardPrefixLen < minShardPrefixLen || srv.shardPrefixLen > maxShardPrefixLen {
+		return fmt.Errorf("shardPrefixLen %d out of range [%d, %d]",
+			srv.shardPrefixLen, minShardPrefixLen, maxShardPrefixLen)
+	}
+
+	// Compute the cohort cutoffs once so every shard scan agrees. maxAge is
+	// added to the set if it's not already a standard duration so cleanup can
+	// read its bucket directly out of the aggregate.
+	srv.durs = computeDurs(srv.maxAge)
+
+	// Allocate the dead-reckoning delta state. One entry per shard, indexed
+	// by the integer value of the SHA256 hex prefix.
+	srv.shardDeltas = make([]shardDelta, srv.numShards())
+
+	// Create the shardScanDuration histogram before loadShardStats so any
+	// QueryDuration values persisted by a previous run get replayed into
+	// the histogram immediately on restart, rather than waiting for the
+	// stats loop to repopulate it from fresh scans.
+	srv.shardScanDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gocached_shard_scan_duration_seconds",
+		Help:    "wall time of each per-shard usage-stats SQL scan",
+		Buckets: prometheus.DefBuckets,
+	})
+
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -292,23 +372,76 @@ func (srv *Server) start() error {
 		collectors.NewBuildInfoCollector(),
 	)
 	srv.registerMetrics(reg)
+	reg.MustRegister(srv.shardScanDuration)
+
+	// Per-scrape gauges for shard stats loop health. GaugeFunc recomputes on
+	// every Prometheus scrape, so the values stay fresh between scans
+	// (an expvar.Int gauge would only update once per shard scan, and
+	// "oldest age" would lag the wall clock between scans).
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "gocached_shard_stats_unscanned",
+			Help: "number of shards with no cached usage stats; nonzero means the stats loop has not yet covered the full shard space (e.g. just after first deploy of this code)",
+		},
+		func() float64 {
+			srv.shardStatsMu.Lock()
+			defer srv.shardStatsMu.Unlock()
+			return float64(srv.numShards() - len(srv.shardStats))
+		},
+	))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "gocached_shard_stats_oldest_age_seconds",
+			Help: "age in seconds of the oldest cached shard scan, or 0 if no shard has been scanned yet; alert when this exceeds shardStalenessTarget by some margin to catch the stats loop falling behind",
+		},
+		func() float64 {
+			_, oldest, _ := srv.shardFreshness(srv.now())
+			if oldest.IsZero() {
+				return 0
+			}
+			return srv.now().Sub(oldest).Seconds()
+		},
+	))
+	// Dead-reckoning gauges: PUTs/evictions adjust these between shard
+	// scans, so they show how much the live state has drifted from the
+	// persisted aggregate. Signed: a sustained negative delta means evictions
+	// are running ahead of writes, which is fine; a sustained large positive
+	// delta hints the stats loop is falling behind write traffic.
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "gocached_pending_blob_count",
+			Help: "signed pending Action-count delta since the last shard scan; combined with gocached_blob_count this gives the live total",
+		},
+		func() float64 {
+			c, _ := srv.sumShardDeltas()
+			return float64(c)
+		},
+	))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "gocached_pending_blob_bytes",
+			Help: "signed pending aggregate-bytes delta since the last shard scan; combined with gocached_blob_bytes this gives the live total used to gate maxSize cleanup",
+		},
+		func() float64 {
+			_, b := srv.sumShardDeltas()
+			return float64(b)
+		},
+	))
 
 	srv.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		ErrorLog: log.Default(),
 	})
 
-	srv.logf("gocached: scanning usage & cleaning as needed...")
-	us, err := srv.usageStats()
-	if err != nil {
-		return fmt.Errorf("getting usage stats: %w", err)
+	// Seed shardStats + the aggregate from BlobShardStats so usageStats is
+	// accurate from the first HTTP request after restart, without a full-table
+	// scan. Stale shards are refreshed by runShardStatsLoop in the
+	// background; the cleanup loop already runs periodically and will catch
+	// up any over-limit state once enough shards have been rescanned.
+	if err := srv.loadShardStats(srv.shutdownCtx); err != nil {
+		srv.logf("loading persisted shard stats: %v", err)
 	}
-
-	srv.logf("gocached: current usage: %v of limit %v", us.All(), bytesFmt(srv.maxSize))
-	if res, err := srv.cleanOldObjects(us); err != nil {
-		return fmt.Errorf("clean old objects: %w", err)
-	} else if res.Count > 0 {
-		srv.logf("gocached: cleaned %v", res)
-	}
+	srv.logf("gocached: %d/%d shards loaded; usage: %v of limit %v",
+		len(srv.shardStats), srv.numShards(), srv.lastUsage.Load().All(), bytesFmt(srv.maxSize))
 
 	if len(srv.jwtIssuers) > 0 {
 		issuerURLs := make([]string, 0, len(srv.jwtIssuers))
@@ -327,9 +460,12 @@ func (srv *Server) start() error {
 		go srv.runCleanSessionsLoop()
 	}
 
-	go srv.runCleanLoop()
-	go srv.runCheckpointLoop()
-	go srv.runDBSizeMetricsLoop()
+	if !srv.disableBackgroundLoops {
+		go srv.runCleanLoop()
+		go srv.runCheckpointLoop()
+		go srv.runDBSizeMetricsLoop()
+		go srv.runShardStatsLoop()
+	}
 
 	return nil
 }
@@ -417,6 +553,18 @@ func WithMaxSize(maxSize int64) ServerOption {
 func WithMaxAge(maxAge time.Duration) ServerOption {
 	return func(srv *Server) {
 		srv.maxAge = maxAge
+	}
+}
+
+// WithShardPrefixLen sets the number of hex characters used as each shard key
+// in BlobShardStats. The shard count is 16^n. Valid values are 1..4 inclusive
+// (16, 256, 4096, or 65536 shards). Passing 0 means "use the default" (2;
+// 256 shards), which keeps individual shard scans fast at hundreds of
+// millions of rows. Tune up only if a single shard scan becomes too slow
+// under continued growth; any other value causes [NewServer] to fail.
+func WithShardPrefixLen(n int) ServerOption {
+	return func(srv *Server) {
+		srv.shardPrefixLen = n
 	}
 }
 
@@ -538,7 +686,52 @@ type Server struct {
 	writeConn            *sql.Conn // nil until first used; single connection for writes
 	updateAccessTimeStmt *sql.Stmt // nil until first used; for updating access times on writeConn
 
+	// lastUsage holds the most recent aggregate of per-shard stats, recomputed
+	// after every shard scan. It is the source of truth for /usage,
+	// BlobCount/BlobBytes gauges, and cleanup decisions; nothing on the hot
+	// path runs a full-table scan.
 	lastUsage atomic.Pointer[usageStats]
+
+	// durs is the set of cohort cutoffs (in standardDurs order, plus maxAge if
+	// set and not already standard) used by all per-shard scans. Computed once
+	// in start. Persisted shard stats whose cohort set doesn't match these are
+	// discarded at load time and re-scanned by the stats loop.
+	durs []time.Duration
+
+	// shardPrefixLen is the number of hex characters in each shard key. Set
+	// via [WithShardPrefixLen]; defaults to [defaultShardPrefixLen] when 0,
+	// and must be in [minShardPrefixLen, maxShardPrefixLen] inclusive once
+	// [Server.start] has run. The derived shard count is 16^shardPrefixLen,
+	// exposed via [Server.numShards].
+	shardPrefixLen int
+
+	// disableBackgroundLoops, when true, skips the start of every periodic
+	// goroutine (shard stats, cleanup, checkpoint, DB-size metrics).
+	// Test-only via withoutBackgroundLoops because the mocked clock collides
+	// scannedAt across concurrent scans; production never sets this.
+	disableBackgroundLoops bool
+
+	// shardStatsMu guards shardStats and serializes recomputeAggregateLocked.
+	shardStatsMu sync.Mutex
+	shardStats   map[shardPrefix]*shardSnapshot
+
+	// shardDeltas is dead-reckoning state: each entry tracks (count, bytes)
+	// added or removed for that shard since its last persisted scan, so
+	// cleanupTick can react to write bursts faster than shardStalenessTarget.
+	// PUTs increment; evictions decrement; scanAndPersistShard subtracts the
+	// (newStats - oldStats) diff so the delta only carries changes that
+	// aren't already in the persisted shard. Allocated once in start
+	// (len == numShards()) so per-shard updates are an addressable struct
+	// with its own mutex; no allocation per PUT.
+	shardDeltas []shardDelta
+
+	// shardScanDuration observes the wall time of each per-shard SQL scan.
+	// Combined with the count of shards, the histogram shows whether any one
+	// shard scan is pathologically slow (e.g. a hot range with millions of
+	// entries while others are nearly empty). Registered manually in start
+	// because it isn't an expvar.Int and so doesn't fit the m-struct
+	// reflection.
+	shardScanDuration prometheus.Histogram
 
 	// Metrics. Exported fields for reflection, but within a private struct
 	// field to control the gocached Server API surface.
@@ -558,8 +751,9 @@ type Server struct {
 		PutsInline     expvar.Int `type:"counter" name:"put_inline" help:"subset of gocached_puts that were stored inline (small objects)"`
 		BlobCount      expvar.Int `type:"gauge" name:"blob_count" help:"number of blobs currently stored in the cache"`
 		BlobBytes      expvar.Int `type:"gauge" name:"blob_bytes" help:"sum of blob sizes currently stored in the cache"`
-		EvictedBlobs   expvar.Int `type:"counter" name:"evicted_blobs" help:"number of blobs evicted from the cache"`
-		EvictedBytes   expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes evicted from the cache"`
+		EvictedActions expvar.Int `type:"counter" name:"evicted_actions" help:"number of Actions evicted from the cache by the cleanup loop"`
+		EvictedBlobs   expvar.Int `type:"counter" name:"evicted_blobs" help:"number of Blobs evicted from the cache; a Blob is evicted when its last referencing Action is evicted"`
+		EvictedBytes   expvar.Int `type:"counter" name:"evicted_bytes" help:"number of bytes reclaimed by evicting Blobs from the cache"`
 		Sessions       expvar.Int `type:"gauge" name:"sessions" help:"number of active authenticated sessions"`
 		Auths          expvar.Int `type:"counter" name:"auth_attempts" help:"number of successful token exchanges"`
 		AuthErrs       expvar.Int `type:"counter" name:"auth_errs" help:"number of failed token exchanges"`
@@ -1153,6 +1347,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats)
 
 	if affected == 0 {
 		stats.PutsDup++
+	} else {
+		s.addBlobDelta(sha256hex, +1, +storedSize)
 	}
 
 	stats.Puts++
@@ -1367,6 +1563,12 @@ type usageStats struct {
 	// reference a BlobID that doesn't exist in the Blobs table.
 	// This should always be zero in a healthy system.
 	MissingBlobRows int
+
+	// QueryDuration is how long the per-shard SQL query took. It is set by
+	// [Server.scanShard] for shard snapshots and is left at the zero value
+	// in the aggregate returned by [Server.usageStats]. Persisted in JSON
+	// so /usage can surface slow shards across restarts.
+	QueryDuration time.Duration
 }
 
 func (us *usageStats) All() countAndSize { return us.ActionsLE[math.MaxInt64] }
@@ -1384,256 +1586,678 @@ var standardDurs = []time.Duration{
 	math.MaxInt64,
 }
 
-func (s *Server) usageStats() (_ *usageStats, err error) {
-	defer func() {
-		if err != nil {
-			s.logf("usageStats error: %v", err)
-		}
-	}()
-
-	st := &usageStats{
-		ActionsLE: make(map[time.Duration]countAndSize),
+// computeDurs calculates histogram buckets for usage stats, given the
+// configured maxAge. The math.MaxInt64 sentinel is always included as the
+// "no upper bound" bucket.
+func computeDurs(maxAge time.Duration) []time.Duration {
+	if maxAge == 0 || slices.Contains(standardDurs, maxAge) {
+		return slices.Clone(standardDurs)
 	}
+	durs := []time.Duration{maxAge, math.MaxInt64}
+	for _, d := range standardDurs {
+		if d < maxAge {
+			durs = append(durs, d)
+		}
+	}
+	slices.Sort(durs)
+	return durs
+}
 
-	// Build the durations to use for the histogram.
-	// The math.MaxInt64 value is always included.
-	// If s.maxAge is set, we ignore sizes above that, except
-	// for the math.MaxInt64 value.
-	var durs []time.Duration
-	if s.maxAge == 0 {
-		durs = standardDurs
+// shardPrefix is the lowercase hex prefix that identifies one SHA256 shard
+// (e.g. "00", "ab"). The named type keeps shard-key strings from being
+// passed where any string would do — code that means "shard key" reads as
+// shardPrefix; SQL parameters and other free-form strings stay plain string.
+type shardPrefix string
+
+// shardSnapshot is the cached state for a single SHA256-prefix shard.
+type shardSnapshot struct {
+	stats     *usageStats
+	scannedAt time.Time
+}
+
+// shardDelta is the dead-reckoning state for one shard. count and bytes are
+// signed: PUTs add positive values, evictions add negative ones.
+// scanAndPersistShard subtracts the change in the persisted view of this
+// shard (newStats - oldStats) so anything that just landed in the aggregate
+// leaves the delta.
+//
+// The per-shard mu serializes the count+bytes pair so a reader can't catch
+// a PUT mid-update with count incremented but bytes not (or vice versa).
+// Storing the values inline avoids allocating a new struct on every PUT.
+type shardDelta struct {
+	mu    sync.Mutex
+	count int64
+	bytes int64
+}
+
+// addBlobDelta adjusts the shardDelta for the shard owning sha256hex by the
+// given signed (count, bytes) values. Callers pass +1, +storedSize on a
+// successful new Action insert, and -1, -storedSize when evicting an Action.
+// Bogus sha256hex (too short or non-hex prefix) is silently ignored.
+func (srv *Server) addBlobDelta(sha256hex string, count, bytes int64) {
+	if srv.shardPrefixLen <= 0 || len(sha256hex) < srv.shardPrefixLen {
+		return
+	}
+	n, err := strconv.ParseUint(sha256hex[:srv.shardPrefixLen], 16, 64)
+	if err != nil || int(n) >= len(srv.shardDeltas) {
+		return
+	}
+	sd := &srv.shardDeltas[n]
+	sd.mu.Lock()
+	sd.count += count
+	sd.bytes += bytes
+	sd.mu.Unlock()
+}
+
+// sumShardDeltas returns the sum of every shard's pending delta. The caller
+// adds this to the persisted aggregate to get a live estimate of total cache
+// occupancy between scans.
+func (srv *Server) sumShardDeltas() (count, bytes int64) {
+	for i := range srv.shardDeltas {
+		sd := &srv.shardDeltas[i]
+		sd.mu.Lock()
+		count += sd.count
+		bytes += sd.bytes
+		sd.mu.Unlock()
+	}
+	return
+}
+
+// numShards returns 16^shardPrefixLen, the total number of SHA256-prefix
+// shards used to partition usage statistics.
+func (srv *Server) numShards() int {
+	return 1 << (4 * srv.shardPrefixLen)
+}
+
+// shardPrefix returns the hex prefix for shard index i, zero-padded to
+// shardPrefixLen characters (e.g. 0 -> "00", 255 -> "ff").
+func (srv *Server) shardPrefix(i int) shardPrefix {
+	return shardPrefix(fmt.Sprintf("%0*x", srv.shardPrefixLen, i))
+}
+
+// shardRange returns the [lo, hi) SHA256 hex range covered by shard index i.
+// For the final shard, hi is a sentinel string of 'g' characters: 'g' sorts
+// after every valid hex digit, so "SHA256 < hi" excludes nothing in that
+// range. Using a sentinel keeps the SQL uniform (always two parameters).
+// Returns plain strings since both ends bind directly into SQL.
+func (srv *Server) shardRange(i int) (lo, hi string) {
+	lo = string(srv.shardPrefix(i))
+	if i+1 == srv.numShards() {
+		hi = strings.Repeat("g", srv.shardPrefixLen)
 	} else {
-		durs = make([]time.Duration, 0, len(standardDurs)+1)
-		durs = append(durs, s.maxAge)
-		for _, d := range standardDurs {
-			if d < s.maxAge || d == math.MaxInt64 {
-				durs = append(durs, d)
-			}
-		}
-		slices.Sort(durs)
+		hi = string(srv.shardPrefix(i + 1))
 	}
+	return
+}
 
-	// Flush any pending access time bumps before computing usage stats.
-	s.mu.RLock()
-	shouldFlush := len(s.accessDirty) > 0
-	s.mu.RUnlock()
-	if shouldFlush {
-		// This acquires sqliteWriteMu, so we avoid that lock if there's nothing
-		// to do.
-		s.flushAccessTimeBumps()
+// usageStats returns the most recent aggregate of per-shard stats. It does no
+// SQL work: the aggregate is maintained by the shard stats loop and seeded
+// from the BlobShardStats table at startup, so callers see usage immediately
+// after process restart rather than after a multi-minute full-table scan. The
+// returned value is never nil; ActionsLE may be empty if no shard has been
+// scanned and no persisted stats exist.
+func (s *Server) usageStats() (*usageStats, error) {
+	if us := s.lastUsage.Load(); us != nil {
+		return us, nil
 	}
+	return &usageStats{ActionsLE: make(map[time.Duration]countAndSize)}, nil
+}
 
-	now := s.now().Unix()
-	rows, err := s.db.Query(
-		"SELECT a.BlobID, a.AccessTime, b.StoredSize FROM Actions a LEFT JOIN Blobs b ON a.BlobID = b.BlobID")
-	if err != nil {
-		return nil, fmt.Errorf("query Actions: %w", err)
-	}
-	var blobID int64
-	var accessTime int64
-	var storedSize sql.NullInt64
-	for rows.Next() {
-		if err := rows.Scan(&blobID, &accessTime, &storedSize); err != nil {
-			return nil, fmt.Errorf("rows.Scan: %w", err)
-		}
-		if !storedSize.Valid {
-			st.MissingBlobRows++
+// scanShard runs a single SQL-aggregated query that computes the cohort
+// histogram for Actions whose Blob's SHA256 falls in shard idx's range.
+// The aggregation happens entirely in SQL via SUM(CASE WHEN ...) clauses, so
+// the driver returns one row regardless of how many Actions fall in the shard.
+// This is what makes a scan cheap enough to pin a reader snapshot for only
+// milliseconds per shard rather than minutes for the whole table.
+func (srv *Server) scanShard(ctx context.Context, idx int) (*usageStats, error) {
+	durs := srv.durs
+	now := srv.now().Unix()
+
+	var sb strings.Builder
+	args := make([]any, 0, 2*len(durs)+2)
+	sb.WriteString("SELECT ")
+	finiteCount := 0
+	for _, d := range durs {
+		if d == math.MaxInt64 {
 			continue
 		}
-
-		dur := time.Duration(now-accessTime) * time.Second
-		if dur < 0 {
-			dur = 0
+		cutoff := now - int64(d/time.Second)
+		if finiteCount > 0 {
+			sb.WriteByte(',')
 		}
-		for _, d := range durs {
-			if dur < d {
-				was := st.ActionsLE[d]
-				was.Count++
-				was.Size += storedSize.Int64
-				st.ActionsLE[d] = was
-			}
-		}
+		sb.WriteString("COALESCE(SUM(CASE WHEN a.AccessTime > ? THEN 1 ELSE 0 END),0),")
+		sb.WriteString("COALESCE(SUM(CASE WHEN a.AccessTime > ? THEN b.StoredSize ELSE 0 END),0)")
+		args = append(args, cutoff, cutoff)
+		finiteCount++
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows.Next: %w", err)
+	sb.WriteString(",COUNT(*),COALESCE(SUM(b.StoredSize),0)")
+	sb.WriteString(" FROM Blobs b JOIN Actions a ON a.BlobID = b.BlobID")
+	sb.WriteString(" WHERE b.SHA256 >= ? AND b.SHA256 < ?")
+	lo, hi := srv.shardRange(idx)
+	args = append(args, lo, hi)
+
+	vals := make([]int64, finiteCount*2+2)
+	dest := make([]any, len(vals))
+	for i := range vals {
+		dest[i] = &vals[i]
+	}
+	start := time.Now()
+	if err := srv.db.QueryRowContext(ctx, sb.String(), args...).Scan(dest...); err != nil {
+		return nil, err
+	}
+	queryDuration := time.Since(start)
+	if srv.shardScanDuration != nil {
+		// Nil-check: scanShard is reachable from tests that build a bare
+		// Server without calling start (e.g. TestShardPrefix).
+		srv.shardScanDuration.Observe(queryDuration.Seconds())
 	}
 
-	s.lastUsage.Store(st)
-	all := st.All()
-	s.m.BlobCount.Set(all.Count)
-	s.m.BlobBytes.Set(all.Size)
+	st := &usageStats{
+		ActionsLE:     make(map[time.Duration]countAndSize, len(durs)),
+		QueryDuration: queryDuration,
+	}
+	j := 0
+	for _, d := range durs {
+		if d == math.MaxInt64 {
+			continue
+		}
+		st.ActionsLE[d] = countAndSize{Count: vals[j*2], Size: vals[j*2+1]}
+		j++
+	}
+	st.ActionsLE[math.MaxInt64] = countAndSize{Count: vals[finiteCount*2], Size: vals[finiteCount*2+1]}
 	return st, nil
 }
 
-type cleanCandidate struct {
-	BlobID     int64
-	Age        time.Duration
-	StoredSize int64 // size of the blob as stored, in bytes (compressed if lz4)
+// shardCohortsMatch reports whether the persisted ActionsLE map keys exactly
+// match the current srv.durs set. A mismatch means the persisted shard was
+// written with a different maxAge (or a different code version), so we
+// discard it and force the stats loop to re-scan that shard.
+func shardCohortsMatch(le map[time.Duration]countAndSize, durs []time.Duration) bool {
+	if len(le) != len(durs) {
+		return false
+	}
+	for _, d := range durs {
+		if _, ok := le[d]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
-func (s *Server) cleanCandidates(olderThan time.Duration, limit int64) ([]cleanCandidate, error) {
-	now := s.now()
-	nowUnix := now.Unix()
-	cutoff := now.Add(-olderThan).Unix()
-
-	rows, err := s.db.Query(`
-		SELECT b.BlobID, MAX(a.AccessTime), b.StoredSize
-		FROM Blobs b LEFT JOIN Actions a ON b.BlobID = a.BlobID
-		GROUP BY b.BlobID
-		HAVING MAX(a.AccessTime) <= ?
-		ORDER BY MAX(a.AccessTime)
-		LIMIT ?`, cutoff, limit)
+// loadShardStats reads every BlobShardStats row at startup, validates that
+// the persisted cohort set matches srv.durs, and seeds shardStats + the
+// aggregate. Rows with mismatched cohorts are dropped so the stats loop
+// re-scans them. The aggregate becomes the source of truth for /usage and the
+// cleanup loop until the first new shard scan completes.
+func (srv *Server) loadShardStats(ctx context.Context) error {
+	rows, err := srv.db.QueryContext(ctx, "SELECT Prefix, ScannedAt, StatsJSON FROM BlobShardStats")
 	if err != nil {
-		return nil, fmt.Errorf("query clean candidates: %w", err)
+		return err
 	}
 	defer rows.Close()
-
-	var candidates []cleanCandidate
-	var accessTime int64
+	srv.shardStatsMu.Lock()
+	defer srv.shardStatsMu.Unlock()
+	srv.shardStats = make(map[shardPrefix]*shardSnapshot, srv.numShards())
 	for rows.Next() {
-		var c cleanCandidate
-		if err := rows.Scan(&c.BlobID, &accessTime, &c.StoredSize); err != nil {
-			return nil, fmt.Errorf("rows.Scan: %w", err)
+		var prefix, statsJSON string
+		var scannedAt int64
+		if err := rows.Scan(&prefix, &scannedAt, &statsJSON); err != nil {
+			return err
 		}
-		c.Age = time.Duration(nowUnix-accessTime) * time.Second
-		candidates = append(candidates, c)
+		if len(prefix) != srv.shardPrefixLen {
+			// A previous run used a different shardPrefixLen. The stats loop
+			// won't write to these keys, so they'd otherwise sit in the
+			// table forever contributing stale data to the aggregate.
+			srv.logf("BlobShardStats[%q] prefix length %d != current %d; will rescan",
+				prefix, len(prefix), srv.shardPrefixLen)
+			continue
+		}
+		var st usageStats
+		if err := json.Unmarshal([]byte(statsJSON), &st); err != nil {
+			srv.logf("BlobShardStats[%q] JSON decode: %v; will rescan", prefix, err)
+			continue
+		}
+		if !shardCohortsMatch(st.ActionsLE, srv.durs) {
+			srv.logf("BlobShardStats[%q] cohort mismatch; will rescan", prefix)
+			continue
+		}
+		srv.shardStats[shardPrefix(prefix)] = &shardSnapshot{
+			stats:     &st,
+			scannedAt: time.Unix(scannedAt, 0),
+		}
+		// Replay the persisted scan time into the histogram so the
+		// /metrics endpoint shows reasonable percentiles immediately after
+		// restart instead of waiting a full pass over every shard. The observation is
+		// older than "now" but it's the most accurate signal we have for
+		// this shard until the stats loop refreshes it.
+		if srv.shardScanDuration != nil && st.QueryDuration > 0 {
+			srv.shardScanDuration.Observe(st.QueryDuration.Seconds())
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("rows.Next: %w", err)
+		return err
 	}
-
-	return candidates, nil
+	srv.recomputeAggregateLocked()
+	return nil
 }
 
-func (srv *Server) deleteBlobs(blobIDs ...int64) error {
+// upsertShardStats persists one shard's scan result. The row is keyed on
+// Prefix so subsequent scans of the same shard overwrite in place.
+func (srv *Server) upsertShardStats(ctx context.Context, prefix shardPrefix, scannedAt time.Time, st *usageStats) error {
+	statsJSON, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	srv.sqliteWriteMu.Lock()
+	defer srv.sqliteWriteMu.Unlock()
+	_, err = srv.db.ExecContext(ctx,
+		`INSERT INTO BlobShardStats (Prefix, ScannedAt, StatsJSON) VALUES (?, ?, ?)
+		 ON CONFLICT(Prefix) DO UPDATE SET ScannedAt=excluded.ScannedAt, StatsJSON=excluded.StatsJSON`,
+		prefix, scannedAt.Unix(), string(statsJSON))
+	return err
+}
+
+// recomputeAggregateLocked sums the cohort histograms across every cached
+// shard, stores the result in lastUsage, and updates the BlobCount/BlobBytes
+// gauges. The caller must hold shardStatsMu.
+func (srv *Server) recomputeAggregateLocked() {
+	agg := &usageStats{ActionsLE: make(map[time.Duration]countAndSize, len(srv.durs))}
+	for _, d := range srv.durs {
+		agg.ActionsLE[d] = countAndSize{}
+	}
+	for _, sh := range srv.shardStats {
+		for d, cs := range sh.stats.ActionsLE {
+			was := agg.ActionsLE[d]
+			was.Count += cs.Count
+			was.Size += cs.Size
+			agg.ActionsLE[d] = was
+		}
+	}
+	srv.lastUsage.Store(agg)
+	total := agg.All()
+	srv.m.BlobCount.Set(total.Count)
+	srv.m.BlobBytes.Set(total.Size)
+}
+
+// pickOldestShard returns the shard index whose ScannedAt is oldest, along
+// with that ScannedAt. A shard that has never been scanned (no entry in
+// shardStats) wins immediately, and is returned with a zero time so the
+// caller treats it as infinitely stale (scan it now, no sleep).
+func (srv *Server) pickOldestShard() (idx int, scannedAt time.Time) {
+	srv.shardStatsMu.Lock()
+	defer srv.shardStatsMu.Unlock()
+	oldestIdx := -1
+	var oldestTime time.Time
+	for i := range srv.numShards() {
+		sh, ok := srv.shardStats[srv.shardPrefix(i)]
+		if !ok {
+			return i, time.Time{}
+		}
+		if oldestIdx == -1 || sh.scannedAt.Before(oldestTime) {
+			oldestIdx = i
+			oldestTime = sh.scannedAt
+		}
+	}
+	return oldestIdx, oldestTime
+}
+
+// scanAndPersistShard scans shard idx, writes the result back to
+// BlobShardStats, and updates the in-memory cache + aggregate.
+func (srv *Server) scanAndPersistShard(ctx context.Context, idx int) error {
+	prefix := srv.shardPrefix(idx)
+	scannedAt := srv.now()
+	stats, err := srv.scanShard(ctx, idx)
+	if err != nil {
+		return fmt.Errorf("scan shard %q: %w", prefix, err)
+	}
+	if err := srv.upsertShardStats(ctx, prefix, scannedAt, stats); err != nil {
+		return fmt.Errorf("persist shard %q: %w", prefix, err)
+	}
+
+	srv.shardStatsMu.Lock()
+	var oldAll countAndSize
+	if old, ok := srv.shardStats[prefix]; ok {
+		oldAll = old.stats.All()
+	}
+	srv.shardStats[prefix] = &shardSnapshot{stats: stats, scannedAt: scannedAt}
+	srv.recomputeAggregateLocked()
+	srv.shardStatsMu.Unlock()
+
+	// Subtract from the delta the exact change that just landed in the
+	// persisted view: (newStats - oldStats). Anything in delta whose Action
+	// commit happened before scanShard's snapshot is now in newStats, so we
+	// subtract it out; anything that committed after the snapshot isn't in
+	// newStats, so the diff doesn't touch its delta contribution. PUTs whose
+	// addBlobDelta hasn't been called yet temporarily push delta negative;
+	// when the addBlobDelta runs it cancels out.
+	//
+	// First-scan caveat: when oldStats was missing (no prior scan for this
+	// shard AND no persisted row from a previous process run), oldAll is
+	// zero. If the DB had pre-existing rows that delta never saw (e.g. first
+	// deploy of this code on a populated DB whose BlobShardStats table was
+	// empty), subtracting newStats from delta will leave delta with a
+	// negative offset equal to the pre-existing row count. The aggregate
+	// becomes correct from then on; the negative offset stays in the delta
+	// until process restart (which reloads aggregate from the now-populated
+	// BlobShardStats and starts delta at zero). Operators deploying onto a
+	// populated DB can avoid this by nuking the DB first.
+	newAll := stats.All()
+	diffCount := newAll.Count - oldAll.Count
+	diffBytes := newAll.Size - oldAll.Size
+	sd := &srv.shardDeltas[idx]
+	sd.mu.Lock()
+	sd.count -= diffCount
+	sd.bytes -= diffBytes
+	sd.mu.Unlock()
+	return nil
+}
+
+// runShardStatsLoop keeps usage stats fresh by rescanning the
+// oldest-scanned shard whenever it crosses [shardStalenessTarget]. The
+// per-scan cadence in steady state works out to about
+// shardStalenessTarget/numShards (~2.3s at defaults)
+func (srv *Server) runShardStatsLoop() {
+	for {
+		idx, scannedAt := srv.pickOldestShard()
+		var sleep time.Duration
+		if !scannedAt.IsZero() {
+			sleep = max(shardStalenessTarget-srv.now().Sub(scannedAt), shardStatsMinInterval)
+		}
+		if sleep > 0 {
+			select {
+			case <-srv.shutdownCtx.Done():
+				return
+			case <-time.After(sleep):
+			}
+		}
+		if err := srv.scanAndPersistShard(srv.shutdownCtx, idx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			srv.logf("shard stats loop: %v", err)
+		}
+	}
+}
+
+// scanAllShards synchronously rescans every shard. Used by tests to get a
+// deterministic aggregate, and by POST /usage as a manual "refresh now"
+// trigger when an operator doesn't want to wait for the stats loop.
+func (srv *Server) scanAllShards(ctx context.Context) error {
+	for i := range srv.numShards() {
+		if err := srv.scanAndPersistShard(ctx, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// shardScanDurationPercentiles returns p25/p50/p90 of the QueryDuration
+// across every cached shard, and the count of shards that contributed (i.e.
+// have a non-zero QueryDuration). Returns zeros if no shard has been scanned
+// yet. Linear interpolation is overkill given numShards is 16/256/etc.; a
+// rank-index pick is good enough for a /usage page.
+func (srv *Server) shardScanDurationPercentiles() (p25, p50, p90 time.Duration, n int) {
+	srv.shardStatsMu.Lock()
+	durs := make([]time.Duration, 0, len(srv.shardStats))
+	for _, sh := range srv.shardStats {
+		if sh.stats.QueryDuration > 0 {
+			durs = append(durs, sh.stats.QueryDuration)
+		}
+	}
+	srv.shardStatsMu.Unlock()
+	n = len(durs)
+	if n == 0 {
+		return
+	}
+	slices.Sort(durs)
+	pick := func(p int) time.Duration {
+		i := (n * p) / 100
+		if i >= n {
+			i = n - 1
+		}
+		return durs[i]
+	}
+	return pick(25), pick(50), pick(90), n
+}
+
+// shardFreshnessBuckets are the "scanned within last X" age cohorts shown on
+// the /usage page. The largest cohort is intentionally larger than
+// [shardStalenessTarget] so the page makes it obvious when the stats loop
+// has fallen behind (the smaller cohorts drop to zero before the largest does).
+var shardFreshnessBuckets = []time.Duration{
+	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	1 * time.Hour,
+	6 * time.Hour,
+	24 * time.Hour,
+}
+
+// shardFreshness counts how many cached shards were last scanned within each
+// of [shardFreshnessBuckets], and returns the absolute time of the oldest
+// scan. The buckets are cumulative ("within last X"), matching the cohort
+// histogram style elsewhere in this package.
+func (srv *Server) shardFreshness(now time.Time) (counts map[time.Duration]int, oldest time.Time, total int) {
+	counts = make(map[time.Duration]int, len(shardFreshnessBuckets))
+	srv.shardStatsMu.Lock()
+	defer srv.shardStatsMu.Unlock()
+	total = len(srv.shardStats)
+	for _, sh := range srv.shardStats {
+		age := now.Sub(sh.scannedAt)
+		for _, b := range shardFreshnessBuckets {
+			if age <= b {
+				counts[b]++
+			}
+		}
+		if oldest.IsZero() || sh.scannedAt.Before(oldest) {
+			oldest = sh.scannedAt
+		}
+	}
+	return counts, oldest, total
+}
+
+// evictionCandidateQuery is the SQL used by [Server.evictOldestActions] to
+// pick which Actions to delete next. INDEXED BY is the documented
+// SQLite mechanism (https://sqlite.org/lang_indexedby.html) for locking
+// down a plan so a future schema change can't silently regress this query
+// from an O(log N) index range scan into an O(N) table scan. The plan is
+// verified in TestEvictionQueryPlan.
+const evictionCandidateQuery = `
+SELECT NamespaceID, ActionID, BlobID
+FROM Actions INDEXED BY idx_actions_access
+WHERE AccessTime <= ?
+ORDER BY AccessTime ASC
+LIMIT ?`
+
+// evictOldestActions deletes up to maxCount Actions whose AccessTime is at
+// or before cutoff, oldest first, in a single short write transaction. For
+// each deleted Action, if its Blob has no other referencing Actions
+// remaining, the Blob row and its on-disk file are also removed. The batch
+// stops early once at least maxBytes have been reclaimed (use math.MaxInt64
+// for no byte budget — e.g., maxAge cleanup, where we want every stale
+// Action gone regardless of size).
+//
+// This is Action-LRU: a stale Action is evicted even if its Blob is shared
+// with newer Actions (the Blob then stays alive via those newer refs). That
+// differs from the prior Blob-LRU policy, where a Blob was only evicted when
+// MAX(AccessTime) of all its Actions was past the cutoff. The cache is
+// mostly 1:1 Action-to-Blob so the two policies are equivalent for the
+// common case; on shared Blobs, Action-LRU is the stricter LRU semantics.
+func (srv *Server) evictOldestActions(ctx context.Context, cutoff int64, maxCount int, maxBytes int64) (countAndSize, error) {
+	var ret countAndSize
+
+	rows, err := srv.db.QueryContext(ctx, evictionCandidateQuery, cutoff, maxCount)
+	if err != nil {
+		return ret, fmt.Errorf("query eviction candidates: %w", err)
+	}
+	type candidate struct {
+		NamespaceID int64
+		ActionID    string
+		BlobID      int64
+	}
+	var cands []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.NamespaceID, &c.ActionID, &c.BlobID); err != nil {
+			rows.Close()
+			return ret, fmt.Errorf("scan candidate: %w", err)
+		}
+		cands = append(cands, c)
+	}
+	if err := rows.Close(); err != nil {
+		return ret, fmt.Errorf("close candidate rows: %w", err)
+	}
+	if len(cands) == 0 {
+		return ret, nil
+	}
+
 	srv.sqliteWriteMu.Lock()
 	defer srv.sqliteWriteMu.Unlock()
 
-	tx, err := srv.db.Begin()
+	tx, err := srv.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("delete blob Begin: %w", err)
+		return ret, fmt.Errorf("eviction Begin: %w", err)
 	}
 	defer tx.Rollback()
 
-	var sumBytes int64
-	for _, blobID := range blobIDs {
+	// pendingDelta queues addBlobDelta updates for after Commit. Holding
+	// them until commit means a rolled-back tx (rare) doesn't poison the
+	// dead-reckoning state.
+	type pendingDelta struct {
+		sha256Hex  string
+		storedSize int64
+	}
+	var pending []pendingDelta
+
+	var evictedBlobs int64
+	var evictedBlobBytes int64   // bytes reclaimed (disk space + EvictedBytes metric)
+	var evictedActionBytes int64 // aggregate-side bytes reduction (drives maxBytes check)
+	var evictedActions int64
+	for _, c := range cands {
+		// Fetch SHA256 + StoredSize up front so we can both (a) decrement
+		// the dead-reckoning delta for this Action and (b) remove the disk
+		// file if the Blob ends up orphaned. A LEFT-JOIN here is just an
+		// extra query; the row is keyed on the primary key so it's cheap.
 		var sha256Hex string
 		var storedSize int64
-		if err := tx.QueryRow("SELECT SHA256, StoredSize FROM Blobs WHERE BlobID = ?", blobID).Scan(&sha256Hex, &storedSize); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("querying blob SHA256: %w", err)
+		blobExists := true
+		switch err := tx.QueryRowContext(ctx,
+			"SELECT SHA256, StoredSize FROM Blobs WHERE BlobID = ?",
+			c.BlobID).Scan(&sha256Hex, &storedSize); {
+		case err == nil:
+		case errors.Is(err, sql.ErrNoRows):
+			blobExists = false
+		default:
+			return ret, fmt.Errorf("fetch Blob row: %w", err)
 		}
-		sumBytes += storedSize
-		if _, err := tx.Exec("DELETE FROM Blobs WHERE BlobID = ?", blobID); err != nil {
-			return fmt.Errorf("deleting blob: %w", err)
+
+		if _, err := tx.ExecContext(ctx,
+			"DELETE FROM Actions WHERE NamespaceID = ? AND ActionID = ?",
+			c.NamespaceID, c.ActionID); err != nil {
+			return ret, fmt.Errorf("delete action: %w", err)
 		}
-		if _, err := tx.Exec("DELETE FROM Actions WHERE BlobID = ?", blobID); err != nil {
-			return fmt.Errorf("deleting actions: %w", err)
+		evictedActions++
+		if !blobExists {
+			// Orphan Action pointing at a missing Blob; delete the row and
+			// move on. No delta, no Blob row, no file.
+			continue
 		}
+		// Each Action contributes 1 count + storedSize bytes to the aggregate
+		// (see scanShard); removing it reduces both by exactly that. Decrement
+		// deferred until after Commit so a rollback doesn't leave the delta
+		// off.
+		pending = append(pending, pendingDelta{sha256Hex, storedSize})
+		evictedActionBytes += storedSize
+
+		// Is this Blob now orphaned? idx_actions_blobid makes this O(log N).
+		var stillReferenced int
+		if err := tx.QueryRowContext(ctx,
+			"SELECT EXISTS(SELECT 1 FROM Actions WHERE BlobID = ?)",
+			c.BlobID).Scan(&stillReferenced); err != nil {
+			return ret, fmt.Errorf("check orphan: %w", err)
+		}
+		if stillReferenced == 1 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM Blobs WHERE BlobID = ?", c.BlobID); err != nil {
+			return ret, fmt.Errorf("delete Blob: %w", err)
+		}
+		evictedBlobs++
+		evictedBlobBytes += storedSize
 		var hash [sha256.Size]byte
 		if _, err := hex.Decode(hash[:], []byte(sha256Hex)); err == nil {
 			base := srv.sha256Filepath(hash)
 			// Try removing both lz4 and plain paths; one or neither may exist.
 			if err := os.Remove(base + ".lz4"); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("removing disk file: %w", err)
+				return ret, fmt.Errorf("removing disk file: %w", err)
 			}
 			if err := os.Remove(base); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("removing disk file: %w", err)
+				return ret, fmt.Errorf("removing disk file: %w", err)
 			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-
-	srv.m.EvictedBlobs.Add(int64(len(blobIDs)))
-	srv.m.EvictedBytes.Add(sumBytes)
-
-	return nil
-}
-
-func (srv *Server) cleanOldObjects(us *usageStats) (countAndSize, error) {
-	var zero countAndSize
-	var ret countAndSize
-
-	all := us.ActionsLE[math.MaxInt64]
-	if srv.verbose {
-		srv.logf("current usage stats: %v", all)
-		last := all
-		for _, d := range slices.Sorted(maps.Keys(us.ActionsLE)) {
-			if d == math.MaxInt64 {
-				continue // skip infinity
-			}
-			c := us.ActionsLE[d]
-			srv.logf("  <=%v: %v", durFmt(d), c)
-			if last == c {
-				break
-			}
-			last = c
-		}
-	}
-
-	// First clean things that are just too old.
-	if srv.maxAge > 0 {
-		if toDelete := all.Count - us.ActionsLE[srv.maxAge].Count; toDelete > 0 {
-			srv.logf("Cleaning %d objects older than %v ...", toDelete, durFmt(srv.maxAge))
-			candidates, err := srv.cleanCandidates(srv.maxAge, toDelete+1)
-			if err != nil {
-				return zero, fmt.Errorf("getting clean candidates: %v", err)
-			}
-			blobIDs := make([]int64, 0, len(candidates))
-			var sumSize int64
-			for _, c := range candidates {
-				blobIDs = append(blobIDs, c.BlobID)
-				sumSize += c.StoredSize
-			}
-			if err := srv.deleteBlobs(blobIDs...); err != nil {
-				return zero, fmt.Errorf("deleting old blobs: %v", err)
-			}
-			all.Count -= int64(len(candidates))
-			all.Size -= sumSize
-			ret.Count += int64(len(candidates))
-			ret.Size += sumSize
-		}
-	}
-
-	for srv.maxSize > 0 && all.Size > srv.maxSize {
-		toClean := all.Size - srv.maxSize
-		if srv.verbose {
-			srv.logf("need to clean %v to get under max size of %v ...",
-				bytesFmt(toClean), bytesFmt(srv.maxSize))
-		}
-
-		var batchBytes int64
-		var blobIDs []int64
-		candidates, err := srv.cleanCandidates(0, 10000)
-		if err != nil {
-			return zero, fmt.Errorf("getting clean candidates: %v", err)
-		}
-		for _, c := range candidates {
-			blobIDs = append(blobIDs, c.BlobID)
-			batchBytes += c.StoredSize
-			if batchBytes >= toClean {
-				break
-			}
-		}
-		if err := srv.deleteBlobs(blobIDs...); err != nil {
-			return zero, fmt.Errorf("deleting old blobs: %v", err)
-		}
-
-		ret.Count += int64(len(blobIDs))
-		ret.Size += batchBytes
-		all.Count -= int64(len(blobIDs))
-		all.Size -= batchBytes
-
-		if len(blobIDs) == len(candidates) {
-			// We didn't find enough candidates to delete.
-			// Just stop here.
-			srv.logf("[unexpected] didn't find enough candidates to delete")
+		// Stop once we've freed enough aggregate bytes. For maxAge cleanup
+		// callers pass math.MaxInt64 so this check never triggers.
+		if evictedActionBytes >= maxBytes {
 			break
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return ret, fmt.Errorf("eviction Commit: %w", err)
+	}
 
+	// Apply the queued delta decrements now that the tx is durably committed.
+	for _, p := range pending {
+		srv.addBlobDelta(p.sha256Hex, -1, -p.storedSize)
+	}
+
+	srv.m.EvictedActions.Add(evictedActions)
+	srv.m.EvictedBlobs.Add(evictedBlobs)
+	srv.m.EvictedBytes.Add(evictedBlobBytes)
+	ret.Count = evictedBlobs
+	ret.Size = evictedBlobBytes
 	return ret, nil
+}
+
+// cleanupTick decides whether the cache is over its configured maxAge or
+// maxSize and, if so, runs one [Server.evictOldestActions] batch. The
+// aggregate from the shard stats loop drives the decision; the eviction itself
+// goes straight at idx_actions_access without consulting the shards.
+func (srv *Server) cleanupTick(ctx context.Context) (countAndSize, error) {
+	var ret countAndSize
+	us := srv.lastUsage.Load()
+	if us == nil {
+		return ret, nil
+	}
+	all := us.All()
+	// Include the dead-reckoning delta in the size pressure check so a
+	// burst of PUTs between scans actually triggers cleanup. The maxAge
+	// check intentionally ignores the delta: fresh PUTs are by definition
+	// within maxAge, so they neither add to nor subtract from the count of
+	// over-age Actions.
+	dCount, dBytes := srv.sumShardDeltas()
+	all.Count += dCount
+	all.Size += dBytes
+
+	// Default cutoff to "any age" for size-only cleanup. evictOldestActions
+	// still uses idx_actions_access (the WHERE/ORDER BY drive the plan), so
+	// the very-large cutoff just means "no upper bound".
+	cutoff := int64(math.MaxInt64)
+	overAge := false
+	if srv.maxAge > 0 {
+		cutoff = srv.now().Add(-srv.maxAge).Unix()
+		overAge = us.All().Count-us.ActionsLE[srv.maxAge].Count > 0
+	}
+	overSize := srv.maxSize > 0 && all.Size > srv.maxSize
+	if !overAge && !overSize {
+		return ret, nil
+	}
+	// maxAge cleanup runs to count limit (every stale Action must go);
+	// size-only cleanup runs until we've reclaimed enough bytes.
+	maxBytes := int64(math.MaxInt64)
+	if !overAge && overSize {
+		maxBytes = all.Size - srv.maxSize
+	}
+	return srv.evictOldestActions(ctx, cutoff, cleanupBatchSize, maxBytes)
 }
 
 // checkpointTruncate runs PRAGMA wal_checkpoint(TRUNCATE) and returns SQLite's
@@ -1733,23 +2357,13 @@ func (srv *Server) runCleanLoop() {
 		select {
 		case <-srv.shutdownCtx.Done():
 			return
-		case <-time.After(5 * time.Minute):
+		case <-time.After(cleanupTickInterval):
 		}
-
-		us, err := srv.usageStats()
-		if err != nil {
-			srv.logf("error getting usage stats: %v", err)
-			continue
-		}
-
-		res, err := srv.cleanOldObjects(us)
-		if err != nil {
-			srv.logf("error cleaning old objects: %v", err)
-			continue
-		}
-		if res.Count > 0 {
-			srv.logf("cleaned %v", res)
-			srv.usageStats() // for side effect of updating lastUsage
+		if _, err := srv.cleanupTick(srv.shutdownCtx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			srv.logf("cleanup: %v", err)
 		}
 	}
 }
@@ -1815,10 +2429,11 @@ func bytesFmt(n int64) string {
 
 func (srv *Server) serveUsage(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
-		// For side effect of updating lastUsage.
-		_, err := srv.usageStats()
-		if err != nil {
-			http.Error(w, "error getting usage stats: "+err.Error(), http.StatusInternalServerError)
+		// Manual "refresh now" trigger: a synchronous scan of every shard.
+		// Slow on a large DB (numShards * per-shard query time), but
+		// operators may want an immediate aggregate after a config change.
+		if err := srv.scanAllShards(r.Context()); err != nil {
+			http.Error(w, "scanAllShards: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
@@ -1829,12 +2444,23 @@ func (srv *Server) serveUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Print out an HTML table of the usage stats, sorted by age.
+	// Dead-reckon the totals so PUT/eviction bursts since the last shard
+	// scan show up on this page immediately. The persisted vs pending split
+	// is implementation noise for /usage readers; if anyone needs the
+	// breakdown they can read gocached_{blob,pending_blob}_{count,bytes}
+	// from /metrics.
+	dCount, dBytes := srv.sumShardDeltas()
+	live := us.All()
+	live.Count += dCount
+	live.Size += dBytes
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<html><body><h1>gocached usage stats</h1>\n")
 	fmt.Fprintf(w, "<p>Current usage: %v of limit %v</p>\n",
-		us.All(), bytesFmt(srv.maxSize))
+		live, bytesFmt(srv.maxSize))
 
+	// Cohort histogram of stored Actions, by access-time age.
+	fmt.Fprintf(w, "<h2>Actions by access-time age</h2>\n")
 	fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")
 	fmt.Fprintf(w, "<tr><th>Age</th><th>Count</th><th>Size</th></tr>\n")
 	for _, d := range slices.Sorted(maps.Keys(us.ActionsLE)) {
@@ -1849,6 +2475,41 @@ func (srv *Server) serveUsage(w http.ResponseWriter, r *http.Request) {
 			title, c.Count, bytesFmt(c.Size))
 	}
 	fmt.Fprintf(w, "</table>\n")
+
+	// Shard scan freshness — how many shards were scanned within each
+	// cohort. Watching the smaller-bucket counts drop is the easiest way to
+	// spot the stats loop falling behind.
+	now := srv.now()
+	freshness, oldest, totalShards := srv.shardFreshness(now)
+	fmt.Fprintf(w, "<h2>Shard scan freshness</h2>\n")
+	fmt.Fprintf(w, "<p>%d of %d shards have a cached scan; staleness target %v.</p>\n",
+		totalShards, srv.numShards(), shardStalenessTarget)
+	if !oldest.IsZero() {
+		fmt.Fprintf(w, "<p>Oldest scan: %v ago (%v).</p>\n",
+			durFmt(now.Sub(oldest).Round(time.Second)), oldest.UTC().Format(time.RFC3339))
+	}
+	fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")
+	fmt.Fprintf(w, "<tr><th>Scanned within</th><th>Shards</th></tr>\n")
+	for _, b := range shardFreshnessBuckets {
+		fmt.Fprintf(w, "<tr><td>&lt;= %v</td><td>%d</td></tr>\n", durFmt(b), freshness[b])
+	}
+	fmt.Fprintf(w, "</table>\n")
+
+	// Per-shard query duration percentiles, snapshotted from the cached
+	// QueryDuration of every persisted shard. The Prometheus histogram
+	// gocached_shard_scan_duration_seconds carries the same data over time.
+	p25, p50, p90, nDur := srv.shardScanDurationPercentiles()
+	fmt.Fprintf(w, "<h2>Per-shard scan duration</h2>\n")
+	if nDur == 0 {
+		fmt.Fprintf(w, "<p>No shard has been scanned yet.</p>\n")
+	} else {
+		fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")
+		fmt.Fprintf(w, "<tr><th>Percentile</th><th>Duration</th></tr>\n")
+		fmt.Fprintf(w, "<tr><td>p25 (n=%d)</td><td>%v</td></tr>\n", nDur, p25.Round(time.Millisecond))
+		fmt.Fprintf(w, "<tr><td>p50</td><td>%v</td></tr>\n", p50.Round(time.Millisecond))
+		fmt.Fprintf(w, "<tr><td>p90</td><td>%v</td></tr>\n", p90.Round(time.Millisecond))
+		fmt.Fprintf(w, "</table>\n")
+	}
 }
 
 func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
