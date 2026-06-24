@@ -374,6 +374,20 @@ func (srv *Server) start() error {
 		Buckets: prometheus.DefBuckets,
 	})
 
+	// Buckets span roughly 1ms to 2s; cache hits should land in the low
+	// milliseconds, large PUTs and disk-backed GETs land higher up.
+	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2}
+	srv.getDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gocached_get_duration_seconds",
+		Help:    "wall time of each cache get request, labeled by outcome: get (hit), miss (404), or error",
+		Buckets: reqLatencyBuckets,
+	}, []string{"type"})
+	srv.putDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gocached_put_duration_seconds",
+		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error",
+		Buckets: reqLatencyBuckets,
+	}, []string{"storage"})
+
 	// Fill the namespace ID cache.
 	rows, err := srv.db.Query("SELECT NamespaceID, Namespace FROM Namespaces")
 	if err != nil {
@@ -399,7 +413,7 @@ func (srv *Server) start() error {
 		collectors.NewBuildInfoCollector(),
 	)
 	srv.registerMetrics(reg)
-	reg.MustRegister(srv.shardScanDuration)
+	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration)
 
 	// Per-scrape gauges for shard stats loop health. GaugeFunc recomputes on
 	// every Prometheus scrape, so the values stay fresh between scans
@@ -771,6 +785,13 @@ type Server struct {
 	// reflection.
 	shardScanDuration prometheus.Histogram
 
+	// getDuration and putDuration observe the wall time of each /action GET
+	// and PUT request handler, labeled by outcome. getDuration.type is one
+	// of "get" (hit), "miss" (404), or "error". putDuration.storage is one
+	// of "disk", "inline", or "error".
+	getDuration *prometheus.HistogramVec
+	putDuration *prometheus.HistogramVec
+
 	// Metrics. Exported fields for reflection, but within a private struct
 	// field to control the gocached Server API surface.
 	m struct {
@@ -1045,8 +1066,11 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	defer srv.m.ActiveGets.Add(-1)
 
 	start := srv.now()
+	result := "error"
 	defer func() {
-		stats.GetNanos += srv.now().Sub(start).Nanoseconds()
+		d := srv.now().Sub(start)
+		stats.GetNanos += d.Nanoseconds()
+		srv.getDuration.WithLabelValues(result).Observe(d.Seconds())
 	}()
 	stats.Gets++
 	ctx := r.Context()
@@ -1086,6 +1110,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			result = "miss"
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -1099,6 +1124,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	}
 
 	stats.GetHits++
+	result = "get"
 
 	outputID := cmp.Or(altObjectID, sha256hex)
 	isLZ4 := storedSize != uncompressedSize
@@ -1138,6 +1164,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	rc, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex, isLZ4)
 	if err != nil {
 		srv.logf("Get object error: %v", err)
+		result = "error"
 		httpErr("Get object error", http.StatusInternalServerError)
 		return
 	}
@@ -1147,6 +1174,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		// Just treat it as a cache miss. The background cleanup
 		// will eventually remove the Action row from the DB
 		// after identifying it as a dangling reference.
+		result = "miss"
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
@@ -1302,8 +1330,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	defer s.m.ActivePuts.Add(-1)
 
 	start := s.now()
+	storage := "error"
 	defer func() {
-		stats.PutsNanos += s.now().Sub(start).Nanoseconds()
+		d := s.now().Sub(start)
+		stats.PutsNanos += d.Nanoseconds()
+		s.putDuration.WithLabelValues(storage).Observe(d.Seconds())
 	}()
 
 	if r.Method != "PUT" {
@@ -1411,6 +1442,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	stats.PutsBytes += r.ContentLength
 	if smallData != nil {
 		stats.PutsInline++
+		storage = "inline"
+	} else {
+		storage = "disk"
 	}
 
 	w.WriteHeader(http.StatusNoContent)
