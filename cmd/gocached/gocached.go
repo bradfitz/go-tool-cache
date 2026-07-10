@@ -22,6 +22,9 @@ import (
 
 var (
 	dir         = flag.String("cache-dir", "", "cache directory, if empty defaults to <UserCacheDir>/gocached")
+	sqliteDir   = flag.String("sqlite-dir", "", "directory for the SQLite metadata database; if empty, defaults to the cache directory")
+	hotDir      = flag.String("hot-dir", "", "if non-empty, enable storage tiering with this directory as a fast tier (e.g. local NVMe) holding a bounded copy of recently used blobs; the cache directory remains the source of truth")
+	hotCapacity = flag.Int("hot-capacity-gb", 600, "maximum size of the hot tier directory in GiB; only used with --hot-dir")
 	verbose     = flag.Bool("verbose", false, "be verbose")
 	listen      = flag.String("listen", ":31364", "listen address for the build-facing HTTP server")
 	debugListen = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
@@ -65,10 +68,21 @@ func main() {
 
 	opts := []gocached.ServerOption{
 		gocached.WithDir(*dir),
+		gocached.WithSQLiteDir(*sqliteDir),
 		gocached.WithVerbose(*verbose),
 		gocached.WithMaxSize(int64(*maxSize) << 30),
 		gocached.WithMaxAge(time.Duration(*maxAge) * 24 * time.Hour),
 		gocached.WithShardPrefixLen(*shardPrefixLen),
+	}
+
+	if *hotDir != "" {
+		if *hotCapacity <= 0 {
+			log.Fatal("--hot-capacity-gb must be positive when --hot-dir is set")
+		}
+		opts = append(opts,
+			gocached.WithHotDir(*hotDir),
+			gocached.WithHotCapacity(int64(*hotCapacity)<<30),
+		)
 	}
 
 	if *jwtIssuer != "" {
