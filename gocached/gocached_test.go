@@ -279,6 +279,12 @@ func newServerTester(t testing.TB, extraOpts ...ServerOption) *tester {
 	}
 	st.srv = srv
 
+	// The hot tier index is populated by an async startup scan; wait for it
+	// so tests observe deterministic hot tier behavior.
+	if srv.hot != nil {
+		waitFor(t, "hot index scan", srv.hot.ready.Load)
+	}
+
 	st.hs = httptest.NewServer(st.srv)
 	t.Cleanup(func() { st.srv.Close() })
 	t.Cleanup(st.hs.Close)

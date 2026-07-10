@@ -329,7 +329,35 @@ func (srv *Server) start() error {
 	if err := os.MkdirAll(srv.dir, 0750); err != nil {
 		return fmt.Errorf("creating cache dir: %w", err)
 	}
-	db, err := openDB(srv.dir)
+	if srv.sqliteDir == "" {
+		srv.sqliteDir = srv.dir
+	} else if err := os.MkdirAll(srv.sqliteDir, 0750); err != nil {
+		return fmt.Errorf("creating sqlite dir: %w", err)
+	}
+	if srv.hotDir != "" {
+		if srv.hotDir == srv.dir {
+			return fmt.Errorf("hot dir %q must differ from cache dir", srv.hotDir)
+		}
+		if srv.hotCap <= 0 {
+			return fmt.Errorf("hot capacity must be positive when hot dir is set")
+		}
+		if err := os.MkdirAll(srv.hotDir, 0750); err != nil {
+			return fmt.Errorf("creating hot dir: %w", err)
+		}
+		srv.hot = newHotIndex()
+		// Populate the index asynchronously: scanning millions of files can
+		// take a while, and reads can be served from existing hot files right
+		// away. Until the scan completes and marks the index ready, nothing
+		// new is written into the hot tier.
+		go func() {
+			if err := srv.hot.scan(srv.shutdownCtx, srv.hotDir, srv.logf); err != nil {
+				srv.logf("hot tier: scan failed; hot tier writes remain disabled: %v", err)
+				return
+			}
+			srv.evictHotIfOver()
+		}()
+	}
+	db, err := openDB(srv.sqliteDir)
 	if err != nil {
 		return fmt.Errorf("openDB: %w", err)
 	}
@@ -379,7 +407,7 @@ func (srv *Server) start() error {
 	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2}
 	srv.getDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_get_duration_seconds",
-		Help:    "wall time of each cache get request, labeled by storage path: disk, inline, none (HEAD request), or error; and type: get (hit), miss (404), or error",
+		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, none (HEAD request), or error; and type: get (hit), miss (404), or error",
 		Buckets: reqLatencyBuckets,
 	}, []string{"storage", "type"})
 	srv.putDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -394,7 +422,7 @@ func (srv *Server) start() error {
 	}
 	srv.blobSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_blob_size_bytes",
-		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: disk, inline, or error; and type: get, put, or dup",
+		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, or error; and type: get, put, or dup",
 		Buckets: blobSizeBuckets,
 	}, []string{"storage", "type"})
 
@@ -478,6 +506,48 @@ func (srv *Server) start() error {
 			return float64(b)
 		},
 	))
+
+	if srv.hot != nil {
+		reg.MustRegister(prometheus.NewGaugeFunc(
+			prometheus.GaugeOpts{
+				Name: "gocached_hot_bytes",
+				Help: "bytes currently stored in the hot tier directory; bounded by the configured hot capacity",
+			},
+			func() float64 { return float64(srv.hot.usageBytes()) },
+		))
+		reg.MustRegister(prometheus.NewGaugeFunc(
+			prometheus.GaugeOpts{
+				Name: "gocached_hot_files",
+				Help: "number of blob files currently stored in the hot tier directory",
+			},
+			func() float64 { return float64(srv.hot.len()) },
+		))
+		reg.MustRegister(prometheus.NewGaugeFunc(
+			prometheus.GaugeOpts{
+				Name: "gocached_hot_ready",
+				Help: "1 once the hot tier startup scan has completed and new blobs may be written into the hot tier, else 0; alert if this stays 0 well past startup",
+			},
+			func() float64 {
+				if srv.hot.ready.Load() {
+					return 1
+				}
+				return 0
+			},
+		))
+		reg.MustRegister(prometheus.NewGaugeFunc(
+			prometheus.GaugeOpts{
+				Name: "gocached_hot_scan_running_seconds",
+				Help: "how long the hot tier startup scan has currently been running, in seconds; 0 when the scan is not running",
+			},
+			func() float64 {
+				ns := srv.hot.scanStart.Load()
+				if ns == 0 {
+					return 0
+				}
+				return time.Since(time.Unix(0, ns)).Seconds()
+			},
+		))
+	}
 
 	srv.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{
 		ErrorLog: log.Default(),
@@ -568,6 +638,34 @@ func WithShutdownCtx(ctx context.Context) ServerOption {
 func WithDir(dir string) ServerOption {
 	return func(srv *Server) {
 		srv.dir = dir
+	}
+}
+
+// WithSQLiteDir sets the directory where the server stores its SQLite
+// database. Defaults to the blob directory (see [WithDir]).
+func WithSQLiteDir(dir string) ServerOption {
+	return func(srv *Server) {
+		srv.sqliteDir = dir
+	}
+}
+
+// WithHotDir enables storage tiering, using dir as a fast storage tier (e.g.
+// local NVMe) holding a bounded copy of recently used blobs. The main blob
+// directory (see [WithDir]) remains the source of truth containing all blobs;
+// files in the hot directory can be deleted at any time. If set,
+// [WithHotCapacity] must also be set. Defaults to empty, meaning no tiering.
+func WithHotDir(dir string) ServerOption {
+	return func(srv *Server) {
+		srv.hotDir = dir
+	}
+}
+
+// WithHotCapacity sets the maximum number of bytes stored in the hot tier
+// directory (see [WithHotDir]). When usage exceeds this capacity, the least
+// recently used hot files are deleted.
+func WithHotCapacity(bytes int64) ServerOption {
+	return func(srv *Server) {
+		srv.hotCap = bytes
 	}
 }
 
@@ -718,7 +816,11 @@ func (srv *Server) Close() error {
 // valid instance.
 type Server struct {
 	db             *sql.DB
-	dir            string // for SQLite DB + large blobs
+	dir            string // for large blobs (and the SQLite DB, unless sqliteDir is set)
+	sqliteDir      string // for the SQLite DB; if empty, defaults to dir
+	hotDir         string // if non-empty, fast storage tier for a bounded copy of hot blobs
+	hotCap         int64  // maximum bytes in hotDir; must be positive if hotDir is set
+	hot            *hotIndex
 	verbose        bool
 	logf           logger.Logf
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
@@ -830,6 +932,15 @@ type Server struct {
 
 		SQLiteDataBytes expvar.Int `type:"gauge" name:"sqlite_data_bytes" help:"size in bytes of the SQLite main database file on disk"`
 		SQLiteWALBytes  expvar.Int `type:"gauge" name:"sqlite_wal_bytes" help:"size in bytes of the SQLite WAL file on disk; should stay bounded near walJournalSizeLimit"`
+
+		HotHits          expvar.Int `type:"counter" name:"hot_hits" help:"GETs served from the hot tier"`
+		HotMisses        expvar.Int `type:"counter" name:"hot_misses" help:"GETs that were not served from the hot tier"`
+		HotReadErrs      expvar.Int `type:"counter" name:"hot_read_errs" help:"hot tier opens that failed for a reason other than the file not existing; reads fall back to the main blob directory"`
+		HotPromotions    expvar.Int `type:"counter" name:"hot_promotions" help:"blobs copied into the hot tier after a hot tier miss"`
+		HotPromotionErrs expvar.Int `type:"counter" name:"hot_promotion_errs" help:"failed attempts to copy a blob into the hot tier"`
+		HotWriteErrs     expvar.Int `type:"counter" name:"hot_write_errs" help:"failed hot tier writes during PUT; the PUT itself still succeeds"`
+		HotEvicted       expvar.Int `type:"counter" name:"hot_evicted" help:"files evicted from the hot tier to stay under its capacity"`
+		HotEvictedBytes  expvar.Int `type:"counter" name:"hot_evicted_bytes" help:"bytes reclaimed by evicting files from the hot tier"`
 	}
 }
 
@@ -1177,7 +1288,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	// Otherwise, for large objects that we know about, we can try to get them
 	// from our local disk or a peer.
 
-	rc, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex, isLZ4)
+	rc, fromHot, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex, isLZ4)
 	if err != nil {
 		srv.logf("Get object error: %v", err)
 		result = "error"
@@ -1197,6 +1308,9 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	}
 	defer rc.Close()
 	storage = "disk"
+	if fromHot {
+		storage = "hot"
+	}
 
 	if isLZ4 && !clientAcceptsLZ4 {
 		// Client doesn't accept lz4; decompress on the fly.
@@ -1324,25 +1438,152 @@ func (srv *Server) flushAccessTimeBumpsWithErr() (ret error) {
 //
 // If isLZ4 is true, the .lz4 suffixed path is opened; otherwise the plain path.
 //
-// It returns (nil, nil) on miss.
-func (srv *Server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string, isLZ4 bool) (rc io.ReadCloser, err error) {
+// With tiering enabled, the hot tier is consulted first; fromHot reports
+// whether the returned reader is backed by the hot tier. A hot tier miss that
+// hits the main directory kicks off an asynchronous promotion into the hot
+// tier.
+//
+// It returns (nil, false, nil) on miss.
+func (srv *Server) getObjectFromDiskOrPeer(_ context.Context, sha256hex string, isLZ4 bool) (rc io.ReadCloser, fromHot bool, err error) {
 	if len(sha256hex) != sha256.Size*2 {
-		return nil, fmt.Errorf("invalid sha256hex %q", sha256hex)
+		return nil, false, fmt.Errorf("invalid sha256hex %q", sha256hex)
 	}
-	diskPath := filepath.Join(srv.dir, sha256hex[:2], sha256hex)
+	name := sha256hex
 	if isLZ4 {
-		diskPath += ".lz4"
+		name += ".lz4"
 	}
+	if srv.hot != nil {
+		f, err := os.Open(srv.hotFilepath(name))
+		if err == nil {
+			srv.hot.touch(name)
+			srv.m.HotHits.Add(1)
+			return f, true, nil
+		}
+		srv.m.HotMisses.Add(1)
+		if !os.IsNotExist(err) {
+			srv.m.HotReadErrs.Add(1)
+			srv.logf("hot tier: opening %v: %v", name, err)
+		}
+	}
+	diskPath := filepath.Join(srv.dir, sha256hex[:2], name)
 	f, err := os.Open(diskPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// TODO(bradfitz): search peers, S3, etc.
-			// For now, just return nil, nil on miss.
-			return nil, nil
+			// For now, just return a miss.
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
-	return f, nil
+	if srv.hot != nil {
+		// The index may still hold an entry if the hot file vanished out from
+		// under us (e.g. a wiped ephemeral disk); drop it so the stale entry
+		// doesn't block re-promotion and usage accounting stays honest.
+		srv.hot.remove(name)
+		if srv.hot.tryStartPromotion(name) {
+			go srv.promoteToHot(name)
+		}
+	}
+	return f, false, nil
+}
+
+// promoteToHot copies the blob file with the given base filename from the
+// main blob directory into the hot tier. It runs in its own goroutine after a
+// hot tier miss; the caller must have registered the promotion via
+// [hotIndex.tryStartPromotion].
+func (srv *Server) promoteToHot(name string) {
+	defer srv.hot.endPromotion(name)
+	if srv.shutdownCtx.Err() != nil {
+		return
+	}
+	size, err := srv.copyToHot(name)
+	if err != nil {
+		srv.logf("hot tier: promoting %v: %v", name, err)
+		srv.m.HotPromotionErrs.Add(1)
+		return
+	}
+	srv.hot.add(name, size)
+	srv.m.HotPromotions.Add(1)
+	srv.evictHotIfOver()
+}
+
+// copyToHot copies the named blob file from the main blob directory to a temp
+// file in the hot dir and atomically renames it into place, returning the
+// file size. The bytes are copied verbatim (in already-compressed form, if
+// applicable), so no re-hashing or re-compression is needed.
+func (srv *Server) copyToHot(name string) (size int64, err error) {
+	src, err := os.Open(filepath.Join(srv.dir, name[:2], name))
+	if err != nil {
+		return 0, err
+	}
+	defer src.Close()
+
+	tf, err := os.CreateTemp(srv.hotDir, fmt.Sprintf("upload-%d-*", srv.now().Unix()))
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			tf.Close()
+			os.Remove(tf.Name())
+		}
+	}()
+
+	size, err = io.Copy(tf, src)
+	if err != nil {
+		return 0, err
+	}
+	if err := tf.Close(); err != nil {
+		return 0, err
+	}
+	target := srv.hotFilepath(name)
+	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
+		return 0, err
+	}
+	if err := os.Rename(tf.Name(), target); err != nil {
+		return 0, err
+	}
+	return size, nil
+}
+
+// hotEvictTargetPct is the percentage of the hot tier capacity that eviction
+// shrinks usage down to once the capacity is exceeded. Evicting slightly past
+// the limit reduces churn from evicting one file at a time on every write.
+const hotEvictTargetPct = 95
+
+// evictHotIfOver deletes the least recently used hot tier files if the hot
+// tier is over its capacity. It's a no-op when tiering is disabled, the
+// startup scan hasn't yet measured usage, or usage is within bounds. Hot
+// files are just copies, so deletion never loses data.
+func (srv *Server) evictHotIfOver() {
+	if srv.hot == nil || !srv.hot.ready.Load() || srv.hot.usageBytes() <= srv.hotCap {
+		return
+	}
+	for _, ent := range srv.hot.evictLRU(srv.hotCap * hotEvictTargetPct / 100) {
+		if err := os.Remove(srv.hotFilepath(ent.name)); err != nil && !os.IsNotExist(err) {
+			srv.logf("hot tier: evicting %v: %v", ent.name, err)
+		}
+		srv.m.HotEvicted.Add(1)
+		srv.m.HotEvictedBytes.Add(ent.size)
+	}
+}
+
+// removeFromHot deletes both possible hot tier files (plain and .lz4) for the
+// given SHA256 hex string and drops them from the hot index. It is called
+// when a blob is evicted from the cache entirely. The files are removed even
+// if the index doesn't know them (e.g. the startup scan hasn't reached them
+// yet). Errors are logged only: hot files are disposable copies, so a
+// leftover is at worst wasted space that eviction later reclaims.
+func (srv *Server) removeFromHot(sha256Hex string) {
+	if srv.hot == nil {
+		return
+	}
+	for _, name := range []string{sha256Hex, sha256Hex + ".lz4"} {
+		srv.hot.remove(name)
+		if err := os.Remove(srv.hotFilepath(name)); err != nil && !os.IsNotExist(err) {
+			srv.logf("hot tier: removing %v: %v", name, err)
+		}
+	}
 }
 
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats, namespaceID int64) {
@@ -1623,7 +1864,13 @@ func (s *Server) sha256Filepath(hash [sha256.Size]byte) string {
 	return filepath.Join(s.dir, hex[:2], hex)
 }
 
-func (s *Server) writeDiskBlob(size int64, r io.Reader) (diskSize int64, err error) {
+// hotFilepath returns the hot tier path for the given base filename, which is
+// either "<sha256-hex>" or "<sha256-hex>.lz4".
+func (s *Server) hotFilepath(name string) string {
+	return filepath.Join(s.hotDir, name[:2], name)
+}
+
+func (s *Server) writeDiskBlob(size int64, r io.Reader) (diskSize int64, retErr error) {
 	compress := size >= lz4CompressThreshold
 
 	nowUnix := s.now().Unix()
@@ -1632,20 +1879,46 @@ func (s *Server) writeDiskBlob(size int64, r io.Reader) (diskSize int64, err err
 		return 0, err
 	}
 	defer func() {
-		if err == nil {
+		if retErr == nil {
 			return
 		}
 		tf.Close()
 		os.Remove(tf.Name())
 	}()
 
+	// With tiering enabled, tee the identical bytes into a hot tier temp file
+	// as we write the main one. Hot tier failures never fail the PUT: the main
+	// blob directory is the source of truth, and a later GET re-promotes.
+	// Until the startup scan has the hot tier's usage, skip the hot copy
+	// rather than grow the tier past its unknown budget.
+	var hotName string // base filename of the blob's target; set once the hash is known
+	var fileDst io.Writer = tf
+	if s.hot != nil && s.hot.ready.Load() {
+		htf, herr := os.CreateTemp(s.hotDir, fmt.Sprintf("upload-%d-*", nowUnix))
+		if herr != nil {
+			s.logf("hot tier: creating temp file: %v", herr)
+			s.m.HotWriteErrs.Add(1)
+		} else {
+			// The failsafeWriter swallows mid-stream hot write errors (e.g.
+			// disk full) so the main copy keeps going; finishHotWrite sees the
+			// first such error and cleans up.
+			hotFW := &failsafeWriter{w: htf}
+			fileDst = io.MultiWriter(tf, hotFW)
+			// The deferred call reads the named results, so it installs the
+			// hot copy only when the whole PUT succeeded.
+			defer func() {
+				s.finishHotWrite(htf, hotFW.err, retErr, hotName, diskSize)
+			}()
+		}
+	}
+
 	hasher := sha256.New()
 	lr := io.LimitReader(io.TeeReader(r, hasher), size+1)
 
-	var dst io.Writer = tf
+	dst := fileDst
 	var lzw *lz4.Writer
 	if compress {
-		lzw = lz4.NewWriter(tf)
+		lzw = lz4.NewWriter(fileDst)
 		if err := lzw.Apply(lz4.SizeOption(uint64(size))); err != nil {
 			return 0, err
 		}
@@ -1681,6 +1954,7 @@ func (s *Server) writeDiskBlob(size int64, r io.Reader) (diskSize int64, err err
 	if compress {
 		target += ".lz4"
 	}
+	hotName = filepath.Base(target)
 	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
 		return 0, err
 	}
@@ -1688,6 +1962,36 @@ func (s *Server) writeDiskBlob(size int64, r io.Reader) (diskSize int64, err err
 		return 0, err
 	}
 	return diskSize, nil
+}
+
+// finishHotWrite is deferred by writeDiskBlob when tiering is enabled. If the
+// main blob landed (putErr is writeDiskBlob's result), it installs the hot
+// tier temp file htf that was teed alongside the main copy; on any failure it
+// cleans htf up instead. writeErr is the first error from the failsafeWriter
+// feeding htf, if any. Hot tier failures are logged and counted but never
+// propagated; the hot tier is only a cache of the main blob directory.
+func (s *Server) finishHotWrite(htf *os.File, writeErr, putErr error, name string, size int64) {
+	closeErr := htf.Close()
+	if putErr != nil {
+		// The PUT itself failed; there's no blob to install a hot copy of.
+		os.Remove(htf.Name())
+		return
+	}
+	err := cmp.Or(writeErr, closeErr)
+	if err == nil {
+		target := s.hotFilepath(name)
+		if err = os.MkdirAll(filepath.Dir(target), 0750); err == nil {
+			err = os.Rename(htf.Name(), target)
+		}
+	}
+	if err != nil {
+		s.logf("hot tier: storing blob %v: %v", name, err)
+		s.m.HotWriteErrs.Add(1)
+		os.Remove(htf.Name())
+		return
+	}
+	s.hot.add(name, size)
+	s.evictHotIfOver()
 }
 
 type countAndSize struct {
@@ -2352,6 +2656,7 @@ func (srv *Server) evictOldestActions(ctx context.Context, cutoff int64, maxCoun
 			if err := os.Remove(base); err != nil && !os.IsNotExist(err) {
 				return ret, fmt.Errorf("removing disk file: %w", err)
 			}
+			srv.removeFromHot(sha256Hex)
 		}
 		// Stop once we've freed enough aggregate bytes. For maxAge cleanup
 		// callers pass math.MaxInt64 so this check never triggers.
@@ -2381,6 +2686,7 @@ func (srv *Server) evictOldestActions(ctx context.Context, cutoff int64, maxCoun
 // aggregate from the shard stats loop drives the decision; the eviction itself
 // goes straight at idx_actions_access without consulting the shards.
 func (srv *Server) cleanupTick(ctx context.Context) (countAndSize, error) {
+	srv.evictHotIfOver()
 	var ret countAndSize
 	us := srv.lastUsage.Load()
 	if us == nil {
@@ -2468,7 +2774,7 @@ func (srv *Server) runCheckpointLoop() {
 // dbPath returns the on-disk path of the SQLite main database file.
 // The WAL file is at dbPath() + "-wal".
 func (srv *Server) dbPath() string {
-	return filepath.Join(srv.dir, fmt.Sprintf("gocached-v%d.db", schemaVersion))
+	return filepath.Join(srv.sqliteDir, fmt.Sprintf("gocached-v%d.db", schemaVersion))
 }
 
 // updateDBSizeMetrics re-stats the SQLite files and updates the size gauges.
