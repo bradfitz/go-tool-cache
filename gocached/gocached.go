@@ -862,6 +862,14 @@ func (srv *Server) Close() error {
 
 // Server implements a gocached server. Use [NewServer] to create and start a
 // valid instance.
+//
+// PUT requests are acknowledged as soon as their bytes are spooled to the
+// local fast disk (or memory, for inline-sized objects); a background
+// pipeline (see [putQueue]) then copies blobs into the main blob directory
+// and commits metadata to SQLite in batched transactions. GETs consult the
+// pending PUTs before the database, so acknowledged writes are always
+// readable; a crash loses only unflushed PUTs, which is acceptable for a
+// cache.
 type Server struct {
 	db             *sql.DB
 	dir            string // for large blobs (and the SQLite DB, unless sqliteDir is set)
