@@ -6,7 +6,6 @@ package gocached
 import (
 	"container/list"
 	"context"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -165,24 +164,6 @@ func (h *hotIndex) endPromotion(name string) {
 // staleHotTempAge is how old an "upload-*" temp file in the hot dir must be
 // before the startup scan deletes it as an abandoned leftover from a crash.
 const staleHotTempAge = time.Hour
-
-// failsafeWriter wraps a writer whose failures should not abort the stream
-// feeding it. The first underlying write error is recorded and all subsequent
-// writes are discarded, but Write always reports success so that sibling
-// writers in an [io.MultiWriter] keep receiving bytes.
-type failsafeWriter struct {
-	w   io.Writer
-	err error // first underlying write error, if any
-}
-
-func (fw *failsafeWriter) Write(p []byte) (int, error) {
-	if fw.err == nil {
-		if _, err := fw.w.Write(p); err != nil {
-			fw.err = err
-		}
-	}
-	return len(p), nil
-}
 
 // scan walks dir and populates h with its blob files, ordered by file
 // modification time so the oldest files are evicted first, then marks h
