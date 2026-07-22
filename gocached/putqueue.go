@@ -519,6 +519,22 @@ func (srv *Server) drainPendingPuts() error {
 	if q == nil {
 		return nil
 	}
+
+	// Empty the worker channels so repeated drains without running workers
+	// (tests, benchmarks) don't fill their buffers and block enqueue. The
+	// pending map is the authoritative source of what needs processing;
+	// anything received here is either in the map (handled below) or
+	// already retired.
+empty:
+	for {
+		select {
+		case <-q.moverCh:
+		case <-q.flushCh:
+		default:
+			break empty
+		}
+	}
+
 	q.mu.Lock()
 	batch := make([]*pendingPut, 0, len(q.pending))
 	for _, p := range q.pending {
