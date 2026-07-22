@@ -1188,12 +1188,11 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	defer srv.m.ActiveGets.Add(-1)
 
 	start := srv.now()
-	storage := "error"
-	result := "error"
+	labels := writeObjectResponseLabels{storage: "error", result: "error"}
 	defer func() {
 		d := srv.now().Sub(start)
 		stats.GetNanos += d.Nanoseconds()
-		srv.getDuration.WithLabelValues(storage, result).Observe(d.Seconds())
+		srv.getDuration.WithLabelValues(labels.storage, labels.result).Observe(d.Seconds())
 	}()
 	stats.Gets++
 	ctx := r.Context()
@@ -1233,8 +1232,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	}
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			result = "miss"
-			storage = "none"
+			labels = writeObjectResponseLabels{storage: "none", result: "miss"}
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -1248,51 +1246,115 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	}
 
 	stats.GetHits++
-	result = "get"
 
-	outputID := cmp.Or(altObjectID, sha256hex)
+	var sd []byte
+	if smallData.Valid {
+		sd = []byte(smallData.String)
+	}
 	isLZ4 := storedSize != uncompressedSize
+	labels = srv.writeObjectResponse(w, r, stats, objectSource{
+		sha256hex:        sha256hex,
+		storedSize:       storedSize,
+		uncompressedSize: uncompressedSize,
+		altOutputID:      altObjectID,
+		inline:           smallData.Valid,
+		smallData:        sd,
+		open: func() (io.ReadCloser, bool, error) {
+			return srv.getObjectFromDiskOrPeer(ctx, sha256hex, isLZ4)
+		},
+	})
+}
+
+// objectSource describes a cached object to be written as an HTTP response,
+// independent of whether its metadata came from SQLite or elsewhere.
+type objectSource struct {
+	sha256hex        string
+	storedSize       int64 // bytes stored (possibly lz4-compressed)
+	uncompressedSize int64
+	altOutputID      string // "" if the output ID equals sha256hex
+	inline           bool   // whether smallData holds the object bytes
+	smallData        []byte // object bytes if inline
+
+	// open opens a non-inline object for reading.
+	// A nil ReadCloser with nil error means the object was not found.
+	open func() (rc io.ReadCloser, fromHot bool, err error)
+}
+
+// writeObjectResponseLabels describes how a [Server.writeObjectResponse]
+// call was served. Its fields are the label values reported to the get
+// latency metric.
+type writeObjectResponseLabels struct {
+	// storage says where the object bytes came from: "inline" (the
+	// database), "disk" (the main blob directory), or "hot" (the hot
+	// tier); "none" for a response without a body (a HEAD request, an
+	// empty object, or a miss); or "error". Callers serving from the
+	// put-queue relabel hits as "pending" via markPending.
+	storage string
+
+	// result is the request outcome: "get" (a hit), "miss" (a 404), or
+	// "error".
+	result string
+}
+
+// markPending relabels a hit that carried a body as served from "pending"
+// storage, for responses served from the put-queue rather than committed
+// storage. Bodyless responses, misses, and errors keep their labels.
+func (l *writeObjectResponseLabels) markPending() {
+	if l.result == "get" && l.storage != "none" {
+		l.storage = "pending"
+	}
+}
+
+// writeObjectResponse writes src to w, negotiating lz4 content encoding and
+// serving inline data directly. It returns the labels for the get latency
+// metric.
+func (srv *Server) writeObjectResponse(w http.ResponseWriter, r *http.Request, stats *stats, src objectSource) (labels writeObjectResponseLabels) {
+	labels = writeObjectResponseLabels{storage: "error", result: "get"}
+
+	outputID := cmp.Or(src.altOutputID, src.sha256hex)
+	isLZ4 := src.storedSize != src.uncompressedSize
 	clientAcceptsLZ4 := requestAcceptsEncoding(r, "lz4")
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Go-Output-Id", outputID)
 
-	if smallData.Valid || !isLZ4 {
+	if src.inline || !isLZ4 {
 		// Inline, empty, or legacy uncompressed: Content-Length is the stored size.
-		w.Header().Set("Content-Length", fmt.Sprint(storedSize))
+		w.Header().Set("Content-Length", fmt.Sprint(src.storedSize))
 	} else if isLZ4 && clientAcceptsLZ4 {
 		// Disk lz4 + client accepts lz4: stream raw compressed file.
 		w.Header().Set("Content-Encoding", "lz4")
-		w.Header().Set("Content-Length", fmt.Sprint(storedSize))
-		w.Header().Set("X-Uncompressed-Length", fmt.Sprint(uncompressedSize))
+		w.Header().Set("Content-Length", fmt.Sprint(src.storedSize))
+		w.Header().Set("X-Uncompressed-Length", fmt.Sprint(src.uncompressedSize))
 	} else {
 		// Disk lz4 + client doesn't accept lz4: decompress for client.
-		w.Header().Set("Content-Length", fmt.Sprint(uncompressedSize))
+		w.Header().Set("Content-Length", fmt.Sprint(src.uncompressedSize))
 	}
 
-	if r.Method == "HEAD" || (storedSize == 0 && uncompressedSize == 0) {
-		storage = "none"
+	if r.Method == "HEAD" || (src.storedSize == 0 && src.uncompressedSize == 0) {
+		labels.storage = "none"
 		return
 	}
 
-	if smallData.Valid {
+	if src.inline {
 		// For small outputs stored inline in the database, we can return them directly.
 		stats.GetHitsInline++
-		stats.GetBytes += storedSize
-		storage = "inline"
-		srv.blobSize.WithLabelValues(storage, result).Observe(float64(storedSize))
-		io.WriteString(w, smallData.String)
+		stats.GetBytes += src.storedSize
+		labels.storage = "inline"
+		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.storedSize))
+		w.Write(src.smallData)
 		return
 	}
 
 	// Otherwise, for large objects that we know about, we can try to get them
 	// from our local disk or a peer.
 
-	rc, fromHot, err := srv.getObjectFromDiskOrPeer(ctx, sha256hex, isLZ4)
+	rc, fromHot, err := src.open()
 	if err != nil {
 		srv.logf("Get object error: %v", err)
-		result = "error"
-		httpErr("Get object error", http.StatusInternalServerError)
+		stats.GetErrs++
+		http.Error(w, "Get object error", http.StatusInternalServerError)
+		labels = writeObjectResponseLabels{storage: "error", result: "error"}
 		return
 	}
 	if rc == nil {
@@ -1301,27 +1363,27 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		// Just treat it as a cache miss. The background cleanup
 		// will eventually remove the Action row from the DB
 		// after identifying it as a dangling reference.
-		result = "miss"
-		storage = "none"
 		http.Error(w, "not found", http.StatusNotFound)
+		labels = writeObjectResponseLabels{storage: "none", result: "miss"}
 		return
 	}
 	defer rc.Close()
-	storage = "disk"
+	labels.storage = "disk"
 	if fromHot {
-		storage = "hot"
+		labels.storage = "hot"
 	}
 
 	if isLZ4 && !clientAcceptsLZ4 {
 		// Client doesn't accept lz4; decompress on the fly.
-		stats.GetBytes += uncompressedSize
-		srv.blobSize.WithLabelValues(storage, result).Observe(float64(uncompressedSize))
+		stats.GetBytes += src.uncompressedSize
+		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.uncompressedSize))
 		io.Copy(w, lz4.NewReader(rc))
 	} else {
-		stats.GetBytes += storedSize
-		srv.blobSize.WithLabelValues(storage, result).Observe(float64(storedSize))
+		stats.GetBytes += src.storedSize
+		srv.blobSize.WithLabelValues(labels.storage, labels.result).Observe(float64(src.storedSize))
 		io.Copy(w, rc)
 	}
+	return
 }
 
 // maybeBumpAccessTime reports whether it enqueued an access time bump for the
@@ -1648,6 +1710,20 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 
 	sha256hex := fmt.Sprintf("%x", hasher.Sum(nil))
 
+	altOutputID := ""
+	if sha256hex != outputID {
+		altOutputID = outputID
+	}
+	p := &pendingPut{
+		key:              actionKey{NamespaceID: namespaceID, ActionID: actionID},
+		sha256hex:        sha256hex,
+		storedSize:       storedSize,
+		uncompressedSize: uncompressedSize,
+		altOutputID:      altOutputID,
+		createTime:       s.now().Unix(),
+		smallData:        smallData,
+	}
+
 	s.sqliteWriteMu.Lock()
 	defer s.sqliteWriteMu.Unlock()
 
@@ -1662,46 +1738,11 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	}
 	defer tx.Rollback()
 
-	var blobID int64
-	err = tx.QueryRow(`INSERT INTO Blobs (SHA256, StoredSize, UncompressedSize, SmallData)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(SHA256) DO UPDATE SET SHA256=excluded.SHA256
-		RETURNING BlobID;
-`, sha256hex, storedSize, uncompressedSize, smallData).Scan(&blobID)
+	dup, err := s.insertPutTx(tx, p)
 	if err != nil {
-		s.logf("Blobs insert error: %v", err)
+		s.logf("put insert error: %v", err)
 		stats.PutErrs++
-		http.Error(w, "Blobs insert error", http.StatusInternalServerError)
-		return
-	}
-
-	// Insert or update the action in the database.
-	nowUnix := s.now().Unix()
-	altObjectID := ""
-	if sha256hex != outputID {
-		altObjectID = outputID
-	}
-	res, err := tx.Exec(`INSERT OR IGNORE INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime)
-	VALUES (?, ?, ?, ?, ?, ?)`,
-		namespaceID,
-		actionID,
-		blobID,
-		altObjectID,
-		nowUnix,
-		nowUnix,
-	)
-	if err != nil {
-		s.logf("Actions insert error: %v", err)
-		stats.PutErrs++
-		http.Error(w, "Actions insert error", http.StatusInternalServerError)
-		return
-	}
-
-	affected, err := res.RowsAffected()
-	if err != nil {
-		s.logf("Actions rows affected error: %v", err)
-		stats.PutErrs++
-		http.Error(w, "Actions rows affected error", http.StatusInternalServerError)
+		http.Error(w, "insert error", http.StatusInternalServerError)
 		return
 	}
 
@@ -1712,7 +1753,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		return
 	}
 
-	if affected == 0 {
+	if dup {
 		stats.PutsDup++
 		result = "dup"
 	} else {
