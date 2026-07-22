@@ -361,6 +361,12 @@ func (srv *Server) start() error {
 	if err := os.MkdirAll(queueDir, 0750); err != nil {
 		return fmt.Errorf("creating put-queue dir: %w", err)
 	}
+	// The cleanup intent directory, unlike the spool, is deliberately NOT
+	// wiped: intents surviving a crash are what let the sweeper find blobs
+	// that reached the main blob directory without SQLite accounting.
+	if err := os.MkdirAll(filepath.Join(srv.dir, cleanupDirName), 0750); err != nil {
+		return fmt.Errorf("creating cleanup dir: %w", err)
+	}
 	srv.putq = newPutQueue(srv, queueDir)
 
 	if srv.hot != nil {
@@ -1006,6 +1012,7 @@ type Server struct {
 		PutQueueFlushes      expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
 		PutQueueFlushedItems expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`
 		PutQueueFlushDups    expvar.Int `type:"counter" name:"put_queue_flush_dups" help:"subset of put_queue_flushed_items that were duplicates of an already-stored action"`
+		PutQueueOrphansSwept expvar.Int `type:"counter" name:"put_queue_orphans_swept" help:"blobs deleted from the main blob directory by the cleanup sweeper because a crashed or dropped PUT left them without SQLite accounting"`
 	}
 }
 
