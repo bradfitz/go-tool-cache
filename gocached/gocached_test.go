@@ -139,6 +139,9 @@ func (st *tester) diskFiles() []string {
 		if err != nil {
 			return err
 		}
+		if fi.IsDir() && strings.HasPrefix(fi.Name(), ".") && path != st.srv.dir {
+			return filepath.SkipDir
+		}
 		if !fi.Mode().IsRegular() || strings.HasPrefix(fi.Name(), ".") || strings.HasPrefix(fi.Name(), "gocached") {
 			return nil
 		}
