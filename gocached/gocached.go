@@ -426,7 +426,7 @@ func (srv *Server) start() error {
 	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2}
 	srv.getDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_get_duration_seconds",
-		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, none (HEAD request), or error; and type: get (hit), miss (404), or error",
+		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), none (HEAD request), or error; and type: get (hit), miss (404), or error",
 		Buckets: reqLatencyBuckets,
 	}, []string{"storage", "type"})
 	srv.putDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -830,12 +830,19 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 // database.
 func (srv *Server) Close() error {
 	srv.shutdownCancel()
+
+	// Settle any PUTs the background pipeline hadn't finished: their
+	// metadata exists only in memory until flushed.
+	var err error
+	if drainErr := srv.drainPendingPuts(); drainErr != nil {
+		err = fmt.Errorf("draining pending puts: %w", drainErr)
+	}
+
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
-	var err error
 	if srv.updateAccessTimeStmt != nil {
-		err = srv.updateAccessTimeStmt.Close()
+		err = errors.Join(err, srv.updateAccessTimeStmt.Close())
 	}
 	if srv.writeConn != nil {
 		err = errors.Join(err, srv.writeConn.Close())
@@ -1260,6 +1267,52 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	if r.Header.Get("Want-Object") != "1" {
 		httpErr("bad request: missing Want-Object header", http.StatusBadRequest)
 		return
+	}
+
+	// Serve from the put-queue first: a just-written PUT is readable here
+	// before its metadata reaches SQLite. Like the SQL queries below, the
+	// global namespace is preferred over the session's.
+	pp, havePending := srv.putq.lookup(actionKey{ActionID: actionID})
+	if !havePending && sessionData != nil && sessionData.namespaceID != 0 {
+		pp, havePending = srv.putq.lookup(actionKey{NamespaceID: sessionData.namespaceID, ActionID: actionID})
+	}
+	if havePending {
+		// Open the spool file before committing to this path: if the entry
+		// was retired between the lookup and now, its file is gone but its
+		// metadata is committed, so fall through to the SQL path below.
+		var rc io.ReadCloser
+		ok := true
+		if pp.smallData == nil {
+			f, err := os.Open(pp.queueFile)
+			if err != nil {
+				ok = false
+			} else {
+				rc = f
+			}
+		}
+		if ok {
+			stats.GetHits++
+			opened := false
+			defer func() {
+				if !opened && rc != nil {
+					rc.Close()
+				}
+			}()
+			labels = srv.writeObjectResponse(w, r, stats, objectSource{
+				sha256hex:        pp.sha256hex,
+				storedSize:       pp.storedSize,
+				uncompressedSize: pp.uncompressedSize,
+				altOutputID:      pp.altOutputID,
+				inline:           pp.smallData != nil,
+				smallData:        pp.smallData,
+				open: func() (io.ReadCloser, bool, error) {
+					opened = true
+					return rc, false, nil
+				},
+			})
+			labels.markPending()
+			return
+		}
 	}
 
 	var (
@@ -1725,6 +1778,24 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		return
 	}
 
+	// Backpressure: reserve queue room for the declared size before reading
+	// any of the body. This blocks when the background pipeline is behind,
+	// and aborts if the client goes away while waiting.
+	reserved, err := s.putq.reserve(r.Context(), r.ContentLength)
+	if err != nil {
+		stats.PutErrs++
+		http.Error(w, "canceled while awaiting queue room", http.StatusServiceUnavailable)
+		return
+	}
+	// The reservation is handed off to the pending entry on enqueue; until
+	// then, any early return must give it back.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			s.putq.unreserve(reserved)
+		}
+	}()
+
 	hasher := sha256.New()
 	hashingBody := io.TeeReader(r.Body, hasher)
 
@@ -1732,9 +1803,10 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	uncompressedSize := r.ContentLength
 
 	var smallData []byte
+	var queueFile string
 	if r.ContentLength <= smallObjectSize {
-		// Store small objects inline in the database.
-		var err error
+		// Small objects are held in memory and eventually stored inline in
+		// the database.
 		smallData, err = io.ReadAll(hashingBody)
 		if err != nil {
 			s.logf("Read content error: %v", err)
@@ -1748,14 +1820,18 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 			return
 		}
 	} else {
-		// For larger objects, we store them on disk (lz4 compressed).
-		diskSize, err := s.writeDiskBlob(r.ContentLength, hashingBody)
+		// Larger objects are spooled (lz4 compressed) to the put-queue
+		// directory on the local disk; the background movers copy them
+		// into the main blob directory.
+		diskSize, path, err := s.putq.spoolBlob(r.ContentLength, hashingBody)
 		if err != nil {
-			s.logf("Write disk blob error: %v", err)
-			http.Error(w, "Write disk blob error", http.StatusInternalServerError)
+			s.logf("Spool blob error: %v", err)
+			stats.PutErrs++
+			http.Error(w, "Spool blob error", http.StatusInternalServerError)
 			return
 		}
 		storedSize = diskSize
+		queueFile = path
 	}
 
 	sha256hex := fmt.Sprintf("%x", hasher.Sum(nil))
@@ -1772,42 +1848,22 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		altOutputID:      altOutputID,
 		createTime:       s.now().Unix(),
 		smallData:        smallData,
+		queueFile:        queueFile,
+		reservedBytes:    reserved,
 	}
 
-	s.sqliteWriteMu.Lock()
-	defer s.sqliteWriteMu.Unlock()
-
-	// Do both inserts in one transaction so each PUT pays for a single
-	// WAL commit (and its fsync) rather than two autocommits.
-	tx, err := s.db.Begin()
-	if err != nil {
-		s.logf("Begin tx error: %v", err)
-		stats.PutErrs++
-		http.Error(w, "Begin tx error", http.StatusInternalServerError)
-		return
-	}
-	defer tx.Rollback()
-
-	dup, err := s.insertPutTx(tx, p)
-	if err != nil {
-		s.logf("put insert error: %v", err)
-		stats.PutErrs++
-		http.Error(w, "insert error", http.StatusInternalServerError)
-		return
-	}
-
-	if err := tx.Commit(); err != nil {
-		s.logf("Commit tx error: %v", err)
-		stats.PutErrs++
-		http.Error(w, "Commit tx error", http.StatusInternalServerError)
-		return
-	}
-
-	if dup {
+	if s.putq.enqueue(p) {
+		// An entry for this action is already pending; the first PUT wins,
+		// as it would at insert time in the database. Duplicates that are
+		// already committed to SQLite aren't detected here; the flusher
+		// discovers and counts those later.
+		if queueFile != "" {
+			os.Remove(queueFile)
+		}
 		stats.PutsDup++
 		result = "dup"
 	} else {
-		s.addBlobDelta(sha256hex, +1, +storedSize)
+		handedOff = true
 		result = "put"
 	}
 
@@ -1977,130 +2033,6 @@ func (s *Server) sha256Filepath(hash [sha256.Size]byte) string {
 // either "<sha256-hex>" or "<sha256-hex>.lz4".
 func (s *Server) hotFilepath(name string) string {
 	return filepath.Join(s.hotDir, name[:2], name)
-}
-
-func (s *Server) writeDiskBlob(size int64, r io.Reader) (diskSize int64, retErr error) {
-	compress := size >= lz4CompressThreshold
-
-	nowUnix := s.now().Unix()
-	tf, err := os.CreateTemp(s.dir, fmt.Sprintf("upload-%d-*", nowUnix))
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if retErr == nil {
-			return
-		}
-		tf.Close()
-		os.Remove(tf.Name())
-	}()
-
-	// With tiering enabled, tee the identical bytes into a hot tier temp file
-	// as we write the main one. Hot tier failures never fail the PUT: the main
-	// blob directory is the source of truth, and a later GET re-promotes.
-	// Until the startup scan has the hot tier's usage, skip the hot copy
-	// rather than grow the tier past its unknown budget.
-	var hotName string // base filename of the blob's target; set once the hash is known
-	var fileDst io.Writer = tf
-	if s.hot != nil && s.hot.ready.Load() {
-		htf, herr := os.CreateTemp(s.hotDir, fmt.Sprintf("upload-%d-*", nowUnix))
-		if herr != nil {
-			s.logf("hot tier: creating temp file: %v", herr)
-			s.m.HotWriteErrs.Add(1)
-		} else {
-			// The failsafeWriter swallows mid-stream hot write errors (e.g.
-			// disk full) so the main copy keeps going; finishHotWrite sees the
-			// first such error and cleans up.
-			hotFW := &failsafeWriter{w: htf}
-			fileDst = io.MultiWriter(tf, hotFW)
-			// The deferred call reads the named results, so it installs the
-			// hot copy only when the whole PUT succeeded.
-			defer func() {
-				s.finishHotWrite(htf, hotFW.err, retErr, hotName, diskSize)
-			}()
-		}
-	}
-
-	hasher := sha256.New()
-	lr := io.LimitReader(io.TeeReader(r, hasher), size+1)
-
-	dst := fileDst
-	var lzw *lz4.Writer
-	if compress {
-		lzw = lz4.NewWriter(fileDst)
-		if err := lzw.Apply(lz4.SizeOption(uint64(size))); err != nil {
-			return 0, err
-		}
-		dst = lzw
-	}
-
-	n, err := io.Copy(dst, lr)
-	if err != nil {
-		return 0, err
-	}
-	if n != size {
-		return 0, fmt.Errorf("wrote %d bytes; wanted %d", n, size)
-	}
-	if lzw != nil {
-		if err := lzw.Close(); err != nil {
-			return 0, err
-		}
-	}
-	if err := tf.Close(); err != nil {
-		return 0, err
-	}
-
-	fi, err := os.Stat(tf.Name())
-	if err != nil {
-		return 0, err
-	}
-	diskSize = fi.Size()
-
-	var hash [sha256.Size]byte
-	hasher.Sum(hash[:0])
-
-	target := s.sha256Filepath(hash)
-	if compress {
-		target += ".lz4"
-	}
-	hotName = filepath.Base(target)
-	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
-		return 0, err
-	}
-	if err := os.Rename(tf.Name(), target); err != nil {
-		return 0, err
-	}
-	return diskSize, nil
-}
-
-// finishHotWrite is deferred by writeDiskBlob when tiering is enabled. If the
-// main blob landed (putErr is writeDiskBlob's result), it installs the hot
-// tier temp file htf that was teed alongside the main copy; on any failure it
-// cleans htf up instead. writeErr is the first error from the failsafeWriter
-// feeding htf, if any. Hot tier failures are logged and counted but never
-// propagated; the hot tier is only a cache of the main blob directory.
-func (s *Server) finishHotWrite(htf *os.File, writeErr, putErr error, name string, size int64) {
-	closeErr := htf.Close()
-	if putErr != nil {
-		// The PUT itself failed; there's no blob to install a hot copy of.
-		os.Remove(htf.Name())
-		return
-	}
-	err := cmp.Or(writeErr, closeErr)
-	if err == nil {
-		target := s.hotFilepath(name)
-		if err = os.MkdirAll(filepath.Dir(target), 0750); err == nil {
-			err = os.Rename(htf.Name(), target)
-		}
-	}
-	if err != nil {
-		s.logf("hot tier: storing blob %v: %v", name, err)
-		s.m.HotWriteErrs.Add(1)
-		os.Remove(htf.Name())
-		return
-	}
-	s.hot.add(name, size)
-	s.evictHotIfOver()
 }
 
 type countAndSize struct {

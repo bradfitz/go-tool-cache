@@ -336,6 +336,53 @@ func TestPutQueueDrainHotInstall(t *testing.T) {
 	}
 }
 
+func TestPutQueueGetWhilePending(t *testing.T) {
+	st := newServerTester(t)
+	c := st.mkClient()
+	ctx := context.Background()
+
+	smallVal := "small val"
+	bigVal := strings.Repeat("big value ", 500) // well over smallObjectSize
+	if _, err := c.Put(ctx, "aa01", "9901", int64(len(smallVal)), strings.NewReader(smallVal)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Put(ctx, "bb02", "9902", int64(len(bigVal)), strings.NewReader(bigVal)); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := st.srv.putq.pendingStats(); n != 2 {
+		t.Fatalf("pending entries = %d, want 2", n)
+	}
+	var n int
+	if err := st.srv.db.QueryRow("SELECT COUNT(*) FROM Actions").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("Actions rows before drain = %d, want 0", n)
+	}
+
+	// Both objects are readable before their metadata reaches SQLite.
+	st.wantGet(c, "aa01", "9901", smallVal)
+	st.wantGet(c, "bb02", "9902", bigVal)
+
+	// A duplicate PUT of a still-pending action is detected synchronously;
+	// the first PUT wins.
+	if _, err := c.Put(ctx, "aa01", "9901", int64(len(smallVal)), strings.NewReader(smallVal)); err != nil {
+		t.Fatal(err)
+	}
+	st.wantMetric(&st.srv.m.PutsDup, 1)
+	if n, _ := st.srv.putq.pendingStats(); n != 2 {
+		t.Fatalf("pending entries after dup = %d, want 2", n)
+	}
+
+	// Still readable after the pipeline settles, now from SQLite and disk.
+	st.drain()
+	if n, _ := st.srv.putq.pendingStats(); n != 0 {
+		t.Fatalf("pending entries after drain = %d, want 0", n)
+	}
+	st.wantGet(c, "aa01", "9901", smallVal)
+	st.wantGet(c, "bb02", "9902", bigVal)
+}
+
 func TestPutQueueStartupCleanup(t *testing.T) {
 	t.Run("hot", func(t *testing.T) {
 		hotDir := t.TempDir()
