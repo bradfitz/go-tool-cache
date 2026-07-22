@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -382,6 +385,42 @@ func TestPutQueueGetWhilePending(t *testing.T) {
 	st.wantGet(c, "aa01", "9901", smallVal)
 	st.wantGet(c, "bb02", "9902", bigVal)
 }
+
+// benchmarkPut measures the end-to-end server cost of PUTs of the given
+// size: the request path (hash + spool + enqueue) plus the amortized
+// background pipeline, which the benchmark drains synchronously every 4096
+// PUTs (also required for progress: the reservation count cap would
+// otherwise block once 8192 PUTs are pending with background loops off).
+func benchmarkPut(b *testing.B, size int) {
+	st := newServerTester(b, WithVerbose(false))
+	srv := st.srv
+	val := bytes.Repeat([]byte("x"), size)
+	b.SetBytes(int64(size))
+
+	i := 0
+	for b.Loop() {
+		i++
+		actionID := fmt.Sprintf("%08x", i)
+		req := httptest.NewRequest("PUT", "/"+actionID+"/"+actionID, bytes.NewReader(val))
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		if w.Code != http.StatusNoContent {
+			b.Fatalf("PUT status = %d, want 204", w.Code)
+		}
+		if i%4096 == 0 {
+			if err := srv.drainPendingPuts(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	b.StopTimer()
+	if err := srv.drainPendingPuts(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func BenchmarkPutInline(b *testing.B) { benchmarkPut(b, 100) }
+func BenchmarkPutDisk(b *testing.B)   { benchmarkPut(b, 8<<10) }
 
 func TestPutQueueStartupCleanup(t *testing.T) {
 	t.Run("hot", func(t *testing.T) {
