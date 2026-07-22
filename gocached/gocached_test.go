@@ -162,6 +162,15 @@ func (st *tester) wantMetric(m *expvar.Int, want int64) {
 	m.Set(0)
 }
 
+// drain synchronously settles all pending PUTs, standing in for the
+// background put-queue pipeline that newServerTester disables.
+func (st *tester) drain() {
+	st.t.Helper()
+	if err := st.srv.drainPendingPuts(); err != nil {
+		st.t.Fatalf("drainPendingPuts: %v", err)
+	}
+}
+
 func (st *tester) wantPut(c *cachers.HTTPClient, actionID, outputID string, val string) {
 	ctx := context.Background()
 	st.t.Helper()
@@ -172,6 +181,7 @@ func (st *tester) wantPut(c *cachers.HTTPClient, actionID, outputID string, val 
 	if clientDiskPath == "" {
 		st.t.Fatal("Put returned empty disk path")
 	}
+	st.drain()
 	st.wantMetric(&st.srv.m.Puts, 1)
 	wrote, err := os.ReadFile(clientDiskPath)
 	if err != nil {
