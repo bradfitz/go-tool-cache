@@ -339,6 +339,24 @@ func TestPutQueueDrainHotInstall(t *testing.T) {
 	}
 }
 
+func TestPutBodyReadDeadline(t *testing.T) {
+	now := time.Unix(1000, 0)
+	tests := []struct {
+		size int64
+		want time.Duration
+	}{
+		{0, putUploadGrace},
+		{1, putUploadGrace}, // sub-second remainders ride on the grace
+		{200 << 20, putUploadGrace + 200*time.Second},
+		{1 << 62, putMaxBodyReadTime}, // absurd sizes are capped, not overflowed
+	}
+	for _, tt := range tests {
+		if got := putBodyReadDeadline(now, tt.size).Sub(now); got != tt.want {
+			t.Errorf("size %d: deadline = now+%v, want now+%v", tt.size, got, tt.want)
+		}
+	}
+}
+
 func TestPutQueueGetWhilePending(t *testing.T) {
 	st := newServerTester(t)
 	c := st.mkClient()
