@@ -1759,6 +1759,41 @@ func (srv *Server) removeFromHot(sha256Hex string) {
 	}
 }
 
+const (
+	// putMinUploadRate is the minimum acceptable PUT upload rate, in bytes
+	// per second, used to scale each PUT's body read deadline by its
+	// declared size. Clients are same-region, same-VPC AWS instances that
+	// normally upload orders of magnitude faster, but they're guest VMs
+	// speaking TLS and may be CPU over-subscribed, so this is deliberately
+	// slack: the point is to have some bound reaping dead or crawling
+	// senders (which would otherwise pin their put-queue reservations for
+	// the multi-minute TCP keepalive timeout), not a tight one.
+	putMinUploadRate = 1 << 20
+
+	// putUploadGrace is the flat allowance added to every PUT's body read
+	// deadline, covering per-request overhead independent of size.
+	putUploadGrace = 30 * time.Second
+
+	// putMaxBodyReadTime caps a PUT's body read deadline, keeping the
+	// duration math sane for absurd declared sizes. At putMinUploadRate it
+	// permits uploads into the tens of GB, far past what a Go build cache
+	// stores.
+	putMaxBodyReadTime = time.Hour
+)
+
+// putBodyReadDeadline returns the wall-clock deadline for reading a PUT body
+// of the declared size, arriving no slower than putMinUploadRate after an
+// initial putUploadGrace.
+func putBodyReadDeadline(now time.Time, contentLength int64) time.Time {
+	// Cap in units of seconds, before the Duration multiply can overflow
+	// for absurd declared sizes.
+	secs := contentLength / putMinUploadRate
+	if secs > int64(putMaxBodyReadTime/time.Second) {
+		return now.Add(putMaxBodyReadTime)
+	}
+	return now.Add(min(putUploadGrace+time.Duration(secs)*time.Second, putMaxBodyReadTime))
+}
+
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats, namespaceID int64) {
 	s.m.ActivePuts.Add(1)
 	defer s.m.ActivePuts.Add(-1)
@@ -1803,6 +1838,16 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 			s.putq.unreserve(reserved)
 		}
 	}()
+
+	// Bound the body read (best effort) so a dead or crawling client can't
+	// pin its reservation: set after the backpressure wait so queueing time
+	// doesn't count against the upload, on the wall clock (not s.now, whose
+	// test clock isn't meaningful to the network stack), and cleared on
+	// return so the deadline doesn't outlive this request on a reused
+	// connection.
+	rc := http.NewResponseController(w)
+	rc.SetReadDeadline(putBodyReadDeadline(time.Now(), r.ContentLength))
+	defer rc.SetReadDeadline(time.Time{})
 
 	hasher := sha256.New()
 	hashingBody := io.TeeReader(r.Body, hasher)
