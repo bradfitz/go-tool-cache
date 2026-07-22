@@ -51,16 +51,17 @@ func main() {
 
 	var p *cacheproc.Process
 	p = &cacheproc.Process{
-		Close: func() error {
-			if *verbose {
-				log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%d errors)",
-					p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), p.PutErrors.Load())
-			}
-			return nil
-		},
 		Get: dc.Get,
 		Put: dc.Put,
 	}
+	statsFunc := func() error {
+		if *verbose {
+			log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%d errors)",
+				p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), p.PutErrors.Load())
+		}
+		return nil
+	}
+	p.Close = statsFunc
 
 	if *gwPort != 0 {
 		if gw, ok := getGatewayIP(); ok {
@@ -89,6 +90,12 @@ func main() {
 		}
 		p.Get = hc.Get
 		p.Put = hc.Put
+		p.Close = func() error {
+			if !hc.Shutdown() {
+				log.Printf("go-cacher: timed out waiting for background PUTs to drain")
+			}
+			return statsFunc()
+		}
 	}
 
 	if err := p.Run(); err != nil {

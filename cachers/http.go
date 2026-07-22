@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/pierrec/lz4/v4"
 )
@@ -41,7 +45,75 @@ type HTTPClient struct {
 	// BestEffortHTTP, when true, makes all HTTP errors non-fatal.
 	// Get returns a cache miss and Put returns the local disk result,
 	// silently ignoring any HTTP failures (connection errors, server errors, etc.).
+	// It also makes the remote HTTP PUTs run asynchronously: Put returns as soon
+	// as the blob is on local disk, and the upload happens in a background goroutine.
 	BestEffortHTTP bool
+
+	// AsyncPutTimeout, if non-zero, bounds how long a background PUT may run
+	// before its context is cancelled. It only applies when BestEffortHTTP is set.
+	AsyncPutTimeout time.Duration
+
+	// AsyncPutMaxConcurrent, if positive, caps the number of background PUTs
+	// running at once. New PUTs beyond the cap are queued until an existing PUT
+	// finishes. If Close is called while some background PUTs are in-progress, it
+	// will wait for up to AsyncPutTimeout before forcing shutdown. Disk writes
+	// are not affected, and it only applies when BestEffortHTTP is set.
+	AsyncPutMaxConcurrent int
+
+	asyncOnce   sync.Once
+	asyncPutSem chan struct{}
+	inFlightWG  sync.WaitGroup
+	baseCtx     context.Context
+	baseCancel  context.CancelFunc
+}
+
+func (c *HTTPClient) ensureAsyncSetup() {
+	c.asyncOnce.Do(func() {
+		c.baseCtx, c.baseCancel = context.WithCancel(context.Background())
+		if c.AsyncPutMaxConcurrent > 0 {
+			c.asyncPutSem = make(chan struct{}, c.AsyncPutMaxConcurrent)
+		}
+	})
+}
+
+// asyncPutSemaphore returns the buffered channel bounding concurrent background
+// PUTs, or nil if AsyncPutMaxConcurrent is unset (unbounded).
+func (c *HTTPClient) asyncPutSemaphore() chan struct{} {
+	c.ensureAsyncSetup()
+	return c.asyncPutSem
+}
+
+// asyncPutContext returns the context shared by all background PUTs. Shutdown
+// cancels it when the drain deadline elapses.
+func (c *HTTPClient) asyncPutContext() context.Context {
+	c.ensureAsyncSetup()
+	return c.baseCtx
+}
+
+// Shutdown blocks until all background PUTs have finished or AsyncPutTimeout
+// elapses, whichever comes first. If AsyncPutTimeout is zero (unbounded
+// PUTs), Shutdown waits indefinitely. It reports whether all PUTs drained in
+// time.
+func (c *HTTPClient) Shutdown() (drained bool) {
+	done := make(chan struct{})
+	go func() {
+		c.inFlightWG.Wait()
+		close(done)
+	}()
+	if c.AsyncPutTimeout == 0 {
+		<-done
+		return true
+	}
+	t := time.NewTimer(c.AsyncPutTimeout)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		c.ensureAsyncSetup()
+		c.baseCancel()
+		return false
+	}
 }
 
 func (c *HTTPClient) httpClient() *http.Client {
@@ -199,73 +271,98 @@ func (c *HTTPClient) Get(ctx context.Context, actionID string) (outputID, diskPa
 }
 
 func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size int64, body io.Reader) (diskPath string, _ error) {
-	// Buffer the body so disk and HTTP can read from independent copies.
-	// This avoids a race between our code and net/http's write loop when
-	// the server responds (e.g. 403) before consuming the full request body.
-	var buf []byte
-	if size > 0 {
-		var err error
-		buf, err = io.ReadAll(body)
-		if err != nil {
-			return "", err
-		}
+	// Write to disk first.
+	diskPath, err := c.Disk.Put(ctx, actionID, outputID, size, body)
+	if err != nil {
+		log.Printf("HTTPClient.Put local disk write error: %v", err)
+		return "", err
 	}
 
-	// Write to disk locally as we write it remotely, as we need to guarantee
-	// it's on disk locally for the caller.
-	diskPutCh := make(chan any, 1)
-	go func() {
-		diskPath, err := c.Disk.Put(ctx, actionID, outputID, size, bytes.NewReader(buf))
-		if err != nil {
-			diskPutCh <- err
-		} else {
-			diskPutCh <- diskPath
-		}
-	}()
+	if c.BestEffortHTTP {
+		sem := c.asyncPutSemaphore()
+		// Background PUTs use a client-owned context, not the per-request ctx,
+		// so they survive the RPC returning.
+		putCtx := c.asyncPutContext()
+		c.inFlightWG.Go(func() {
+			// Acquire a concurrency slot before opening the file, so a queued
+			// backlog doesn't hold an open file descriptor per pending upload.
+			if sem != nil {
+				select {
+				case sem <- struct{}{}:
+				case <-putCtx.Done():
+					return
+				}
+				defer func() {
+					<-sem
+				}()
+			}
+			f, err := os.Open(diskPath)
+			if err != nil {
+				log.Printf("HTTPClient.Put local disk open after write error: %v", err)
+				return
+			}
+			c.putRemote(putCtx, actionID, outputID, size, f)
+		})
+		return diskPath, nil
+	}
 
-	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, bytes.NewReader(buf))
+	f, err := os.Open(diskPath)
+	if err != nil {
+		log.Printf("HTTPClient.Put local disk open after write error: %v", err)
+		return "", err
+	}
+	if err := c.putRemote(ctx, actionID, outputID, size, f); err != nil {
+		return diskPath, err
+	}
+
+	return diskPath, nil
+}
+
+func (c *HTTPClient) putRemote(ctx context.Context, actionID, outputID string, size int64, body io.ReadCloser) error {
+	defer body.Close()
+	if c.BestEffortHTTP && c.AsyncPutTimeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.AsyncPutTimeout)
+		defer cancel()
+	}
+	// For a zero-length body, hand net/http NoBody so it sends an explicit
+	// Content-Length: 0 rather than switching to chunked transfer encoding,
+	// which the server rejects.
+	var reqBody io.Reader = body
+	if size == 0 {
+		reqBody = http.NoBody
+	}
+	req, _ := http.NewRequestWithContext(ctx, "PUT", c.BaseURL+"/"+actionID+"/"+outputID, reqBody)
 	req.ContentLength = size
 	if c.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	}
+
 	res, err := c.httpClient().Do(req)
-	var httpErr error
 	if err != nil {
 		log.Printf("error PUT /%s/%s: %v", actionID, outputID, err)
-		httpErr = err
-	} else {
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusNoContent {
-			msg := tryReadErrorMessage(res)
-			if c.BestEffortHTTP && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) {
-				// Known error codes that will repeatedly happen, so avoid
-				// filling the logs with these errors.
-				//
-				// 401: can happen when gocached restarts during a session, as it
-				// doesn't persist access tokens.
-				// TODO(tomhjp): make the client retry auth in the background.
-				//
-				// 403: can happen when authed with a JWT that didn't grant global
-				// write permissions.
-				// TODO(tomhjp): support namespaces so all sessions can safely write.
-			} else {
-				log.Printf("error PUT /%s/%s: %v, %s", actionID, outputID, res.Status, msg)
-			}
-			httpErr = fmt.Errorf("unexpected PUT /%s/%s status %v", actionID, outputID, res.Status)
-		}
+		return err
 	}
-	// Wait for the disk write regardless of HTTP result.
-	select {
-	case v := <-diskPutCh:
-		if diskErr, ok := v.(error); ok {
-			log.Printf("HTTPClient.Put local disk error: %v", diskErr)
-			return "", diskErr
+
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		errMsg := fmt.Sprintf("error PUT /%s/%s: %s, %s", actionID, outputID, res.Status, tryReadErrorMessage(res))
+		if c.BestEffortHTTP && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden) {
+			// Known error codes that will repeatedly happen, so avoid
+			// filling the logs with these errors.
+			//
+			// 401: can happen when gocached restarts during a session, as it
+			// doesn't persist access tokens.
+			// TODO(tomhjp): make the client retry auth in the background.
+			//
+			// 403: can happen when authed with a JWT that didn't grant global
+			// write permissions.
+			// TODO(tomhjp): support namespaces so all sessions can safely write.
+		} else {
+			log.Print(errMsg)
 		}
-		if c.BestEffortHTTP {
-			return v.(string), nil
-		}
-		return v.(string), httpErr
-	case <-ctx.Done():
-		return "", ctx.Err()
+		return errors.New(errMsg)
 	}
+
+	return nil
 }
