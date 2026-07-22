@@ -216,6 +216,11 @@ func (h *hotIndex) scan(ctx context.Context, dir string, logf logger.Logf) error
 			return ctx.Err()
 		}
 		if d.IsDir() {
+			// Skip dot-directories such as the put-queue spool dir,
+			// whose files are not hot tier entries.
+			if strings.HasPrefix(d.Name(), ".") && path != dir {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		fi, err := d.Info()

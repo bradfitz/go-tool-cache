@@ -95,13 +95,17 @@ func TestSQLiteDir(t *testing.T) {
 }
 
 // hotFiles returns the base names of all non-temp files in the hot dir,
-// sorted.
+// sorted. Dot-directories (like the put-queue spool dir) are not part of
+// the hot tier and are skipped.
 func (st *tester) hotFiles() []string {
 	st.t.Helper()
 	var ret []string
 	err := filepath.Walk(st.srv.hotDir, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		if fi.IsDir() && strings.HasPrefix(fi.Name(), ".") && path != st.srv.hotDir {
+			return filepath.SkipDir
 		}
 		if !fi.Mode().IsRegular() || strings.HasPrefix(fi.Name(), "upload-") {
 			return nil
@@ -379,6 +383,16 @@ func TestHotStartupScan(t *testing.T) {
 	}
 	writeTemp("upload-1-stale", 2*time.Hour)
 	writeTemp("upload-2-fresh", 0)
+
+	// Files under dot-directories (such as the put-queue spool dir) are not
+	// hot tier entries and must not be indexed; the usage and len checks
+	// below would fail if this file were counted.
+	if err := os.MkdirAll(filepath.Join(hotDir, ".put-queue"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hotDir, ".put-queue", "put-1-spool"), []byte("spooled"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	st := newServerTester(t, WithHotDir(hotDir), WithHotCapacity(1<<20))
 
