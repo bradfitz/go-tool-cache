@@ -526,6 +526,27 @@ func (srv *Server) start() error {
 		},
 	))
 
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "gocached_put_queue_pending",
+			Help: "PUTs accepted but whose metadata hasn't been committed to SQLite yet; should return to zero shortly after a write burst",
+		},
+		func() float64 {
+			c, _ := srv.putq.pendingStats()
+			return float64(c)
+		},
+	))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "gocached_put_queue_pending_bytes",
+			Help: "sum of the reserved sizes of pending PUTs; bounds spool disk usage and reflects backpressure toward its cap",
+		},
+		func() float64 {
+			_, b := srv.putq.pendingStats()
+			return float64(b)
+		},
+	))
+
 	if srv.hot != nil {
 		reg.MustRegister(prometheus.NewGaugeFunc(
 			prometheus.GaugeOpts{
@@ -597,6 +618,7 @@ func (srv *Server) start() error {
 	}
 
 	if !srv.disableBackgroundLoops {
+		srv.putq.start(srv.shutdownCtx)
 		go srv.runCleanLoop()
 		go srv.runCheckpointLoop()
 		go srv.runDBSizeMetricsLoop()
@@ -962,6 +984,13 @@ type Server struct {
 		HotWriteErrs     expvar.Int `type:"counter" name:"hot_write_errs" help:"failed hot tier writes during PUT; the PUT itself still succeeds"`
 		HotEvicted       expvar.Int `type:"counter" name:"hot_evicted" help:"files evicted from the hot tier to stay under its capacity"`
 		HotEvictedBytes  expvar.Int `type:"counter" name:"hot_evicted_bytes" help:"bytes reclaimed by evicting files from the hot tier"`
+
+		PutQueueBlocked      expvar.Int `type:"counter" name:"put_queue_blocked" help:"PUT requests that had to wait for put-queue backpressure before being admitted"`
+		PutQueueCopyErrs     expvar.Int `type:"counter" name:"put_queue_copy_errs" help:"failed attempts to copy a spooled blob into the main blob directory; retried before the PUT is dropped"`
+		PutQueueDropped      expvar.Int `type:"counter" name:"put_queue_dropped" help:"pending PUTs abandoned after repeated copy or flush failures; the client saw success but the object was lost"`
+		PutQueueFlushes      expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
+		PutQueueFlushedItems expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`
+		PutQueueFlushDups    expvar.Int `type:"counter" name:"put_queue_flush_dups" help:"subset of put_queue_flushed_items that were duplicates of an already-stored action"`
 	}
 }
 
