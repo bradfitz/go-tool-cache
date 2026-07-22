@@ -345,6 +345,25 @@ func (srv *Server) start() error {
 			return fmt.Errorf("creating hot dir: %w", err)
 		}
 		srv.hot = newHotIndex()
+	}
+
+	// Pending PUT metadata is memory-only, so any spool files left over
+	// from a previous process are unreachable; delete them. This must
+	// happen before the hot tier scan starts walking hotDir, so the scan
+	// never sees the directory mid-removal.
+	queueDir := filepath.Join(srv.dir, putQueueDirName)
+	if srv.hotDir != "" {
+		queueDir = filepath.Join(srv.hotDir, putQueueDirName)
+	}
+	if err := os.RemoveAll(queueDir); err != nil {
+		return fmt.Errorf("cleaning put-queue dir: %w", err)
+	}
+	if err := os.MkdirAll(queueDir, 0750); err != nil {
+		return fmt.Errorf("creating put-queue dir: %w", err)
+	}
+	srv.putq = newPutQueue(srv, queueDir)
+
+	if srv.hot != nil {
 		// Populate the index asynchronously: scanning millions of files can
 		// take a while, and reads can be served from existing hot files right
 		// away. Until the scan completes and marks the index ready, nothing
@@ -821,6 +840,7 @@ type Server struct {
 	hotDir         string // if non-empty, fast storage tier for a bounded copy of hot blobs
 	hotCap         int64  // maximum bytes in hotDir; must be positive if hotDir is set
 	hot            *hotIndex
+	putq           *putQueue
 	verbose        bool
 	logf           logger.Logf
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
@@ -845,7 +865,8 @@ type Server struct {
 	// sometimes seen DB busy errors. Just serialize it explicitly out of
 	// laziness for now.
 	//
-	// Lock ordering: sqliteWriteMu before mu.
+	// Lock ordering: sqliteWriteMu before mu. putQueue.mu is a leaf:
+	// nothing else is acquired while holding it.
 	sqliteWriteMu        sync.Mutex
 	writeConn            *sql.Conn // nil until first used; single connection for writes
 	updateAccessTimeStmt *sql.Stmt // nil until first used; for updating access times on writeConn
