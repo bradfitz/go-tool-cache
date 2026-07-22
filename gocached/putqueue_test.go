@@ -3,10 +3,13 @@ package gocached
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -187,6 +190,149 @@ func TestPutQueueSpoolBlob(t *testing.T) {
 	}
 	if got, want := len(ents), 2; got != want {
 		t.Errorf("spool dir has %d files, want %d (failed spool not cleaned up?)", got, want)
+	}
+}
+
+// makePending builds a pendingPut for the given content the way handlePut
+// will: reserving queue room, spooling big content to a queue file, and
+// keeping small content in memory.
+func makePending(t *testing.T, q *putQueue, ns int64, actionID string, content []byte) *pendingPut {
+	t.Helper()
+	reserved, err := q.reserve(context.Background(), int64(len(content)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(content)
+	p := &pendingPut{
+		key:              actionKey{NamespaceID: ns, ActionID: actionID},
+		sha256hex:        hex.EncodeToString(sum[:]),
+		storedSize:       int64(len(content)),
+		uncompressedSize: int64(len(content)),
+		createTime:       q.srv.now().Unix(),
+		reservedBytes:    reserved,
+	}
+	if len(content) <= smallObjectSize {
+		p.smallData = content
+	} else {
+		diskSize, path, err := q.spoolBlob(int64(len(content)), bytes.NewReader(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.storedSize = diskSize
+		p.queueFile = path
+	}
+	return p
+}
+
+func TestPutQueueDrain(t *testing.T) {
+	st := newServerTester(t)
+	q := st.srv.putq
+
+	small := []byte("inline data")
+	big := bytes.Repeat([]byte("gocached"), 1000)
+
+	pSmall := makePending(t, q, 0, "aa01", small)
+	if dup := q.enqueue(pSmall); dup {
+		t.Fatal("small enqueue reported dup")
+	}
+	pBig := makePending(t, q, 0, "bb02", big)
+	if dup := q.enqueue(pBig); dup {
+		t.Fatal("big enqueue reported dup")
+	}
+
+	// While pending, entries are visible via lookup.
+	if _, ok := q.lookup(pSmall.key); !ok {
+		t.Fatal("small entry not pending before drain")
+	}
+
+	if err := st.srv.drainPendingPuts(); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, _ := q.pendingStats(); n != 0 {
+		t.Errorf("%d entries still pending after drain", n)
+	}
+	st.wantMetric(&st.srv.m.PutQueueFlushes, 1)
+	st.wantMetric(&st.srv.m.PutQueueFlushedItems, 2)
+	st.wantMetric(&st.srv.m.PutQueueFlushDups, 0)
+	st.wantMetric(&st.srv.m.PutQueueDropped, 0)
+
+	// The big blob was installed in the main blob directory (lz4'd), and
+	// with no hot tier its spool file is deleted.
+	if got, want := st.diskFiles(), []string{pBig.blobName()}; !slices.Equal(got, want) {
+		t.Errorf("disk files = %v, want %v", got, want)
+	}
+	if ents, err := os.ReadDir(q.dir); err != nil || len(ents) != 0 {
+		t.Errorf("queue dir has %d entries after drain, err=%v; want empty", len(ents), err)
+	}
+
+	// Metadata is committed: both actions exist in SQLite.
+	var n int
+	if err := st.srv.db.QueryRow("SELECT COUNT(*) FROM Actions").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("Actions rows = %d, want 2", n)
+	}
+
+	// A second drain is a no-op.
+	if err := st.srv.drainPendingPuts(); err != nil {
+		t.Fatal(err)
+	}
+	st.wantMetric(&st.srv.m.PutQueueFlushes, 0)
+}
+
+func TestPutQueueDrainFlushDup(t *testing.T) {
+	st := newServerTester(t)
+	q := st.srv.putq
+
+	// Commit an action, then make the same action pending again: the flush
+	// discovers the dup and doesn't double-count the shard delta.
+	p1 := makePending(t, q, 0, "cc03", []byte("first"))
+	q.enqueue(p1)
+	if err := st.srv.drainPendingPuts(); err != nil {
+		t.Fatal(err)
+	}
+	preCount, preBytes := st.srv.sumShardDeltas()
+
+	p2 := makePending(t, q, 0, "cc03", []byte("other content"))
+	if dup := q.enqueue(p2); dup {
+		t.Fatal("enqueue after flush reported pending-dup; want flush-time dup")
+	}
+	if err := st.srv.drainPendingPuts(); err != nil {
+		t.Fatal(err)
+	}
+	st.wantMetric(&st.srv.m.PutQueueFlushDups, 1)
+	if c, b := st.srv.sumShardDeltas(); c != preCount || b != preBytes {
+		t.Errorf("shard deltas changed on dup flush: (%d, %d) -> (%d, %d)", preCount, preBytes, c, b)
+	}
+}
+
+func TestPutQueueDrainHotInstall(t *testing.T) {
+	st := newServerTester(t, WithHotDir(filepath.Join(t.TempDir(), "hot")), WithHotCapacity(1<<20))
+	q := st.srv.putq
+
+	big := bytes.Repeat([]byte("hot data"), 1000)
+	p := makePending(t, q, 0, "dd04", big)
+	q.enqueue(p)
+
+	if err := st.srv.drainPendingPuts(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The spool file was renamed into the hot tier and indexed, and the
+	// main blob directory got its own copy.
+	if got, want := st.hotFiles(), []string{p.blobName()}; !slices.Equal(got, want) {
+		t.Errorf("hot files = %v, want %v", got, want)
+	}
+	if got, want := st.srv.hot.usageBytes(), p.storedSize; got != want {
+		t.Errorf("hot usage = %d, want %d", got, want)
+	}
+	if got, want := st.diskFiles(), []string{p.blobName()}; !slices.Equal(got, want) {
+		t.Errorf("disk files = %v, want %v", got, want)
+	}
+	if ents, err := os.ReadDir(q.dir); err != nil || len(ents) != 0 {
+		t.Errorf("queue dir has %d entries after drain, err=%v; want empty", len(ents), err)
 	}
 }
 
