@@ -1651,8 +1651,19 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	s.sqliteWriteMu.Lock()
 	defer s.sqliteWriteMu.Unlock()
 
+	// Do both inserts in one transaction so each PUT pays for a single
+	// WAL commit (and its fsync) rather than two autocommits.
+	tx, err := s.db.Begin()
+	if err != nil {
+		s.logf("Begin tx error: %v", err)
+		stats.PutErrs++
+		http.Error(w, "Begin tx error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+
 	var blobID int64
-	err := s.db.QueryRow(`INSERT INTO Blobs (SHA256, StoredSize, UncompressedSize, SmallData)
+	err = tx.QueryRow(`INSERT INTO Blobs (SHA256, StoredSize, UncompressedSize, SmallData)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(SHA256) DO UPDATE SET SHA256=excluded.SHA256
 		RETURNING BlobID;
@@ -1670,7 +1681,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	if sha256hex != outputID {
 		altObjectID = outputID
 	}
-	res, err := s.db.Exec(`INSERT OR IGNORE INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime)
+	res, err := tx.Exec(`INSERT OR IGNORE INTO Actions (NamespaceID, ActionID, BlobID, AltOutputID, CreateTime, AccessTime)
 	VALUES (?, ?, ?, ?, ?, ?)`,
 		namespaceID,
 		actionID,
@@ -1691,6 +1702,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		s.logf("Actions rows affected error: %v", err)
 		stats.PutErrs++
 		http.Error(w, "Actions rows affected error", http.StatusInternalServerError)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		s.logf("Commit tx error: %v", err)
+		stats.PutErrs++
+		http.Error(w, "Commit tx error", http.StatusInternalServerError)
 		return
 	}
 
