@@ -339,6 +339,144 @@ func TestPutQueueDrainHotInstall(t *testing.T) {
 	}
 }
 
+func TestPutQueueCleanupIntents(t *testing.T) {
+	st := newServerTester(t)
+	q := st.srv.putq
+
+	exists := func(path string) bool {
+		t.Helper()
+		_, err := os.Stat(path)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	writeIntent := func(due int64, blobName string) string {
+		t.Helper()
+		path := filepath.Join(q.cleanupDir, fmt.Sprintf("%08x-%s", due, blobName))
+		if err := os.WriteFile(path, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	blobPath := func(blobName string) string {
+		return filepath.Join(st.srv.dir, blobName[:2], blobName)
+	}
+	now := st.srv.now().Unix()
+
+	// Common case: a drained PUT leaves a blob and no intents behind.
+	committed := makePending(t, q, 0, "aa01", bytes.Repeat([]byte("committed"), 1000))
+	q.enqueue(committed)
+	st.drain()
+	if ents, err := os.ReadDir(q.cleanupDir); err != nil || len(ents) != 0 {
+		t.Fatalf("cleanup dir has %d entries after drain, err=%v; want empty", len(ents), err)
+	}
+	if !exists(blobPath(committed.blobName())) {
+		t.Fatal("committed blob missing after drain")
+	}
+
+	// A crash-orphaned blob (file on disk, intent due, no SQLite row) is
+	// swept along with its intent.
+	orphanSum := sha256.Sum256([]byte("orphan"))
+	orphanName := hex.EncodeToString(orphanSum[:]) + ".lz4"
+	if err := os.MkdirAll(filepath.Dir(blobPath(orphanName)), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blobPath(orphanName), []byte("orphan bytes"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	orphanIntent := writeIntent(now-1, orphanName)
+
+	// A due intent for an accounted-for blob loses only the intent.
+	staleIntent := writeIntent(now-1, committed.blobName())
+
+	// An intent that isn't due yet is untouched, as is a malformed entry.
+	futureIntent := writeIntent(now+1000, orphanName)
+	if err := os.WriteFile(filepath.Join(q.cleanupDir, "0bad-name"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := q.sweepCleanupIntents(); err != nil {
+		t.Fatal(err)
+	}
+	if exists(blobPath(orphanName)) {
+		t.Error("orphan blob not swept")
+	}
+	if exists(orphanIntent) {
+		t.Error("orphan intent not removed")
+	}
+	if exists(staleIntent) {
+		t.Error("stale intent for accounted-for blob not removed")
+	}
+	if !exists(blobPath(committed.blobName())) {
+		t.Error("accounted-for blob was swept")
+	}
+	if !exists(futureIntent) {
+		t.Error("future intent removed early")
+	}
+	st.wantMetric(&st.srv.m.PutQueueOrphansSwept, 1)
+
+	// An in-flight PUT protects its blob: metadata isn't committed yet,
+	// but a due intent for its SHA must neither delete the blob nor the
+	// intent (it's rechecked next sweep).
+	inflight := makePending(t, q, 0, "bb02", bytes.Repeat([]byte("inflight"), 1000))
+	q.enqueue(inflight)
+	if err := q.writeCleanupIntent(inflight); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.copyToMain(inflight); err != nil {
+		t.Fatal(err)
+	}
+	dueIntent := writeIntent(now-1, inflight.blobName())
+	if err := q.sweepCleanupIntents(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(blobPath(inflight.blobName())) {
+		t.Fatal("in-flight blob swept out from under a pending PUT")
+	}
+	if !exists(dueIntent) {
+		t.Error("due intent for in-flight PUT removed; want kept for recheck")
+	}
+	st.wantMetric(&st.srv.m.PutQueueOrphansSwept, 0)
+
+	// After the PUT commits, the next sweep drops the now-moot intent and
+	// keeps the blob.
+	st.drain()
+	if err := q.sweepCleanupIntents(); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(blobPath(inflight.blobName())) {
+		t.Error("committed blob swept")
+	}
+	if exists(dueIntent) {
+		t.Error("moot intent not removed after commit")
+	}
+}
+
+func TestParseCleanupIntent(t *testing.T) {
+	sha := strings.Repeat("ab", 32)
+	tests := []struct {
+		name     string
+		wantDue  int64
+		wantBlob string
+		wantOK   bool
+	}{
+		{"000004d1-" + sha, 1233, sha, true},
+		{"000004d1-" + sha + ".lz4", 1233, sha + ".lz4", true},
+		{"4d1-" + sha, 0, "", false},           // time not fixed-width
+		{"000004d1-" + sha[:10], 0, "", false}, // truncated hash
+		{"junk", 0, "", false},
+		{"000004d1-", 0, "", false},
+	}
+	for _, tt := range tests {
+		due, blob, ok := parseCleanupIntent(tt.name)
+		if due != tt.wantDue || blob != tt.wantBlob || ok != tt.wantOK {
+			t.Errorf("parseCleanupIntent(%q) = (%v, %q, %v), want (%v, %q, %v)",
+				tt.name, due, blob, ok, tt.wantDue, tt.wantBlob, tt.wantOK)
+		}
+	}
+}
+
 func TestPutBodyReadDeadline(t *testing.T) {
 	now := time.Unix(1000, 0)
 	tests := []struct {

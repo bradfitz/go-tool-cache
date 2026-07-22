@@ -3,11 +3,15 @@ package gocached
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +25,31 @@ import (
 // renamed into the hot tier) and in the main blob directory otherwise. The
 // leading dot keeps the hot tier startup scan from indexing it.
 const putQueueDirName = ".put-queue"
+
+// cleanupDirName is the name of the directory under the main blob directory
+// holding cleanup intent records: empty files named
+// "<8-hex-unix-seconds>-<blob filename>", written by a mover before it
+// copies a blob into the main blob directory and deleted after the blob's
+// metadata commits to SQLite. If the process crashes in between, the intent
+// survives (this directory is never wiped at startup, unlike the put-queue
+// spool) and the sweeper later deletes the unaccounted-for blob. The
+// fixed-width hex time makes lexical directory order chronological, so the
+// sweeper can stop at the first intent that isn't due yet.
+const cleanupDirName = ".cleanup"
+
+const (
+	// cleanupIntentDelay is how far in the future a cleanup intent comes
+	// due. It needs to comfortably exceed the pipeline's worst case from
+	// intent write to metadata commit (copy retries plus flush retries,
+	// tens of seconds) so the sweeper never reaps a blob whose PUT is
+	// merely slow.
+	cleanupIntentDelay = time.Hour
+
+	// cleanupSweepInterval is how often the sweeper lists the cleanup
+	// directory. In the common case the directory holds only in-flight
+	// intents and nothing is due.
+	cleanupSweepInterval = time.Minute
+)
 
 const (
 	// putQueuePendingBytesCap bounds the total declared size of pending
@@ -77,6 +106,7 @@ type pendingPut struct {
 	smallData        []byte // non-nil iff the object is stored inline (<= smallObjectSize)
 	queueFile        string // path of the spool file holding the blob bytes; "" if inline
 	reservedBytes    int64  // semaphore weight to release when the entry retires
+	intentPath       string // path of the cleanup intent record; "" until a mover writes it
 }
 
 // blobName returns the base filename for p's blob in the main and hot blob
@@ -94,8 +124,9 @@ func (p *pendingPut) blobName() string {
 // been committed to SQLite yet. GETs consult the pending map before the
 // database so a just-written PUT is immediately readable.
 type putQueue struct {
-	srv *Server
-	dir string // spool directory for blob bytes
+	srv        *Server
+	dir        string // spool directory for blob bytes
+	cleanupDir string // cleanup intent directory under the main blob dir
 
 	// bytesSem and countSem implement backpressure: a PUT reserves its
 	// declared size (clamped to the cap) and one entry slot before spooling
@@ -115,28 +146,38 @@ type putQueue struct {
 	// which countSem guarantees is never exceeded, so sends don't block.
 	moverCh chan *pendingPut
 	flushCh chan *pendingPut
+
+	// intentDelCh hands cleanup intent deletions (an NFS round-trip that
+	// shouldn't block the flusher) back to the movers after a batch
+	// commits. Sends are non-blocking: an intent that doesn't fit is left
+	// for the sweeper.
+	intentDelCh chan string
 }
 
 func newPutQueue(srv *Server, dir string) *putQueue {
 	return &putQueue{
-		srv:      srv,
-		dir:      dir,
-		bytesSem: semaphore.NewWeighted(putQueuePendingBytesCap),
-		countSem: semaphore.NewWeighted(putQueuePendingCountCap),
-		pending:  make(map[actionKey]*pendingPut),
-		moverCh:  make(chan *pendingPut, putQueuePendingCountCap),
-		flushCh:  make(chan *pendingPut, putQueuePendingCountCap),
+		srv:         srv,
+		dir:         dir,
+		cleanupDir:  filepath.Join(srv.dir, cleanupDirName),
+		bytesSem:    semaphore.NewWeighted(putQueuePendingBytesCap),
+		countSem:    semaphore.NewWeighted(putQueuePendingCountCap),
+		pending:     make(map[actionKey]*pendingPut),
+		moverCh:     make(chan *pendingPut, putQueuePendingCountCap),
+		flushCh:     make(chan *pendingPut, putQueuePendingCountCap),
+		intentDelCh: make(chan string, putQueuePendingCountCap),
 	}
 }
 
-// start launches the background movers and the metadata flusher. It is not
-// called under disableBackgroundLoops; tests drive the pipeline with
-// [Server.drainPendingPuts] instead.
+// start launches the background movers, the metadata flusher, and the
+// cleanup intent sweeper. It is not called under disableBackgroundLoops;
+// tests drive the pipeline with [Server.drainPendingPuts] and
+// [putQueue.sweepCleanupIntents] instead.
 func (q *putQueue) start(ctx context.Context) {
 	for range numPutMovers {
 		go q.moverLoop(ctx)
 	}
 	go q.flusherLoop(ctx)
+	go q.runCleanupSweepLoop(ctx)
 }
 
 // reserve blocks until the queue has room for a PUT of the given declared
@@ -302,8 +343,9 @@ func (q *putQueue) spoolBlob(size int64, r io.Reader) (diskSize int64, path stri
 }
 
 // moverLoop copies spooled blobs into the main blob directory and passes
-// them on to the flusher. Several movers run concurrently since the main
-// directory may be a high-latency network filesystem.
+// them on to the flusher. It also executes the post-commit cleanup intent
+// deletions the flusher hands back. Several movers run concurrently since
+// the main directory may be a high-latency network filesystem.
 func (q *putQueue) moverLoop(ctx context.Context) {
 	for {
 		select {
@@ -311,13 +353,18 @@ func (q *putQueue) moverLoop(ctx context.Context) {
 			return
 		case p := <-q.moverCh:
 			q.moveToFlush(ctx, p)
+		case path := <-q.intentDelCh:
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				q.srv.logf("put-queue: removing cleanup intent %v: %v", path, err)
+			}
 		}
 	}
 }
 
-// moveToFlush copies p's blob into the main blob directory, retrying a few
-// times, then hands p to the flusher. After the last failed attempt p is
-// dropped.
+// moveToFlush writes p's cleanup intent and copies its blob into the main
+// blob directory, retrying a few times, then hands p to the flusher. After
+// the last failed attempt p is dropped; the intent record survives the drop
+// so the sweeper eventually deletes whatever the copy left behind.
 func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 	for try := range putCopyRetries {
 		if try > 0 {
@@ -327,7 +374,10 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 			case <-time.After(time.Second << (try - 1)):
 			}
 		}
-		err := q.copyToMain(p)
+		err := q.writeCleanupIntent(p)
+		if err == nil {
+			err = q.copyToMain(p)
+		}
 		if err == nil {
 			q.flushCh <- p
 			return
@@ -336,6 +386,127 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 		q.srv.m.PutQueueCopyErrs.Add(1)
 	}
 	q.drop(p)
+}
+
+// writeCleanupIntent creates p's cleanup intent record: a durable note that
+// p's blob is about to exist in the main blob directory without SQLite
+// accounting, and should be deleted at the encoded time if it's still
+// unreferenced then. It must be durable before the blob copy starts; the
+// intent is deleted after p's metadata commits.
+func (q *putQueue) writeCleanupIntent(p *pendingPut) error {
+	if p.intentPath == "" {
+		due := q.srv.now().Add(cleanupIntentDelay).Unix()
+		p.intentPath = filepath.Join(q.cleanupDir, fmt.Sprintf("%08x-%s", due, p.blobName()))
+	}
+	f, err := os.OpenFile(p.intentPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("writing cleanup intent: %w", err)
+	}
+	return f.Close()
+}
+
+// parseCleanupIntent splits a cleanup intent filename into its due time and
+// the blob filename to clean up.
+func parseCleanupIntent(name string) (due int64, blobName string, ok bool) {
+	hexTime, blob, found := strings.Cut(name, "-")
+	if !found || len(hexTime) != 8 {
+		return 0, "", false
+	}
+	t, err := strconv.ParseUint(hexTime, 16, 63)
+	if err != nil {
+		return 0, "", false
+	}
+	sha := strings.TrimSuffix(blob, ".lz4")
+	if len(sha) != sha256.Size*2 || !validHex(sha) {
+		return 0, "", false
+	}
+	return int64(t), blob, true
+}
+
+// runCleanupSweepLoop periodically reaps cleanup intents that have come
+// due, deleting blobs that a crashed or dropped PUT left in the main blob
+// directory without SQLite accounting.
+func (q *putQueue) runCleanupSweepLoop(ctx context.Context) {
+	t := time.NewTicker(cleanupSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := q.sweepCleanupIntents(); err != nil {
+				q.srv.logf("put-queue: cleanup sweep: %v", err)
+			}
+		}
+	}
+}
+
+// sweepCleanupIntents processes every cleanup intent that has come due. A
+// blob whose SHA-256 is accounted for in SQLite (or is referenced by an
+// in-flight pending PUT, which covers the copy-to-commit window without
+// locking against the movers or the flusher) is left alone and only the
+// intent is removed; anything else is an orphan from a crash or a dropped
+// PUT and is deleted along with its intent.
+func (q *putQueue) sweepCleanupIntents() error {
+	ents, err := os.ReadDir(q.cleanupDir)
+	if err != nil {
+		return err
+	}
+	now := q.srv.now().Unix()
+	for _, ent := range ents {
+		name := ent.Name()
+		due, blobName, ok := parseCleanupIntent(name)
+		if !ok {
+			q.srv.logf("put-queue: ignoring malformed cleanup intent %q", name)
+			continue
+		}
+		if due > now {
+			// ReadDir sorts by name and the fixed-width hex time makes
+			// that chronological; nothing after this is due either.
+			break
+		}
+		sha := strings.TrimSuffix(blobName, ".lz4")
+		var one int
+		err := q.srv.db.QueryRow("SELECT 1 FROM Blobs WHERE SHA256 = ?", sha).Scan(&one)
+		switch {
+		case err == nil:
+			// Accounted for; the intent is moot.
+		case errors.Is(err, sql.ErrNoRows):
+			if q.pendingSHA(sha) {
+				// A PUT of this content is in flight; recheck next sweep.
+				continue
+			}
+			blobPath := filepath.Join(q.srv.dir, blobName[:2], blobName)
+			if err := os.Remove(blobPath); err != nil && !os.IsNotExist(err) {
+				q.srv.logf("put-queue: sweeping orphan blob %v: %v", blobName, err)
+				continue // keep the intent and retry next sweep
+			} else if err == nil {
+				q.srv.logf("put-queue: swept orphan blob %v", blobName)
+				q.srv.m.PutQueueOrphansSwept.Add(1)
+			}
+		default:
+			return err
+		}
+		if err := os.Remove(filepath.Join(q.cleanupDir, name)); err != nil && !os.IsNotExist(err) {
+			q.srv.logf("put-queue: removing cleanup intent %v: %v", name, err)
+		}
+	}
+	return nil
+}
+
+// pendingSHA reports whether any in-flight pending PUT references the given
+// blob SHA-256. The pending map is bounded by putQueuePendingCountCap and
+// this runs at most once per sweep interval per due intent, so the linear
+// scan is fine.
+func (q *putQueue) pendingSHA(sha string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, p := range q.pending {
+		if p.sha256hex == sha {
+			return true
+		}
+	}
+	return false
 }
 
 // copyToMain installs p's spooled blob into the main blob directory, leaving
@@ -489,6 +660,16 @@ func (q *putQueue) finishCommitted(p *pendingPut, dup bool) {
 	if p.queueFile == "" {
 		return
 	}
+	if p.intentPath != "" {
+		// The metadata is committed, so the cleanup intent is moot. Hand
+		// its deletion to a mover rather than paying the NFS round-trip
+		// here on the flusher; if the channel is full, the sweeper reaps
+		// the stale intent instead.
+		select {
+		case q.intentDelCh <- p.intentPath:
+		default:
+		}
+	}
 	// A dup action doesn't necessarily reference our blob (the earlier
 	// action's blob won), so don't promote it into the hot tier.
 	if !dup && srv.hot != nil && srv.hot.ready.Load() {
@@ -548,7 +729,11 @@ empty:
 	toFlush := batch[:0]
 	for _, p := range batch {
 		if p.queueFile != "" {
-			if err := q.copyToMain(p); err != nil {
+			err := q.writeCleanupIntent(p)
+			if err == nil {
+				err = q.copyToMain(p)
+			}
+			if err != nil {
 				srv.logf("put-queue: copying blob %v to main dir: %v", p.sha256hex, err)
 				srv.m.PutQueueCopyErrs.Add(1)
 				q.drop(p)
@@ -557,10 +742,25 @@ empty:
 		}
 		toFlush = append(toFlush, p)
 	}
-	if len(toFlush) == 0 {
-		return nil
+	var flushErr error
+	if len(toFlush) > 0 {
+		flushErr = q.flushBatch(toFlush)
 	}
-	return q.flushBatch(toFlush)
+
+	// Execute the cleanup intent deletions the flushes enqueued, since the
+	// movers that normally handle them aren't running here.
+intentDels:
+	for {
+		select {
+		case path := <-q.intentDelCh:
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				srv.logf("put-queue: removing cleanup intent %v: %v", path, err)
+			}
+		default:
+			break intentDels
+		}
+	}
+	return flushErr
 }
 
 // insertPutTx runs the two metadata inserts for p inside tx: the Blobs
