@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pierrec/lz4/v4"
@@ -49,16 +50,20 @@ type HTTPClient struct {
 	// as the blob is on local disk, and the upload happens in a background goroutine.
 	BestEffortHTTP bool
 
-	// AsyncPutTimeout, if non-zero, bounds how long a background PUT may run
-	// before its context is cancelled. It only applies when BestEffortHTTP is set.
-	AsyncPutTimeout time.Duration
+	// AsyncPutTimeout, if non-nil, returns how long a background PUT of the
+	// given object size can run before its context is canceled. A zero or
+	// negative duration means no timeout. It only applies when BestEffortHTTP
+	// is set.
+	AsyncPutTimeout func(size int64) time.Duration
 
 	// AsyncPutMaxConcurrent, if positive, caps the number of background PUTs
 	// running at once. New PUTs beyond the cap are queued until an existing PUT
-	// finishes. If Close is called while some background PUTs are in-progress, it
-	// will wait for up to AsyncPutTimeout before forcing shutdown. Disk writes
-	// are not affected, and it only applies when BestEffortHTTP is set.
+	// finishes. Disk writes are not affected, and it only applies when
+	// BestEffortHTTP is set.
 	AsyncPutMaxConcurrent int
+
+	PutsTimedOut atomic.Int64 // The number of PUTs that timed out.
+	PutsCanceled atomic.Int64 // The number of PUTs canceled due to shutdown.
 
 	asyncOnce   sync.Once
 	asyncPutSem chan struct{}
@@ -90,28 +95,23 @@ func (c *HTTPClient) asyncPutContext() context.Context {
 	return c.baseCtx
 }
 
-// Shutdown blocks until all background PUTs have finished or AsyncPutTimeout
-// elapses, whichever comes first. If AsyncPutTimeout is zero (unbounded
-// PUTs), Shutdown waits indefinitely. It reports whether all PUTs drained in
-// time.
-func (c *HTTPClient) Shutdown() (drained bool) {
+// Shutdown blocks until all background PUTs have finished or ctx is done,
+// whichever comes first. When ctx is done first, it cancels the context shared
+// by any still-running PUTs and waits for them to unwind, so no background PUT
+// outlives Shutdown. It reports whether all PUTs drained before ctx was done.
+func (c *HTTPClient) Shutdown(ctx context.Context) (drained bool) {
 	done := make(chan struct{})
 	go func() {
 		c.inFlightWG.Wait()
 		close(done)
 	}()
-	if c.AsyncPutTimeout == 0 {
-		<-done
-		return true
-	}
-	t := time.NewTimer(c.AsyncPutTimeout)
-	defer t.Stop()
 	select {
 	case <-done:
 		return true
-	case <-t.C:
+	case <-ctx.Done():
 		c.ensureAsyncSetup()
 		c.baseCancel()
+		<-done
 		return false
 	}
 }
@@ -290,6 +290,7 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 				select {
 				case sem <- struct{}{}:
 				case <-putCtx.Done():
+					c.PutsCanceled.Add(1)
 					return
 				}
 				defer func() {
@@ -320,10 +321,22 @@ func (c *HTTPClient) Put(ctx context.Context, actionID, outputID string, size in
 
 func (c *HTTPClient) putRemote(ctx context.Context, actionID, outputID string, size int64, body io.ReadCloser) error {
 	defer body.Close()
-	if c.BestEffortHTTP && c.AsyncPutTimeout != 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.AsyncPutTimeout)
-		defer cancel()
+	if c.BestEffortHTTP && c.AsyncPutTimeout != nil {
+		if d := c.AsyncPutTimeout(size); d > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, d)
+			defer cancel()
+		}
+	}
+	if c.BestEffortHTTP {
+		defer func() {
+			switch {
+			case c.baseCtx.Err() != nil:
+				c.PutsCanceled.Add(1)
+			case ctx.Err() != nil:
+				c.PutsTimedOut.Add(1)
+			}
+		}()
 	}
 	// For a zero-length body, hand net/http NoBody so it sends an explicit
 	// Content-Length: 0 rather than switching to chunked transfer encoding,
