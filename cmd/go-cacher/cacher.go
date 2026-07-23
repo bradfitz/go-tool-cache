@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -20,6 +21,10 @@ import (
 	"github.com/bradfitz/go-tool-cache/cacheproc"
 	"github.com/bradfitz/go-tool-cache/cachers"
 )
+
+// shutdownDrainTimeout bounds how long Close waits for background PUTs to drain
+// before abandoning them.
+const shutdownDrainTimeout = 5 * time.Second
 
 var (
 	dir        = flag.String("cache-dir", "", "cache directory; empty means automatic")
@@ -54,10 +59,15 @@ func main() {
 		Get: dc.Get,
 		Put: dc.Put,
 	}
+	var hc *cachers.HTTPClient
 	statsFunc := func() error {
 		if *verbose {
-			log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%d errors)",
-				p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), p.PutErrors.Load())
+			putDetail := fmt.Sprintf("%d errors", p.PutErrors.Load())
+			if hc != nil {
+				putDetail += fmt.Sprintf(", %d timed out, %d canceled", hc.PutsTimedOut.Load(), hc.PutsCanceled.Load())
+			}
+			log.Printf("cacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%s)",
+				p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), putDetail)
 		}
 		return nil
 	}
@@ -82,7 +92,7 @@ func main() {
 	}
 
 	if *serverBase != "" {
-		hc := &cachers.HTTPClient{
+		hc = &cachers.HTTPClient{
 			BaseURL:     *serverBase,
 			Disk:        dc,
 			Verbose:     *verbose,
@@ -91,8 +101,14 @@ func main() {
 		p.Get = hc.Get
 		p.Put = hc.Put
 		p.Close = func() error {
-			if !hc.Shutdown() {
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+			defer cancel()
+			if !hc.Shutdown(ctx) {
 				log.Printf("go-cacher: timed out waiting for background PUTs to drain")
+			}
+			// Always surface dropped PUTs; the full stats line below is verbose-only.
+			if timedOut, canceled := hc.PutsTimedOut.Load(), hc.PutsCanceled.Load(); timedOut+canceled > 0 {
+				log.Printf("go-cacher: %d background PUTs timed out, %d canceled", timedOut, canceled)
 			}
 			return statsFunc()
 		}
