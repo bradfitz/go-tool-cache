@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -92,11 +93,11 @@ func main() {
 
 		opts = append(opts,
 			gocached.WithJWTAuth(*jwtIssuer),
-			gocached.WithNamespaceMapping(func(claims map[string]any) (gocached.Namespace, error) {
+			gocached.WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*gocached.NamespaceGrant, error) {
 				var ns gocached.Namespace
 				for k, want := range jwtClaims {
 					if got := claims[k]; got != want {
-						return "", fmt.Errorf("claim %q = %v, want %v", k, got, want)
+						return nil, fmt.Errorf("claim %q = %v, want %v", k, got, want)
 					}
 					if ns != "" {
 						ns += ","
@@ -105,10 +106,16 @@ func main() {
 				}
 				for k, want := range globalJWTClaims {
 					if got := claims[k]; got != want {
-						return ns, nil
+						return &gocached.NamespaceGrant{
+							WriteNamespace:     &ns,
+							ExtraReadNamespace: &ns,
+						}, nil
 					}
 				}
-				return gocached.GlobalNamespace, nil
+				return &gocached.NamespaceGrant{
+					WriteNamespace:     new(gocached.GlobalNamespace),
+					ExtraReadNamespace: &ns,
+				}, nil
 			}),
 		)
 	}
