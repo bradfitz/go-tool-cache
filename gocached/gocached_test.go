@@ -1244,11 +1244,11 @@ func TestExchangeToken(t *testing.T) {
 			issuer, createJWT := startOIDCServer(t, privateKey.Public())
 			st := newServerTester(t,
 				WithJWTAuth(issuer),
-				WithNamespaceMapping(func(claims map[string]any) (Namespace, error) {
+				WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
 					if claims["sub"] != "user123" {
-						return "", fmt.Errorf("sub = %v, want user123", claims["sub"])
+						return nil, fmt.Errorf("sub = %v, want user123", claims["sub"])
 					}
-					return GlobalNamespace, nil
+					return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
 				}),
 			)
 
@@ -1375,8 +1375,9 @@ func TestExchangeTokenNamespaceValidation(t *testing.T) {
 			issuer, createJWT := startOIDCServer(t, testKey1.Public())
 			st := newServerTester(t,
 				WithJWTAuth(issuer),
-				WithNamespaceMapping(func(claims map[string]any) (Namespace, error) {
-					return Namespace(claims["sub"].(string)), nil
+				WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+					ns := Namespace(claims["sub"].(string))
+					return &NamespaceGrant{WriteNamespace: &ns, ExtraReadNamespace: &ns}, nil
 				}),
 			)
 
@@ -1406,7 +1407,7 @@ func TestMultiIssuerAuth(t *testing.T) {
 	issuerB, createJWTB := startOIDCServer(t, keyB.Public())
 	issuerC, createJWTC := startOIDCServer(t, keyC.Public())
 
-	namespaceFunc := func(claims map[string]any) (Namespace, error) {
+	namespaceFunc := func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
 		iss, _ := claims["iss"].(string)
 		var requiredSub string
 		switch iss {
@@ -1415,15 +1416,16 @@ func TestMultiIssuerAuth(t *testing.T) {
 		case issuerB:
 			requiredSub = "userB"
 		default:
-			return "", fmt.Errorf("unknown issuer %q", iss)
+			return nil, fmt.Errorf("unknown issuer %q", iss)
 		}
 		if claims["sub"] != requiredSub {
-			return "", fmt.Errorf("issuer %q: sub = %v, want %v", iss, claims["sub"], requiredSub)
+			return nil, fmt.Errorf("issuer %q: sub = %v, want %v", iss, claims["sub"], requiredSub)
 		}
 		if claims["ref"] == "refs/heads/main" {
-			return GlobalNamespace, nil
+			return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
 		}
-		return Namespace(requiredSub), nil
+		ns := Namespace(requiredSub)
+		return &NamespaceGrant{WriteNamespace: &ns, ExtraReadNamespace: &ns}, nil
 	}
 
 	st := newServerTester(t,
@@ -1518,15 +1520,16 @@ func TestNamespaces(t *testing.T) {
 	// the session writes to a namespace named after its sub claim.
 	st := newServerTester(t,
 		WithJWTAuth(issuer),
-		WithNamespaceMapping(func(claims map[string]any) (Namespace, error) {
+		WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
 			if claims["ref"] == "refs/heads/main" {
-				return GlobalNamespace, nil
+				return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
 			}
 			sub, _ := claims["sub"].(string)
 			if sub == "" {
-				return "", fmt.Errorf("missing sub claim")
+				return nil, fmt.Errorf("missing sub claim")
 			}
-			return Namespace(sub), nil
+			ns := Namespace(sub)
+			return &NamespaceGrant{WriteNamespace: &ns, ExtraReadNamespace: &ns}, nil
 		}),
 	)
 
@@ -1573,6 +1576,141 @@ func TestNamespaces(t *testing.T) {
 	// alice prefers global over her own namespace, so the access-time bump
 	// lands on the shared row.
 	st.wantGet(alice(), actionA, outG, valG)
+}
+
+// TestReadOnlySession verifies that a mapping returning an empty write list
+// produces a session that can read but whose PUTs are rejected with 403.
+func TestReadOnlySession(t *testing.T) {
+	privateKey := testKey1
+	issuer, createJWT := startOIDCServer(t, privateKey.Public())
+
+	// "reader" sub gets no write namespace; anyone else writes global.
+	st := newServerTester(t,
+		WithJWTAuth(issuer),
+		WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+			if claims["sub"] == "reader" {
+				return &NamespaceGrant{}, nil
+			}
+			return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
+		}),
+	)
+
+	freshClient := func(token string) *cachers.HTTPClient {
+		c := st.mkClient()
+		c.AccessToken = token
+		return c
+	}
+
+	_, writerToken := exchangeToken(t, st.hs.URL, createJWT(baseClaims(issuer, "writer"), privateKey))
+	_, readerToken := exchangeToken(t, st.hs.URL, createJWT(baseClaims(issuer, "reader"), privateKey))
+
+	const actionID, outputID, val = "0001", "9901", "shared bytes"
+
+	// Writer seeds the global namespace.
+	st.wantPut(freshClient(writerToken), actionID, outputID, val)
+
+	// Reader can read it.
+	st.wantGet(freshClient(readerToken), actionID, outputID, val)
+
+	// Reader's PUT is rejected with 403.
+	reader := freshClient(readerToken)
+	if _, err := reader.Put(context.Background(), "0002", "9902", int64(len("nope")), strings.NewReader("nope")); err == nil {
+		t.Fatal("read-only session Put succeeded; want error")
+	}
+}
+
+// TestExchangeTokenScope verifies the OAuth scope advertised in the
+// token-exchange response reflects the mapping's read/write grants.
+func TestExchangeTokenScope(t *testing.T) {
+	issuer, createJWT := startOIDCServer(t, testKey1.Public())
+	st := newServerTester(t,
+		WithJWTAuth(issuer),
+		WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+			if claims["sub"] == "readwrite" {
+				return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
+			}
+			// Any authenticated session can read global, so an empty grant is
+			// read-only rather than no-access.
+			return &NamespaceGrant{}, nil
+		}),
+	)
+
+	for _, tc := range []struct {
+		sub       string
+		wantScope string
+	}{
+		{"readwrite", "action:read object:read action:write object:write"},
+		{"readonly", "action:read object:read"},
+	} {
+		t.Run(tc.sub, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"jwt": createJWT(baseClaims(issuer, tc.sub), testKey1),
+			})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			resp, err := http.Post(st.hs.URL+"/auth/exchange-token", "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d, want 200", resp.StatusCode)
+			}
+			var got struct {
+				Scope string `json:"scope"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.Scope != tc.wantScope {
+				t.Errorf("scope = %q, want %q", got.Scope, tc.wantScope)
+			}
+		})
+	}
+}
+
+// TestExtraReadNamespace verifies that a session may read from one namespace
+// besides the always-readable global namespace, while remaining blind to other
+// non-global namespaces.
+func TestExtraReadNamespace(t *testing.T) {
+	privateKey := testKey1
+	issuer, createJWT := startOIDCServer(t, privateKey.Public())
+
+	// "aggregator" writes its own namespace but also reads alice's.
+	st := newServerTester(t,
+		WithJWTAuth(issuer),
+		WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+			sub, _ := claims["sub"].(string)
+			if sub == "aggregator" {
+				agg, alice := Namespace("aggregator"), Namespace("alice")
+				return &NamespaceGrant{WriteNamespace: &agg, ExtraReadNamespace: &alice}, nil
+			}
+			ns := Namespace(sub)
+			return &NamespaceGrant{WriteNamespace: &ns, ExtraReadNamespace: &ns}, nil
+		}),
+	)
+
+	freshClient := func(token string) *cachers.HTTPClient {
+		c := st.mkClient()
+		c.AccessToken = token
+		return c
+	}
+	_, aliceToken := exchangeToken(t, st.hs.URL, createJWT(baseClaims(issuer, "alice"), privateKey))
+	_, bobToken := exchangeToken(t, st.hs.URL, createJWT(baseClaims(issuer, "bob"), privateKey))
+	_, aggToken := exchangeToken(t, st.hs.URL, createJWT(baseClaims(issuer, "aggregator"), privateKey))
+
+	st.wantPut(freshClient(aliceToken), "0001", "9901", "from-alice")
+	st.wantPut(freshClient(bobToken), "0002", "9902", "from-bob")
+
+	// Aggregator reads from alice's namespace via its extra read grant.
+	st.wantGet(freshClient(aggToken), "0001", "9901", "from-alice")
+
+	// But it was granted no read access to bob's namespace.
+	st.wantGetMiss(freshClient(aggToken), "0002")
+
+	// Alice cannot see bob's namespace.
+	st.wantGetMiss(freshClient(aliceToken), "0002")
 }
 
 func BenchmarkFlushAccessTimes(b *testing.B) {

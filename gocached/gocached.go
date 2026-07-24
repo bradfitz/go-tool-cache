@@ -761,14 +761,16 @@ func WithShardPrefixLen(n int) ServerOption {
 }
 
 // Namespace identifies a logical partition of the cache where each peer is
-// equally trusted. Every session is associated with exactly one Namespace to
-// which it can read and write; sessions for non-global namespaces also read
-// from [GlobalNamespace]. See [WithNamespaceMapping]. It may only contain
-// characters from the set [a-zA-Z0-9._~:/@+|=-].
+// equally trusted. A [WithNamespaceMapping] function decides which single
+// namespace (if any) a session may write to and which additional namespace (if
+// any) it may read from, on top of the always-readable [GlobalNamespace]. It
+// may only contain characters from the set [a-zA-Z0-9._~:/@+|=-].
 type Namespace string
 
-// GlobalNamespace is a trusted namespace that all sessions can read from. Only
-// sessions explicitly mapped to GlobalNamespace can write to it.
+// GlobalNamespace is the namespace shared by all peers. Every authenticated
+// session may read from it; a session may write to it only if its mapping
+// function grants it as the write namespace. When JWT auth is enabled without a
+// mapping function, every session both reads and writes GlobalNamespace.
 const GlobalNamespace Namespace = ""
 
 // WithJWTAuth enables JWT-based authentication for the server. Each issuer
@@ -785,17 +787,31 @@ func WithJWTAuth(issuers ...string) ServerOption {
 	}
 }
 
+// NamespaceGrant is the access decision returned by a [WithNamespaceMapping]
+// function. Every authenticated session may read from [GlobalNamespace]; these
+// fields grant access beyond that.
+type NamespaceGrant struct {
+	// WriteNamespace, if non-nil, is the single namespace the session may write
+	// to. A nil WriteNamespace yields a read-only session whose PUT requests are
+	// rejected with 403.
+	WriteNamespace *Namespace
+	// ExtraReadNamespace, if non-nil, is one additional namespace the session may
+	// read from, beyond the always-readable [GlobalNamespace].
+	ExtraReadNamespace *Namespace
+}
+
 // WithNamespaceMapping sets the function that makes policy decisions based on
 // a JWT's claims. It is called once per token exchange after the JWT's
 // signature and standard claims have been validated. It should return an error
-// if the claims are not authorized, and otherwise return which [Namespace] the
-// session is allowed to read and write in. See [Namespace] for character set
-// constraints. All authorized sessions are allowed to read from the
-// [GlobalNamespace] regardless of the namespace returned. Check claims["iss"]
-// to switch on per-issuer rules. If JWT auth is enabled but no mapping
-// function is provided, all sessions will read and write in the
-// [GlobalNamespace].
-func WithNamespaceMapping(fn func(claims map[string]any) (Namespace, error)) ServerOption {
+// if the claims are not authorized; the token exchange then fails with 401.
+//
+// Otherwise it returns a [NamespaceGrant] describing the session's access. See
+// [Namespace] for character set constraints and [NamespaceGrant] for the
+// meaning of its fields. Check claims["iss"] to switch on per-issuer rules.
+//
+// If JWT auth is enabled but no mapping function is provided, every session
+// both reads and writes [GlobalNamespace].
+func WithNamespaceMapping(fn func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error)) ServerOption {
 	return func(srv *Server) {
 		srv.namespaceMapping = fn
 	}
@@ -817,10 +833,12 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 	}
 
 	if len(srv.jwtIssuers) > 0 && srv.namespaceMapping == nil {
-		// If JWT auth is enabled, but not namespace mapping, every session is in
-		// the global namespace.
-		srv.namespaceMapping = func(claims map[string]any) (Namespace, error) {
-			return GlobalNamespace, nil
+		// If JWT auth is enabled, but not namespace mapping, every session reads
+		// and writes the global namespace.
+		srv.namespaceMapping = func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+			return &NamespaceGrant{
+				WriteNamespace: new(GlobalNamespace),
+			}, nil
 		}
 	}
 
@@ -893,9 +911,9 @@ type Server struct {
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 
-	jwtValidator     *ijwt.Validator                                // nil unless jwtIssuers is non-empty
-	jwtIssuers       []string                                       // accepted issuer URLs
-	namespaceMapping func(claims map[string]any) (Namespace, error) // required when jwtIssuers is non-empty
+	jwtValidator     *ijwt.Validator                                                           // nil unless jwtIssuers is non-empty
+	jwtIssuers       []string                                                                  // accepted issuer URLs
+	namespaceMapping func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) // required when jwtIssuers is non-empty
 
 	mu               sync.RWMutex            // guards following fields in this block
 	sessions         map[string]*sessionData // maps access token -> session data.
@@ -1019,13 +1037,36 @@ type Server struct {
 // sessionData corresponds to a specific access token, and is only used if JWT
 // auth is enabled.
 type sessionData struct {
-	expiry      time.Time      // Session valid until.
-	namespaceID int64          // The namespace this session writes to. 0 means GlobalNamespace; non-zero sessions also read from 0.
-	namespace   Namespace      // Namespace this session writes to, stored for debug.
-	claims      map[string]any // Claims from the JWT used to create this session, stored for debug.
+	expiry time.Time // Session valid until.
+
+	canWrite             bool  // Whether this session may write at all.
+	writeNamespaceID     int64 // Namespace this session writes to; 0 means GlobalNamespace. It is only meaningful if canWrite is true.
+	extraReadNamespaceID int64 // One namespace this session may read from besides the always-readable global namespace. 0 means only global.
+
+	// These fields are for debug display purposes only.
+	writeNamespace     Namespace      // The Namespace this session writes to, if any.
+	extraReadNamespace Namespace      // The extra Namespace this session reads from, if any.
+	claims             map[string]any // Claims from the JWT used to create this session.
 
 	mu    sync.Mutex // Guards stats.
 	stats stats
+}
+
+// scope returns the OAuth 2.0 scope string (RFC 8693 §2.2.1 / RFC 6749 §3.3:
+// space-delimited, case-sensitive) advertising the operations this session may
+// perform so a client can skip requests that would be denied. It is advisory:
+// the server still enforces access on every request, so a client that ignores
+// it is only less efficient, never wrong.
+//
+// action and object permissions are currently always assigned together, but
+// may be split in future. Object writes can be self-verified as they are
+// content-addressed, so require less trust in the client.
+func (d *sessionData) scope() string {
+	s := []string{"action:read", "object:read"}
+	if d.canWrite {
+		s = append(s, "action:write", "object:write")
+	}
+	return strings.Join(s, " ")
 }
 
 // stats holds per-request or per-session stats which get rolled up into server
@@ -1134,7 +1175,11 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "PUT" {
 		var writeNS int64
 		if sessionData != nil {
-			writeNS = sessionData.namespaceID
+			if !sessionData.canWrite {
+				http.Error(w, "forbidden: read-only session", http.StatusForbidden)
+				return
+			}
+			writeNS = sessionData.writeNamespaceID
 		}
 		srv.handlePut(w, r, reqStats, writeNS)
 		return
@@ -1235,17 +1280,11 @@ func validHex(x string) bool {
 // we do a DB write to update it.
 const relAtimeSeconds = 60 * 60 * 24 // 1 day
 
-const getFromGlobalNamespace = `
-SELECT b.SHA256, b.StoredSize, b.UncompressedSize, b.SmallData, a.AltOutputID, a.AccessTime, a.NamespaceID
-FROM Actions a, Blobs b
-WHERE a.NamespaceID = 0
-  AND a.ActionID = ?
-  AND a.BlobID = b.BlobID
-`
-
-// Get hits from the global namespace first so shared cache mtime is bumped
-// with higher priority than namespaced cache.
-const getFromSessionNamespace = `
+// getFromNamespace fetches an action row from the global namespace (0) or the
+// session's one extra read namespace, preferring a hit in global so the shared
+// cache mtime is bumped with higher priority than namespaced entries. Pass 0
+// for the extra namespace when there is none: IN (0, 0) collapses to global.
+const getFromNamespace = `
 SELECT b.SHA256, b.StoredSize, b.UncompressedSize, b.SmallData, a.AltOutputID, a.AccessTime, a.NamespaceID
 FROM Actions a, Blobs b
 WHERE a.NamespaceID IN (0, ?)
@@ -1284,12 +1323,20 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		return
 	}
 
+	// A session may read from its one extra namespace in addition to the
+	// always-readable global namespace; 0 (unauthenticated or no extra) means
+	// global only.
+	var extraReadID int64
+	if sessionData != nil {
+		extraReadID = sessionData.extraReadNamespaceID
+	}
+
 	// Serve from the put-queue first: a just-written PUT is readable here
-	// before its metadata reaches SQLite. Like the SQL queries below, the
-	// global namespace is preferred over the session's.
+	// before its metadata reaches SQLite. Like the SQL query below, global is
+	// preferred over the extra namespace.
 	pp, havePending := srv.putq.lookup(actionKey{ActionID: actionID})
-	if !havePending && sessionData != nil && sessionData.namespaceID != 0 {
-		pp, havePending = srv.putq.lookup(actionKey{NamespaceID: sessionData.namespaceID, ActionID: actionID})
+	if !havePending && extraReadID != 0 {
+		pp, havePending = srv.putq.lookup(actionKey{NamespaceID: extraReadID, ActionID: actionID})
 	}
 	if havePending {
 		// Open the spool file before committing to this path: if the entry
@@ -1341,13 +1388,8 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 			ActionID: actionID,
 		}
 	)
-	if sessionData != nil && sessionData.namespaceID != 0 {
-		err = srv.db.QueryRow(getFromSessionNamespace, sessionData.namespaceID, actionID).Scan(
-			&sha256hex, &storedSize, &uncompressedSize, &smallData, &altObjectID, &accessTime, &actionKey.NamespaceID)
-	} else {
-		err = srv.db.QueryRow(getFromGlobalNamespace, actionID).Scan(
-			&sha256hex, &storedSize, &uncompressedSize, &smallData, &altObjectID, &accessTime, &actionKey.NamespaceID)
-	}
+	err = srv.db.QueryRow(getFromNamespace, extraReadID, actionID).Scan(
+		&sha256hex, &storedSize, &uncompressedSize, &smallData, &altObjectID, &accessTime, &actionKey.NamespaceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			labels = writeObjectResponseLabels{storage: "none", result: "miss"}
@@ -1964,8 +2006,8 @@ func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ns, err := srv.namespaceMapping(jwtClaims)
-	if err != nil {
+	grant, err := srv.namespaceMapping(r.Context(), jwtClaims)
+	if err != nil || grant == nil {
 		srv.m.AuthErrs.Add(1)
 		if srv.verbose {
 			srv.logf("token exchange: namespace func error: %v", err)
@@ -1974,19 +2016,38 @@ func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateNamespace(ns); err != nil {
-		srv.m.AuthErrs.Add(1)
-		if srv.verbose {
-			srv.logf("token exchange: invalid namespace from claims: %v", err)
+	for _, ns := range []*Namespace{grant.WriteNamespace, grant.ExtraReadNamespace} {
+		if ns == nil {
+			continue
 		}
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		if err := validateNamespace(*ns); err != nil {
+			srv.m.AuthErrs.Add(1)
+			if srv.verbose {
+				srv.logf("token exchange: invalid namespace from claims: %v", err)
+			}
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 
-	var namespaceID int64
-	if ns != GlobalNamespace {
-		namespaceID, err = srv.resolveNamespaceID(ns)
-		if err != nil {
+	const ttl = time.Hour
+	sd := &sessionData{
+		expiry: srv.now().UTC().Add(ttl),
+		claims: jwtClaims,
+	}
+	if grant.WriteNamespace != nil {
+		sd.canWrite = true
+		sd.writeNamespace = *grant.WriteNamespace
+		if sd.writeNamespaceID, err = srv.resolveNamespaceID(*grant.WriteNamespace); err != nil {
+			srv.m.AuthErrs.Add(1)
+			srv.logf("token exchange: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
+	if grant.ExtraReadNamespace != nil {
+		sd.extraReadNamespace = *grant.ExtraReadNamespace
+		if sd.extraReadNamespaceID, err = srv.resolveNamespaceID(*grant.ExtraReadNamespace); err != nil {
 			srv.m.AuthErrs.Add(1)
 			srv.logf("token exchange: %v", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -1994,20 +2055,15 @@ func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	const ttl = time.Hour
 	// 52 base32 characters, 256 bits of entropy.
 	accessToken := tokenPrefix + strings.ToLower(rand.Text()+rand.Text())
-	srv.addSessionData(accessToken, &sessionData{
-		expiry:      srv.now().UTC().Add(ttl),
-		namespaceID: namespaceID,
-		namespace:   ns,
-		claims:      jwtClaims,
-	})
+	srv.addSessionData(accessToken, sd)
 
 	resp := map[string]any{
 		"access_token": accessToken,
 		"token_type":   "Bearer",
 		"expires_in":   ttl.Seconds(),
+		"scope":        sd.scope(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -2045,7 +2101,12 @@ func validateNamespace(ns Namespace) error {
 
 // resolveNamespaceID returns the integer ID for the given Namespace,
 // inserting a row in the Namespaces table if one doesn't already exist.
+// GlobalNamespace always resolves to 0 without touching the database.
 func (srv *Server) resolveNamespaceID(ns Namespace) (int64, error) {
+	if ns == GlobalNamespace {
+		return 0, nil
+	}
+
 	// If it's not a new namespace, we only need to consult our cache of IDs.
 	srv.mu.Lock()
 	id, ok := srv.namespaces[ns]
@@ -3089,11 +3150,14 @@ func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
 	for _, v := range srv.sessions {
 		v.mu.Lock()
 		sessions = append(sessions, &sessionData{
-			expiry:      v.expiry,
-			namespaceID: v.namespaceID,
-			namespace:   v.namespace,
-			claims:      v.claims,
-			stats:       v.stats,
+			expiry:               v.expiry,
+			canWrite:             v.canWrite,
+			writeNamespaceID:     v.writeNamespaceID,
+			writeNamespace:       v.writeNamespace,
+			extraReadNamespaceID: v.extraReadNamespaceID,
+			extraReadNamespace:   v.extraReadNamespace,
+			claims:               v.claims,
+			stats:                v.stats,
 		})
 		v.mu.Unlock()
 	}
@@ -3107,23 +3171,33 @@ func (srv *Server) serveSessions(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<p>Number of sessions: %d</p>\n", len(sessions))
 
 	fmt.Fprintf(w, "<table border='1' cellpadding=5>\n")
-	fmt.Fprintf(w, "<tr><th>Last used</th><th>Expiry time</th><th>Namespace</th><th>Stats</th><th>Claims</th></tr>\n")
+	fmt.Fprintf(w, "<tr><th>Last used</th><th>Expiry time</th><th>Write</th><th>Reads</th><th>Stats</th><th>Claims</th></tr>\n")
 	slices.SortFunc(sessions, func(a, b *sessionData) int {
-		return a.stats.LastUsed.Compare(b.stats.LastUsed)
+		return a.expiry.Compare(b.expiry)
 	})
+	nsLabel := func(ns Namespace) string {
+		if ns == GlobalNamespace {
+			return "(global)"
+		}
+		return fmt.Sprintf("%q", ns)
+	}
 	for _, d := range slices.Backward(sessions) {
 		lastUsed := "never"
 		if !d.stats.LastUsed.IsZero() {
 			lastUsed = durFmt(time.Since(d.stats.LastUsed)) + " ago"
 		}
-		nsLabel := "(global)"
-		if d.namespaceID != 0 {
-			nsLabel = fmt.Sprintf("%q (id=%d)", d.namespace, d.namespaceID)
+		writeLabel := "(read-only)"
+		if d.canWrite {
+			writeLabel = nsLabel(d.writeNamespace)
+		}
+		readLabels := []string{nsLabel(GlobalNamespace)}
+		if d.extraReadNamespaceID != 0 {
+			readLabels = append(readLabels, nsLabel(d.extraReadNamespace))
 		}
 		statsJSON, _ := json.MarshalIndent(d.stats, "", "  ")
 		claimsJSON, _ := json.MarshalIndent(d.claims, "", "  ")
-		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td><td><pre>%s</pre></td><td><pre>%s</pre></td></tr>\n",
-			lastUsed, d.expiry.Format(time.RFC3339), nsLabel, statsJSON, claimsJSON)
+		fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td><pre>%s</pre></td><td><pre>%s</pre></td></tr>\n",
+			lastUsed, d.expiry.Format(time.RFC3339), writeLabel, strings.Join(readLabels, ", "), statsJSON, claimsJSON)
 	}
 	fmt.Fprintf(w, "</table>\n")
 }
