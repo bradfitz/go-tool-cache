@@ -159,7 +159,7 @@ const shardStalenessTarget = 10 * time.Minute
 const schema = `
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS Actions (
-  NamespaceID  INTEGER NOT NULL, -- 0 for global trusted namespace
+  NamespaceID  INTEGER NOT NULL, -- 0 for global trusted namespace (generation 1; see WithGlobalGeneration)
   ActionID     TEXT    NOT NULL,
   BlobID       INTEGER NOT NULL,
   AltOutputID  TEXT NOT NULL DEFAULT '', -- if non-empty, the alternate object ID to use for this action; NULL means the blob's sha256
@@ -469,6 +469,21 @@ func (srv *Server) start() error {
 		return err
 	}
 
+	if srv.globalGeneration < 0 {
+		return fmt.Errorf("global generation %d must not be negative", srv.globalGeneration)
+	}
+	if srv.globalGeneration > 1 {
+		// Later generations of the global namespace live under a synthetic
+		// name in the Namespaces table. The "!" prefix is outside the
+		// character set validateNamespace permits, so no mapping-provided
+		// namespace can collide with it.
+		id, err := srv.resolveNamespaceID(Namespace(fmt.Sprintf("!global:%d", srv.globalGeneration)))
+		if err != nil {
+			return fmt.Errorf("resolving global generation namespace: %w", err)
+		}
+		srv.globalNamespaceID = id
+	}
+
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
 		collectors.NewGoCollector(),
@@ -760,6 +775,20 @@ func WithShardPrefixLen(n int) ServerOption {
 	}
 }
 
+// WithGlobalGeneration sets the generation number of the global namespace.
+// Generations 0 and 1 both mean the original global namespace; incrementing
+// the generation effectively wipes the global namespace without any O(n)
+// deletion work: reads and writes move to a fresh namespace, and the previous
+// generation's entries stop being accessed, so they age out of the cache via
+// the normal LRU eviction (which requires [WithMaxSize] or [WithMaxAge] to be
+// set). Decrementing back to a previous generation makes that generation's
+// surviving entries visible again.
+func WithGlobalGeneration(gen int) ServerOption {
+	return func(srv *Server) {
+		srv.globalGeneration = gen
+	}
+}
+
 // Namespace identifies a logical partition of the cache where each peer is
 // equally trusted. A [WithNamespaceMapping] function decides which single
 // namespace (if any) a session may write to and which additional namespace (if
@@ -771,6 +800,7 @@ type Namespace string
 // session may read from it; a session may write to it only if its mapping
 // function grants it as the write namespace. When JWT auth is enabled without a
 // mapping function, every session both reads and writes GlobalNamespace.
+// Which storage namespace it maps to is controlled by [WithGlobalGeneration].
 const GlobalNamespace Namespace = ""
 
 // WithJWTAuth enables JWT-based authentication for the server. Each issuer
@@ -911,6 +941,17 @@ type Server struct {
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 
+	// globalGeneration is the generation number of the global namespace, set
+	// via [WithGlobalGeneration]. Values 0 and 1 both mean the original
+	// global namespace.
+	globalGeneration int
+
+	// globalNamespaceID is the NamespaceID that [GlobalNamespace] resolves
+	// to. It is 0 for globalGeneration <= 1; for later generations it is the
+	// ID of a synthetic per-generation row in the Namespaces table, computed
+	// once in start.
+	globalNamespaceID int64
+
 	jwtValidator     *ijwt.Validator                                                           // nil unless jwtIssuers is non-empty
 	jwtIssuers       []string                                                                  // accepted issuer URLs
 	namespaceMapping func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) // required when jwtIssuers is non-empty
@@ -1040,7 +1081,7 @@ type sessionData struct {
 	expiry time.Time // Session valid until.
 
 	canWrite             bool  // Whether this session may write at all.
-	writeNamespaceID     int64 // Namespace this session writes to; 0 means GlobalNamespace. It is only meaningful if canWrite is true.
+	writeNamespaceID     int64 // NamespaceID this session writes to (the current global generation's ID for GlobalNamespace). It is only meaningful if canWrite is true.
 	extraReadNamespaceID int64 // One namespace this session may read from besides the always-readable global namespace. 0 means only global.
 
 	// These fields are for debug display purposes only.
@@ -1173,7 +1214,7 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == "PUT" {
-		var writeNS int64
+		writeNS := srv.globalNamespaceID
 		if sessionData != nil {
 			if !sessionData.canWrite {
 				http.Error(w, "forbidden: read-only session", http.StatusForbidden)
@@ -1258,7 +1299,7 @@ func getHexSuffix(r *http.Request, prefix string) (hexSuffix string, ok bool) {
 // actionKey is the comparable value type for the (NamespaceID, ActionID)
 // primary key tuple used in the SQLite Actions table.
 type actionKey struct {
-	NamespaceID int64 // 0 for global
+	NamespaceID int64 // Server.globalNamespaceID for global
 	ActionID    string
 }
 
@@ -1280,17 +1321,19 @@ func validHex(x string) bool {
 // we do a DB write to update it.
 const relAtimeSeconds = 60 * 60 * 24 // 1 day
 
-// getFromNamespace fetches an action row from the global namespace (0) or the
+// getFromNamespace fetches an action row from the global namespace or the
 // session's one extra read namespace, preferring a hit in global so the shared
-// cache mtime is bumped with higher priority than namespaced entries. Pass 0
-// for the extra namespace when there is none: IN (0, 0) collapses to global.
+// cache mtime is bumped with higher priority than namespaced entries. The
+// parameters are (globalID, extraID, actionID, globalID); pass the global ID
+// again as the extra namespace when there is none, so the IN clause collapses
+// to global only.
 const getFromNamespace = `
 SELECT b.SHA256, b.StoredSize, b.UncompressedSize, b.SmallData, a.AltOutputID, a.AccessTime, a.NamespaceID
 FROM Actions a, Blobs b
-WHERE a.NamespaceID IN (0, ?)
+WHERE a.NamespaceID IN (?, ?)
   AND a.ActionID = ?
   AND a.BlobID = b.BlobID
-ORDER BY CASE a.NamespaceID WHEN 0 THEN 0 ELSE 1 END
+ORDER BY CASE a.NamespaceID WHEN ? THEN 0 ELSE 1 END
 LIMIT 1
 `
 
@@ -1324,18 +1367,19 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 	}
 
 	// A session may read from its one extra namespace in addition to the
-	// always-readable global namespace; 0 (unauthenticated or no extra) means
-	// global only.
-	var extraReadID int64
-	if sessionData != nil {
+	// always-readable global namespace. Unauthenticated sessions (or those
+	// with no extra grant) read global only, expressed by using the global ID
+	// as the extra ID so the SQL IN clause collapses to global.
+	extraReadID := srv.globalNamespaceID
+	if sessionData != nil && sessionData.extraReadNamespaceID != 0 {
 		extraReadID = sessionData.extraReadNamespaceID
 	}
 
 	// Serve from the put-queue first: a just-written PUT is readable here
 	// before its metadata reaches SQLite. Like the SQL query below, global is
 	// preferred over the extra namespace.
-	pp, havePending := srv.putq.lookup(actionKey{ActionID: actionID})
-	if !havePending && extraReadID != 0 {
+	pp, havePending := srv.putq.lookup(actionKey{NamespaceID: srv.globalNamespaceID, ActionID: actionID})
+	if !havePending && extraReadID != srv.globalNamespaceID {
 		pp, havePending = srv.putq.lookup(actionKey{NamespaceID: extraReadID, ActionID: actionID})
 	}
 	if havePending {
@@ -1388,7 +1432,7 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 			ActionID: actionID,
 		}
 	)
-	err = srv.db.QueryRow(getFromNamespace, extraReadID, actionID).Scan(
+	err = srv.db.QueryRow(getFromNamespace, srv.globalNamespaceID, extraReadID, actionID, srv.globalNamespaceID).Scan(
 		&sha256hex, &storedSize, &uncompressedSize, &smallData, &altObjectID, &accessTime, &actionKey.NamespaceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2101,10 +2145,11 @@ func validateNamespace(ns Namespace) error {
 
 // resolveNamespaceID returns the integer ID for the given Namespace,
 // inserting a row in the Namespaces table if one doesn't already exist.
-// GlobalNamespace always resolves to 0 without touching the database.
+// GlobalNamespace always resolves to [Server.globalNamespaceID] (0 unless
+// [WithGlobalGeneration] is 2+) without touching the database.
 func (srv *Server) resolveNamespaceID(ns Namespace) (int64, error) {
 	if ns == GlobalNamespace {
-		return 0, nil
+		return srv.globalNamespaceID, nil
 	}
 
 	// If it's not a new namespace, we only need to consult our cache of IDs.

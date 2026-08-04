@@ -165,6 +165,17 @@ func (st *tester) wantMetric(m *expvar.Int, want int64) {
 	m.Set(0)
 }
 
+// close shuts down the tester's HTTP listener and server early so a later
+// tester can reopen the same cache directory. The Cleanup-registered closes
+// registered by newServerTester then become harmless no-ops.
+func (st *tester) close() {
+	st.t.Helper()
+	st.hs.Close()
+	if err := st.srv.Close(); err != nil {
+		st.t.Fatalf("Close: %v", err)
+	}
+}
+
 // drain synchronously settles all pending PUTs, standing in for the
 // background put-queue pipeline that newServerTester disables.
 func (st *tester) drain() {
@@ -455,6 +466,41 @@ func TestEvictionQueryPlan(t *testing.T) {
 	}
 	if strings.Contains(detail, "SCAN Actions") || strings.Contains(detail, "SCAN TABLE Actions") {
 		t.Errorf("plan does a table scan of Actions: %q", detail)
+	}
+}
+
+// TestGetFromNamespaceQueryPlan is the lockdown test for the GET lookup
+// query: the NamespaceID IN (?, ?) + ActionID equality must resolve via the
+// (NamespaceID, ActionID) primary key, never a table scan, regardless of the
+// global generation in use.
+func TestGetFromNamespaceQueryPlan(t *testing.T) {
+	st := newServerTester(t, WithGlobalGeneration(2))
+	rows, err := st.srv.db.Query("EXPLAIN QUERY PLAN "+getFromNamespace,
+		st.srv.globalNamespaceID, int64(7), "0001", st.srv.globalNamespaceID)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+	var sawActionsSearch bool
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		t.Logf("plan: %s", detail)
+		if strings.Contains(detail, "SCAN a") || strings.Contains(detail, "SCAN TABLE a") {
+			t.Errorf("plan does a table scan of Actions: %q", detail)
+		}
+		if strings.Contains(detail, "SEARCH a ") && strings.Contains(detail, "NamespaceID=? AND ActionID=?") {
+			sawActionsSearch = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !sawActionsSearch {
+		t.Error("plan does not search Actions by (NamespaceID, ActionID)")
 	}
 }
 
@@ -1711,6 +1757,162 @@ func TestExtraReadNamespace(t *testing.T) {
 
 	// Alice cannot see bob's namespace.
 	st.wantGetMiss(freshClient(aliceToken), "0002")
+}
+
+// TestGlobalGeneration verifies that bumping the global generation makes the
+// global namespace start out empty, that the generation-to-ID mapping is
+// stable across restarts, and that rolling back to a previous generation
+// makes its surviving entries visible again.
+func TestGlobalGeneration(t *testing.T) {
+	dir := t.TempDir()
+	open := func(gen int) *tester {
+		return newServerTester(t, WithDir(dir), WithGlobalGeneration(gen))
+	}
+
+	// Generation 1 is the original global namespace with NamespaceID 0.
+	st := open(1)
+	if got := st.srv.globalNamespaceID; got != 0 {
+		t.Fatalf("generation 1 globalNamespaceID = %d, want 0", got)
+	}
+	st.wantPut(st.mkClient(), "0001", "9901", "gen1 bytes")
+	st.wantGet(st.mkClient(), "0001", "9901", "gen1 bytes")
+	st.close()
+
+	// Generation 2: the global namespace is effectively empty. The old rows
+	// remain in the database under NamespaceID 0 but are not visible.
+	st = open(2)
+	if st.srv.globalNamespaceID == 0 {
+		t.Fatal("generation 2 globalNamespaceID = 0, want nonzero")
+	}
+	var genRows int
+	if err := st.srv.db.QueryRow(`SELECT COUNT(*) FROM Namespaces WHERE Namespace = '!global:2'`).Scan(&genRows); err != nil {
+		t.Fatal(err)
+	}
+	if genRows != 1 {
+		t.Errorf("synthetic namespace rows = %d, want 1", genRows)
+	}
+	st.wantGetMiss(st.mkClient(), "0001")
+	st.wantPut(st.mkClient(), "0001", "9902", "gen2 bytes")
+	st.wantGet(st.mkClient(), "0001", "9902", "gen2 bytes")
+
+	// A just-written PUT is served from the put-queue before its metadata
+	// reaches SQLite; that pending lookup must also use the generation's ID.
+	const pendingVal = "pending bytes"
+	if _, err := st.mkClient().Put(context.Background(), "00aa", "99aa", int64(len(pendingVal)), strings.NewReader(pendingVal)); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	st.wantGet(st.mkClient(), "00aa", "99aa", pendingVal)
+	st.drain()
+
+	gen2ID := st.srv.globalNamespaceID
+	st.close()
+
+	// Reopening generation 2 reuses the synthetic namespace row, so the
+	// generation's entries survive restarts.
+	st = open(2)
+	if st.srv.globalNamespaceID != gen2ID {
+		t.Errorf("reopened generation 2 globalNamespaceID = %d, want %d", st.srv.globalNamespaceID, gen2ID)
+	}
+	st.wantGet(st.mkClient(), "0001", "9902", "gen2 bytes")
+	st.close()
+
+	// Rolling back to generation 1 makes its surviving entries visible again.
+	st = open(1)
+	st.wantGet(st.mkClient(), "0001", "9901", "gen1 bytes")
+	st.close()
+}
+
+// TestGlobalGenerationEviction verifies the "wipe via generation bump" story:
+// after a bump, the previous generation's rows stop being accessed and so are
+// the first LRU eviction candidates, while blobs whose content was rewritten
+// into the new generation survive eviction of the old rows.
+func TestGlobalGenerationEviction(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// Generation 1: one entry whose content the new generation will also
+	// write (shared blob) and one unique to generation 1.
+	st := newServerTester(t, WithDir(dir), WithGlobalGeneration(1))
+	c := st.mkClient()
+	st.wantPut(c, "0001", "9901", "shared content")
+	st.wantPut(c, "0002", "9902", "gen1-only content")
+	st.close()
+
+	// Generation 2, a day later: rewrite the shared content under a new
+	// action, as a fresh build would.
+	st = newServerTester(t, WithDir(dir), WithGlobalGeneration(2))
+	st.advanceClock(24 * time.Hour)
+	st.wantPut(st.mkClient(), "0003", "9903", "shared content")
+
+	// Evict everything not accessed within the last hour: exactly the two
+	// generation-1 Actions. The shared blob stays alive via 0003, so only
+	// the gen1-only blob's bytes are reclaimed.
+	res, err := st.srv.evictOldestActions(ctx, st.srv.now().Add(-time.Hour).Unix(), 10, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("evictOldestActions: %v", err)
+	}
+	if want := (countAndSize{Count: 1, Size: int64(len("gen1-only content"))}); res != want {
+		t.Errorf("evict result = %+v, want %+v", res, want)
+	}
+	var actionCount int
+	if err := st.srv.db.QueryRow(`SELECT COUNT(*) FROM Actions`).Scan(&actionCount); err != nil {
+		t.Fatal(err)
+	}
+	if actionCount != 1 {
+		t.Errorf("Actions count after evict = %d, want 1 (only the generation-2 row)", actionCount)
+	}
+	st.wantGet(st.mkClient(), "0003", "9903", "shared content")
+}
+
+// TestGlobalGenerationNamespaces verifies that session grants resolve against
+// the configured global generation: a GlobalNamespace write grant lands in the
+// generation's namespace, and an extra-read grant works alongside it.
+func TestGlobalGenerationNamespaces(t *testing.T) {
+	privateKey := testKey1
+	issuer, createJWT := startOIDCServer(t, privateKey.Public())
+
+	st := newServerTester(t,
+		WithGlobalGeneration(2),
+		WithJWTAuth(issuer),
+		WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+			if claims["ref"] == "refs/heads/main" {
+				return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
+			}
+			sub, _ := claims["sub"].(string)
+			if sub == "" {
+				return nil, fmt.Errorf("missing sub claim")
+			}
+			ns := Namespace(sub)
+			return &NamespaceGrant{WriteNamespace: &ns, ExtraReadNamespace: &ns}, nil
+		}),
+	)
+
+	mainClaims := baseClaims(issuer, "main-builder")
+	mainClaims["ref"] = "refs/heads/main"
+	_, aliceToken := exchangeToken(t, st.hs.URL, createJWT(baseClaims(issuer, "alice"), privateKey))
+	_, mainToken := exchangeToken(t, st.hs.URL, createJWT(mainClaims, privateKey))
+	freshClient := func(token string) *cachers.HTTPClient {
+		c := st.mkClient()
+		c.AccessToken = token
+		return c
+	}
+
+	// The global writer's session resolves to the generation's namespace ID,
+	// not the retired generation-1 ID 0.
+	mainSession, ok := st.srv.getSessionData(mainToken)
+	if !ok {
+		t.Fatal("no session data for main token")
+	}
+	if got, want := mainSession.writeNamespaceID, st.srv.globalNamespaceID; got != want || got == 0 {
+		t.Errorf("main session writeNamespaceID = %d, want %d (nonzero)", got, want)
+	}
+
+	// Global writes are visible to everyone; alice's own namespace still
+	// works alongside the generation's global namespace.
+	st.wantPut(freshClient(mainToken), "0001", "9901", "global gen2 bytes")
+	st.wantGet(freshClient(aliceToken), "0001", "9901", "global gen2 bytes")
+	st.wantPut(freshClient(aliceToken), "0002", "9902", "alice bytes")
+	st.wantGet(freshClient(aliceToken), "0002", "9902", "alice bytes")
 }
 
 func BenchmarkFlushAccessTimes(b *testing.B) {
