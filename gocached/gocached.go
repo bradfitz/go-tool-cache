@@ -317,7 +317,6 @@ func migrateV3ToV4(dbDir, v3Path, v4Path string) error {
 
 // start initializes the server, including defaults and background goroutines.
 func (srv *Server) start() error {
-	srv.shutdownCtx, srv.shutdownCancel = context.WithCancel(srv.shutdownCtx)
 	if srv.dir == "" {
 		d, err := os.UserCacheDir()
 		if err != nil {
@@ -872,8 +871,12 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 		}
 	}
 
+	srv.shutdownCtx, srv.shutdownCancel = context.WithCancel(srv.shutdownCtx)
 	err := srv.start()
 	if err != nil {
+		// start may have already opened the SQLite database, and leaking that handle
+		// keeps the file open.
+		srv.Close()
 		return nil, err
 	}
 
@@ -900,6 +903,10 @@ func (srv *Server) Close() error {
 	}
 	if srv.writeConn != nil {
 		err = errors.Join(err, srv.writeConn.Close())
+	}
+
+	if srv.db == nil {
+		return err
 	}
 
 	// Final TRUNCATE checkpoint so the WAL doesn't linger on disk past

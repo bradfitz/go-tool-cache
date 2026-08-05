@@ -10,6 +10,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"expvar"
 	"fmt"
@@ -316,12 +317,56 @@ func newServerTester(t testing.TB, extraOpts ...ServerOption) *tester {
 	return st
 }
 
-type jwtFunc func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string
+// signingKey must be a key type the server's signing method accepts; either
+// [*ecdsa.PrivateKey] for ES256 and ES384, or [*rsa.PrivateKey] for RS256.
+type jwtFunc func(claims jwt.MapClaims, signingKey any) string
+
+type oidcConfig struct {
+	alg       string
+	use       string
+	method    jwt.SigningMethod
+	extraKeys []jose.JSONWebKey
+}
+
+type oidcOpt func(*oidcConfig)
+
+// withJWKAlg sets the published JWK's "alg" member. Empty omits it entirely,
+// which is what AWS's STS issuers do on their RSA key.
+func withJWKAlg(alg string) oidcOpt {
+	return func(c *oidcConfig) { c.alg = alg }
+}
+
+// withJWKUse sets the published JWK's "use" member. Empty omits it entirely.
+func withJWKUse(use string) oidcOpt {
+	return func(c *oidcConfig) { c.use = use }
+}
+
+// withSigningMethod changes the algorithm the returned [jwtFunc] signs with,
+// and the "alg" it puts in the token header. Callers must pass a key of a type
+// the method can sign with.
+func withSigningMethod(m jwt.SigningMethod) oidcOpt {
+	return func(c *oidcConfig) { c.method = m }
+}
+
+// withExtraJWK publishes an additional key alongside the primary one, for
+// reproducing issuers that serve a mix of usable and unusable keys.
+func withExtraJWK(k jose.JSONWebKey) oidcOpt {
+	return func(c *oidcConfig) { c.extraKeys = append(c.extraKeys, k) }
+}
 
 // startOIDCServer starts a mock OIDC server that gocached can use for JWT auth.
 // The provided publicKey is what JWT signatures will be validated against.
-func startOIDCServer(t *testing.T, publicKey crypto.PublicKey) (iss string, jwtFunc jwtFunc) {
+func startOIDCServer(t *testing.T, publicKey crypto.PublicKey, opts ...oidcOpt) (iss string, jwtFunc jwtFunc) {
 	t.Helper()
+	cfg := oidcConfig{
+		alg:    "ES256",
+		use:    "sig",
+		method: jwt.SigningMethodES256,
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -337,28 +382,29 @@ func startOIDCServer(t *testing.T, publicKey crypto.PublicKey) (iss string, jwtF
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"keys": []jose.JSONWebKey{
-				{
-					Key:       publicKey,
-					KeyID:     "test-key",
-					Algorithm: "ES256",
-					Use:       "sig",
-				},
+		keys := []jose.JSONWebKey{
+			{
+				Key:       publicKey,
+				KeyID:     "test-key",
+				Algorithm: cfg.alg,
+				Use:       cfg.use,
 			},
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"keys": append(keys, cfg.extraKeys...),
 		})
 	})
 
-	return issuer, func(claims jwt.MapClaims, signingKey *ecdsa.PrivateKey) string {
+	return issuer, func(claims jwt.MapClaims, signingKey any) string {
 		t.Helper()
 		unsignedTk := &jwt.Token{
 			Header: map[string]any{
 				"typ": "JWT",
-				"alg": jwt.SigningMethodES256.Alg(),
+				"alg": cfg.method.Alg(),
 				"kid": "test-key",
 			},
 			Claims: claims,
-			Method: jwt.SigningMethodES256,
+			Method: cfg.method,
 		}
 		tk, err := unsignedTk.SignedString(signingKey)
 		if err != nil {
@@ -1398,6 +1444,101 @@ func TestExchangeToken(t *testing.T) {
 			}
 			if stats.Puts == 0 {
 				t.Errorf("expected non-zero puts in session stats")
+			}
+		})
+	}
+}
+
+// Test an issuer that looks like AWS's STS issuers, which omit the optional
+// "alg" member (RFC 7517 4.4) on their RSA signing key and also publish an
+// ES384 EC key.
+func TestExchangeTokenAWSShapedJWKS(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating RSA key: %v", err)
+	}
+	ecKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating P-384 key: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		publicKey  crypto.PublicKey
+		signingKey any
+		opts       []oidcOpt
+	}{
+		// The key AWS actually signs identity tokens with.
+		"rsa_without_alg": {
+			publicKey:  rsaKey.Public(),
+			signingKey: rsaKey,
+			opts: []oidcOpt{
+				withJWKAlg(""),
+				withSigningMethod(jwt.SigningMethodRS256),
+				withExtraJWK(jose.JSONWebKey{
+					Key:       ecKey.Public(),
+					KeyID:     "EC384_0",
+					Algorithm: "ES384",
+					Use:       "sig",
+				}),
+			},
+		},
+		"es384": {
+			publicKey:  ecKey.Public(),
+			signingKey: ecKey,
+			opts: []oidcOpt{
+				withJWKAlg("ES384"),
+				withSigningMethod(jwt.SigningMethodES384),
+			},
+		},
+		// "use" is optional too, so its absence mustn't disqualify a key.
+		"without_use": {
+			publicKey:  testKey1.Public(),
+			signingKey: testKey1,
+			opts: []oidcOpt{
+				withJWKUse(""),
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			issuer, createJWT := startOIDCServer(t, tc.publicKey, tc.opts...)
+			st := newServerTester(t,
+				WithJWTAuth(issuer),
+				WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+					return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
+				}),
+			)
+
+			resp, accessToken := exchangeToken(t, st.hs.URL, createJWT(baseClaims(issuer, "user123"), tc.signingKey))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("got status %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+			if accessToken == "" {
+				t.Error("expected an access token")
+			}
+		})
+	}
+}
+
+func TestJWKSNoUsableSigningKeys(t *testing.T) {
+	for name, opts := range map[string][]oidcOpt{
+		"unsupported_alg": {withJWKAlg("PS512")},
+		"encryption_key":  {withJWKUse("enc")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			issuer, _ := startOIDCServer(t, testKey1.Public(), opts...)
+			_, err := NewServer(
+				WithDir(t.TempDir()),
+				WithLogf(t.Logf),
+				WithJWTAuth(issuer),
+				WithNamespaceMapping(func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) {
+					return &NamespaceGrant{WriteNamespace: new(GlobalNamespace)}, nil
+				}),
+			)
+			if err == nil {
+				t.Fatal("NewServer succeeded with an issuer that has no usable signing keys, want error")
+			}
+			if !strings.Contains(err.Error(), "no usable signing keys") {
+				t.Errorf("error = %v, want it to mention no usable signing keys", err)
 			}
 		})
 	}

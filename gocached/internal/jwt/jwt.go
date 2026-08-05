@@ -24,8 +24,10 @@ import (
 const oidcConfigWellKnownPath string = "/.well-known/openid-configuration"
 
 var (
-	// Required + recommended algorithms from https://datatracker.ietf.org/doc/html/rfc7518#section-3.1
-	supportedAlgorithms = []string{"HS256", "RS256", "ES256"}
+	// Required + recommended algorithms from
+	// https://datatracker.ietf.org/doc/html/rfc7518#section-3.1, plus ES384
+	// because that's AWS's only alternative to RS256.
+	supportedAlgorithms = []string{"HS256", "RS256", "ES256", "ES384"}
 )
 
 // issuer holds the per-issuer state: its own JWT parser and signing keys.
@@ -46,7 +48,7 @@ func (ie *issuer) keyFunc(t *jwt.Token) (any, error) {
 		return nil, fmt.Errorf("no kid found in token header")
 	}
 
-	signingKeys := ie.signingKeys.Load().([]jose.JSONWebKey)
+	signingKeys, _ := ie.signingKeys.Load().([]jose.JSONWebKey)
 	for _, k := range signingKeys {
 		if k.KeyID == kid {
 			return k.Key, nil
@@ -198,13 +200,23 @@ func (ie *issuer) updateJWKS(ctx context.Context, logf logger.Logf) error {
 
 	var signingKeys []jose.JSONWebKey
 	for _, k := range keySet.Keys {
-		if k.Use != "sig" {
+		// "use" is optional, but unlike "alg" it has no bearing on whether we can
+		// verify with the key, so only exclude keys that declare a non-signing use.
+		if k.Use != "" && k.Use != "sig" {
 			continue
 		}
-		if !slices.Contains(supportedAlgorithms, k.Algorithm) {
+		// "alg" is optional (RFC 7517 4.4) and AWS's STS issuers omit it on their
+		// RSA key. Algorithm confusion is prevented by [jwt.WithValidMethods]
+		// constraining the token header at parse time regardless.
+		if k.Algorithm != "" && !slices.Contains(supportedAlgorithms, k.Algorithm) {
 			continue
 		}
 		signingKeys = append(signingKeys, k)
+	}
+
+	// Fail loudly if an issuer was specified but we got no usable keys.
+	if len(signingKeys) == 0 {
+		return fmt.Errorf("no usable signing keys in JWKS from %q: none of the %d key(s) offered both use=sig and a supported algorithm %v", config.JSONWebKeySetURI, len(keySet.Keys), supportedAlgorithms)
 	}
 
 	ie.signingKeys.Store(signingKeys)
