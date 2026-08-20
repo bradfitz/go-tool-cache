@@ -1553,6 +1553,7 @@ func TestExchangeTokenNamespaceValidation(t *testing.T) {
 		"structured_sub": {"repo:octo-org/octo-repo:environment:prod", http.StatusOK},
 		"auth0_sub":      {"auth0|507f1f77bcf86cd799439020", http.StatusOK},
 		"email":          {"alice+ci@example.com", http.StatusOK},
+		"dependabot":     {"dependabot[bot]", http.StatusOK},
 		"space":          {"has space", http.StatusUnauthorized},
 		"non_ascii":      {"héllo", http.StatusUnauthorized},
 		"control_char":   {"bad\tns", http.StatusUnauthorized},

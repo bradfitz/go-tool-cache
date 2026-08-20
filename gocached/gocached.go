@@ -2073,9 +2073,8 @@ func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := validateNamespace(*ns); err != nil {
 			srv.m.AuthErrs.Add(1)
-			if srv.verbose {
-				srv.logf("token exchange: invalid namespace from claims: %v", err)
-			}
+			// This is a bug in the namespace mapping function, so always log errors.
+			srv.logf("token exchange: invalid namespace from claims: %v", err)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -2129,10 +2128,10 @@ func (srv *Server) handleTokenExchange(w http.ResponseWriter, r *http.Request) {
 // namespaceAllowedBytes is the set of non-alphanumeric bytes permitted in a
 // namespace. It is chosen to cover characters common in JWT identity claims:
 // issuer URLs, emails, and provider-structured "sub" values such as
-// "repo:org/repo:environment:prod" and "auth0|abc123". It is deliberately
-// ASCII-only so SQLite BINARY comparison matches Go string equality byte for
-// byte, avoiding Unicode normalization divergence.
-const namespaceAllowedBytes = "._~:/@+|=-"
+// "repo:org/repo:environment:prod", "auth0|abc123", and dependabot[bot]. It is
+// deliberately ASCII-only so SQLite BINARY comparison matches Go string equality
+// byte for byte, avoiding Unicode normalization divergence.
+const namespaceAllowedBytes = "._~:/@+|=-[]"
 
 func validateNamespace(ns Namespace) error {
 	if ns == GlobalNamespace {
