@@ -439,6 +439,20 @@ func (srv *Server) start() error {
 		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error; and type: put (success), dup, or error",
 		Buckets: reqLatencyBuckets,
 	}, []string{"storage", "type"})
+	// Copies into the main blob directory and metadata flushes are
+	// background work against possibly remote storage; buckets span 1ms
+	// to about a minute.
+	pipelineBuckets := prometheus.ExponentialBuckets(0.001, 2, 16)
+	srv.putCopyDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gocached_put_queue_copy_duration_seconds",
+		Help:    "wall time of each attempt to write a spooled blob's cleanup intent and copy it into the main blob directory, labeled by result: ok or error",
+		Buckets: pipelineBuckets,
+	}, []string{"result"})
+	srv.putFlushDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gocached_put_queue_flush_duration_seconds",
+		Help:    "wall time of each put-queue metadata batch transaction, including waiting for the SQLite write lock; divide by gocached_put_queue_flushed_items per flush to see whether SQLite commit throughput is what bounds the flusher",
+		Buckets: pipelineBuckets,
+	})
 	blobSizeBuckets := []float64{1}
 	for i := 6; i <= 30; i += 2 {
 		bucket := 1 << i
@@ -490,7 +504,8 @@ func (srv *Server) start() error {
 		collectors.NewBuildInfoCollector(),
 	)
 	srv.registerMetrics(reg)
-	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize)
+	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize,
+		srv.putCopyDuration, srv.putFlushDuration)
 
 	// Per-scrape gauges for shard stats loop health. GaugeFunc recomputes on
 	// every Prometheus scrape, so the values stay fresh between scans
@@ -566,6 +581,22 @@ func (srv *Server) start() error {
 			return float64(b)
 		},
 	))
+	// The cap and the stage backlogs are exported so dashboards and alerts
+	// can show utilization and locate the bottleneck without knowing the
+	// server's constants.
+	for _, g := range []struct {
+		name, help string
+		fn         func() float64
+	}{
+		{"gocached_put_queue_pending_cap", "capacity of the put queue in pending PUTs; compare with gocached_put_queue_pending",
+			func() float64 { return putQueuePendingCountCap }},
+		{"gocached_put_queue_mover_backlog", "spooled blobs waiting for a mover to start copying them into the main blob directory; nonzero while the movers are the constraint",
+			func() float64 { return float64(len(srv.putq.moverCh)) }},
+		{"gocached_put_queue_flush_backlog", "settled PUTs waiting for the metadata flusher; nonzero while SQLite commits are the constraint",
+			func() float64 { return float64(len(srv.putq.flushCh)) }},
+	} {
+		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: g.name, Help: g.help}, g.fn))
+	}
 
 	if srv.hot != nil {
 		reg.MustRegister(prometheus.NewGaugeFunc(
@@ -1034,6 +1065,13 @@ type Server struct {
 	getDuration *prometheus.HistogramVec
 	putDuration *prometheus.HistogramVec
 	blobSize    *prometheus.HistogramVec
+
+	// putCopyDuration and putFlushDuration observe the put queue's two
+	// background stages: copying a spooled blob into the main blob
+	// directory (labeled by result, ok or error) and committing a metadata
+	// batch to SQLite. They are nil in tests that build a bare Server.
+	putCopyDuration  *prometheus.HistogramVec
+	putFlushDuration prometheus.Histogram
 
 	// Metrics. Exported fields for reflection, but within a private struct
 	// field to control the gocached Server API surface.
