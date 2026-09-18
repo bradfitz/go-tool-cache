@@ -26,6 +26,7 @@ var (
 	sqliteDir   = flag.String("sqlite-dir", "", "directory for the SQLite metadata database; if empty, defaults to the cache directory")
 	hotDir      = flag.String("hot-dir", "", "if non-empty, enable storage tiering with this directory as a fast tier (e.g. local NVMe) holding a bounded copy of recently used blobs; the cache directory remains the source of truth")
 	hotCapacity = flag.Int("hot-capacity-gb", 600, "maximum size of the hot tier directory in GiB; only used with --hot-dir")
+	putSpoolCap = flag.Int("put-spool-gb", 0, "capacity in GiB of the put queue's spooled lane: accepted PUT bytes waiting on local disk (the hot tier's filesystem, with --hot-dir) for a copy into the cache directory; 0 means one eighth of that filesystem's size")
 	verbose     = flag.Bool("verbose", false, "be verbose")
 	listen      = flag.String("listen", ":31364", "listen address for the build-facing HTTP server")
 	debugListen = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
@@ -87,6 +88,9 @@ func main() {
 			gocached.WithHotDir(*hotDir),
 			gocached.WithHotCapacity(int64(*hotCapacity)<<30),
 		)
+	}
+	if *putSpoolCap > 0 {
+		opts = append(opts, gocached.WithPutSpoolCapacity(int64(*putSpoolCap)<<30))
 	}
 
 	if *jwtIssuer != "" {
