@@ -574,14 +574,14 @@ func (srv *Server) start() error {
 	reg.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "gocached_put_queue_pending_bytes",
-			Help: "sum of the reserved sizes of pending PUTs; bounds spool disk usage and reflects backpressure toward its cap",
+			Help: "sum of the reserved sizes of pending spooled PUTs; bounds spool disk usage and reflects backpressure toward its cap",
 		},
 		func() float64 {
 			_, b := srv.putq.pendingStats()
 			return float64(b)
 		},
 	))
-	// The cap and the stage backlogs are exported so dashboards and alerts
+	// The caps and the stage backlogs are exported so dashboards and alerts
 	// can show utilization and locate the bottleneck without knowing the
 	// server's constants.
 	for _, g := range []struct {
@@ -590,6 +590,10 @@ func (srv *Server) start() error {
 	}{
 		{"gocached_put_queue_pending_cap", "capacity of the put queue in pending PUTs; compare with gocached_put_queue_pending",
 			func() float64 { return putQueuePendingCountCap }},
+		{"gocached_put_queue_pending_inline", "subset of gocached_put_queue_pending that are inline (small) PUTs in the inline lane, which waits only on the metadata flusher and never on the movers",
+			func() float64 { return float64(srv.putq.pendingInline()) }},
+		{"gocached_put_queue_pending_inline_cap", "capacity of the inline lane in pending PUTs; compare with gocached_put_queue_pending_inline",
+			func() float64 { return putQueuePendingInlineCap }},
 		{"gocached_put_queue_mover_backlog", "spooled blobs waiting for a mover to start copying them into the main blob directory; nonzero while the movers are the constraint",
 			func() float64 { return float64(len(srv.putq.moverCh)) }},
 		{"gocached_put_queue_flush_backlog", "settled PUTs waiting for the metadata flusher; nonzero while SQLite commits are the constraint",
@@ -1110,13 +1114,16 @@ type Server struct {
 		HotEvicted       expvar.Int `type:"counter" name:"hot_evicted" help:"files evicted from the hot tier to stay under its capacity"`
 		HotEvictedBytes  expvar.Int `type:"counter" name:"hot_evicted_bytes" help:"bytes reclaimed by evicting files from the hot tier"`
 
-		PutQueueBlocked      expvar.Int `type:"counter" name:"put_queue_blocked" help:"PUT requests that had to wait for put-queue backpressure before being admitted"`
-		PutQueueCopyErrs     expvar.Int `type:"counter" name:"put_queue_copy_errs" help:"failed attempts to copy a spooled blob into the main blob directory; retried before the PUT is dropped"`
-		PutQueueDropped      expvar.Int `type:"counter" name:"put_queue_dropped" help:"pending PUTs abandoned after repeated copy or flush failures; the client saw success but the object was lost"`
-		PutQueueFlushes      expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
-		PutQueueFlushedItems expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`
-		PutQueueFlushDups    expvar.Int `type:"counter" name:"put_queue_flush_dups" help:"subset of put_queue_flushed_items that were duplicates of an already-stored action"`
-		PutQueueOrphansSwept expvar.Int `type:"counter" name:"put_queue_orphans_swept" help:"blobs deleted from the main blob directory by the cleanup sweeper because a crashed or dropped PUT left them without SQLite accounting"`
+		PutQueueBlocked           expvar.Int `type:"counter" name:"put_queue_blocked" help:"PUT requests that had to wait for put-queue backpressure before being admitted; see the per-lane put_queue_blocked_* counters for which cap bound"`
+		PutQueueBlockedInline     expvar.Int `type:"counter" name:"put_queue_blocked_inline" help:"PUT requests that waited on the inline lane's count cap; the lane drains only through the metadata flusher, so this growing means SQLite commit throughput is the constraint"`
+		PutQueueBlockedSpoolBytes expvar.Int `type:"counter" name:"put_queue_blocked_spool_bytes" help:"PUT requests that waited on the spooled lane's byte cap; raise the spool capacity if the disk has room, or look at the movers if pending never drains"`
+		PutQueueBlockedSpoolCount expvar.Int `type:"counter" name:"put_queue_blocked_spool_count" help:"PUT requests that waited on the spooled lane's count cap; many small blobs are piling up faster than the movers copy them"`
+		PutQueueCopyErrs          expvar.Int `type:"counter" name:"put_queue_copy_errs" help:"failed attempts to copy a spooled blob into the main blob directory; retried before the PUT is dropped"`
+		PutQueueDropped           expvar.Int `type:"counter" name:"put_queue_dropped" help:"pending PUTs abandoned after repeated copy or flush failures; the client saw success but the object was lost"`
+		PutQueueFlushes           expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
+		PutQueueFlushedItems      expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`
+		PutQueueFlushDups         expvar.Int `type:"counter" name:"put_queue_flush_dups" help:"subset of put_queue_flushed_items that were duplicates of an already-stored action"`
+		PutQueueOrphansSwept      expvar.Int `type:"counter" name:"put_queue_orphans_swept" help:"blobs deleted from the main blob directory by the cleanup sweeper because a crashed or dropped PUT left them without SQLite accounting"`
 	}
 }
 
@@ -2040,7 +2047,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		createTime:       s.now().Unix(),
 		smallData:        smallData,
 		queueFile:        queueFile,
-		reservedBytes:    reserved,
+		reservation:      reserved,
 	}
 
 	if s.putq.enqueue(p) {
