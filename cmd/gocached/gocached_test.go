@@ -57,3 +57,31 @@ func TestInvalidJWTClaimFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestParsePutMovers(t *testing.T) {
+	for _, tc := range []struct {
+		in       string
+		min, max int
+		wantErr  bool
+	}{
+		{in: "8,256", min: 8, max: 256},
+		{in: "32", min: 32, max: 32},
+		{in: " 4 , 4 ", min: 4, max: 4},
+		{in: "0", wantErr: true},
+		{in: "0,8", wantErr: true},
+		{in: "16,8", wantErr: true},
+		{in: "8,", wantErr: true},
+		{in: "", wantErr: true},
+		{in: "x", wantErr: true},
+		{in: "8,16,32", wantErr: true},
+	} {
+		lo, hi, err := parsePutMovers(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parsePutMovers(%q) err = %v, wantErr %v", tc.in, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr && (lo != tc.min || hi != tc.max) {
+			t.Errorf("parsePutMovers(%q) = %d,%d; want %d,%d", tc.in, lo, hi, tc.min, tc.max)
+		}
+	}
+}
