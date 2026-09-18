@@ -53,22 +53,33 @@ const (
 )
 
 const (
-	// putQueuePendingBytesCap bounds the total declared size of pending
-	// PUTs, which in turn bounds the spool directory's disk usage and the
-	// backlog of blobs awaiting a copy into the main blob directory. It
-	// bounds disk, not memory (the count cap bounds memory), so it can be
-	// generous: individual PUTs run to hundreds of MB and each holds its
-	// reservation for its whole pending window (spool, copy, batch flush;
-	// or a few minutes of TCP keepalive if the client dies mid-body), so
-	// a cap near a single PUT's size would serialize the big ones. The
-	// spool must still fit on the hot tier's disk alongside the hot
-	// capacity when tiering is enabled.
-	putQueuePendingBytesCap = 16 << 30
+	// The spooled lane's byte cap bounds the total declared size of pending
+	// spooled PUTs, which in turn bounds the spool directory's disk usage
+	// and the backlog of blobs awaiting a copy into the main blob directory.
+	// It is a property of the host (the spool shares a disk with the hot
+	// tier when tiering is enabled), so it is configured per server with
+	// [WithPutSpoolCapacity] and otherwise defaults to the spool
+	// filesystem's size divided by putSpoolCapDivisor, or
+	// defaultPutSpoolCap where the filesystem size can't be read. Spooled
+	// bytes are lz4-compressed, so actual disk usage runs under the cap.
+	//
+	// If gocached_put_queue_blocked_spool_bytes grows while
+	// gocached_put_queue_pending_bytes sits at its cap and the disk has
+	// room, raise it; the cap only delays backpressure, so if pending never
+	// drains between bursts the movers are the constraint instead.
+	putSpoolCapDivisor = 8
+	defaultPutSpoolCap = 16 << 30
 
-	// putQueuePendingCountCap bounds the number of pending spooled PUTs
-	// (those bigger than smallObjectSize), which in turn bounds the memory
-	// held by their pending map entries and the worker channel buffers.
-	putQueuePendingCountCap = 8192
+	// putQueueSpooledMemBudget bounds the memory held by pending spooled
+	// PUTs (those bigger than smallObjectSize). A spooled entry holds no
+	// blob bytes in memory, only its pendingPut (a few short strings and
+	// paths), its map slot, and a slot in each worker channel buffer;
+	// putQueueSpooledEntryMem is that per-entry allowance. The resulting
+	// count cap is the spooled lane's second constraint, binding when many
+	// small blobs pile up faster than the movers copy them.
+	putQueueSpooledMemBudget = 32 << 20
+	putQueueSpooledEntryMem  = 512
+	putQueuePendingCountCap  = putQueueSpooledMemBudget / putQueueSpooledEntryMem
 
 	// putQueueInlineMemBudget bounds the memory held by pending inline PUTs
 	// (those of at most smallObjectSize bytes, including empty ones), each
@@ -156,6 +167,7 @@ type putQueue struct {
 	// separate lane for PUTs of at most smallObjectSize, so they are never
 	// stuck behind spooled blobs waiting for the movers. Blocked
 	// reservations abort when the HTTP request context is canceled.
+	spoolCap  int64 // byte capacity of the spooled lane; see putSpoolCapDivisor
 	bytesSem  *semaphore.Weighted
 	countSem  *semaphore.Weighted
 	inlineSem *semaphore.Weighted
@@ -181,11 +193,19 @@ type putQueue struct {
 }
 
 func newPutQueue(srv *Server, dir string) *putQueue {
+	spoolCap := srv.putSpoolCap
+	if spoolCap <= 0 {
+		spoolCap = defaultPutSpoolCap
+		if total, err := fsTotalBytes(dir); err == nil && total > 0 {
+			spoolCap = total / putSpoolCapDivisor
+		}
+	}
 	return &putQueue{
 		srv:         srv,
 		dir:         dir,
 		cleanupDir:  filepath.Join(srv.dir, cleanupDirName),
-		bytesSem:    semaphore.NewWeighted(putQueuePendingBytesCap),
+		spoolCap:    spoolCap,
+		bytesSem:    semaphore.NewWeighted(spoolCap),
 		countSem:    semaphore.NewWeighted(putQueuePendingCountCap),
 		inlineSem:   semaphore.NewWeighted(putQueuePendingInlineCap),
 		pending:     make(map[actionKey]*pendingPut),
@@ -227,7 +247,7 @@ func (q *putQueue) reserve(ctx context.Context, contentLength int64) (putReserva
 		}
 		return putReservation{inline: true}, nil
 	}
-	reserved := min(contentLength, putQueuePendingBytesCap)
+	reserved := min(contentLength, q.spoolCap)
 	if !q.bytesSem.TryAcquire(reserved) {
 		q.srv.m.PutQueueBlocked.Add(1)
 		q.srv.m.PutQueueBlockedSpoolBytes.Add(1)

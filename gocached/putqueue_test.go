@@ -65,12 +65,12 @@ func TestPutQueueReserveBackpressure(t *testing.T) {
 	ctx := context.Background()
 
 	// Fill the byte budget entirely.
-	r1, err := q.reserve(ctx, putQueuePendingBytesCap)
+	r1, err := q.reserve(ctx, q.spoolCap)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r1.bytes != putQueuePendingBytesCap || r1.inline {
-		t.Fatalf("reserved = %+v, want %d spooled bytes", r1, putQueuePendingBytesCap)
+	if r1.bytes != q.spoolCap || r1.inline {
+		t.Fatalf("reserved = %+v, want %d spooled bytes", r1, q.spoolCap)
 	}
 
 	// A blocked reservation aborts when its context is canceled (e.g. the
@@ -106,12 +106,12 @@ func TestPutQueueReserveBackpressure(t *testing.T) {
 	q.unreserve(r2)
 
 	// A single blob bigger than the whole budget is clamped and admitted.
-	big, err := q.reserve(ctx, putQueuePendingBytesCap*3)
+	big, err := q.reserve(ctx, q.spoolCap*3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if big.bytes != putQueuePendingBytesCap {
-		t.Fatalf("oversized reservation = %+v, want clamp to %d", big, putQueuePendingBytesCap)
+	if big.bytes != q.spoolCap {
+		t.Fatalf("oversized reservation = %+v, want clamp to %d", big, q.spoolCap)
 	}
 	q.unreserve(big)
 }
@@ -195,7 +195,7 @@ func TestPutQueueReserveInlineLane(t *testing.T) {
 	cancel()
 
 	// Exhaust the spooled lane's byte budget with one big blob.
-	big, err := q.reserve(ctx, putQueuePendingBytesCap)
+	big, err := q.reserve(ctx, q.spoolCap)
 	if err != nil {
 		t.Fatal(err)
 	}

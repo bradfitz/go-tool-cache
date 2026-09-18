@@ -588,8 +588,10 @@ func (srv *Server) start() error {
 		name, help string
 		fn         func() float64
 	}{
-		{"gocached_put_queue_pending_cap", "capacity of the put queue in pending PUTs; compare with gocached_put_queue_pending",
+		{"gocached_put_queue_pending_cap", "capacity of the spooled lane in pending PUTs; compare with gocached_put_queue_pending minus gocached_put_queue_pending_inline",
 			func() float64 { return putQueuePendingCountCap }},
+		{"gocached_put_queue_pending_bytes_cap", "capacity of the spooled lane in reserved bytes; compare with gocached_put_queue_pending_bytes",
+			func() float64 { return float64(srv.putq.spoolCap) }},
 		{"gocached_put_queue_pending_inline", "subset of gocached_put_queue_pending that are inline (small) PUTs in the inline lane, which waits only on the metadata flusher and never on the movers",
 			func() float64 { return float64(srv.putq.pendingInline()) }},
 		{"gocached_put_queue_pending_inline_cap", "capacity of the inline lane in pending PUTs; compare with gocached_put_queue_pending_inline",
@@ -762,6 +764,19 @@ func WithHotDir(dir string) ServerOption {
 func WithHotCapacity(bytes int64) ServerOption {
 	return func(srv *Server) {
 		srv.hotCap = bytes
+	}
+}
+
+// WithPutSpoolCapacity sets the byte capacity of the put queue's spooled
+// lane: the total declared size of accepted PUTs whose blobs may be waiting
+// on local disk for a copy into the main blob directory. PUTs beyond it wait
+// (backpressure). The spool lives on the hot tier's filesystem when tiering
+// is enabled (see [WithHotDir]) and must fit there alongside the hot
+// capacity. Zero, the default, uses one eighth of the spool filesystem's
+// size, or 16 GiB if that can't be determined.
+func WithPutSpoolCapacity(bytes int64) ServerOption {
+	return func(srv *Server) {
+		srv.putSpoolCap = bytes
 	}
 }
 
@@ -974,6 +989,7 @@ type Server struct {
 	hotCap         int64  // maximum bytes in hotDir; must be positive if hotDir is set
 	hot            *hotIndex
 	putq           *putQueue
+	putSpoolCap    int64 // byte capacity of the put queue's spooled lane; 0 means derive from the spool filesystem
 	verbose        bool
 	logf           logger.Logf
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
