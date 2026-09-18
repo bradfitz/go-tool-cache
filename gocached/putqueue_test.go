@@ -32,7 +32,7 @@ func TestPutQueueInsertDup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p1 := &pendingPut{key: actionKey{ActionID: "aa11"}, sha256hex: "s1", reservedBytes: reserved}
+	p1 := &pendingPut{key: actionKey{ActionID: "aa11"}, sha256hex: "s1", reservation: reserved}
 	if dup := q.insert(p1); dup {
 		t.Fatal("first insert reported dup")
 	}
@@ -64,20 +64,21 @@ func TestPutQueueReserveBackpressure(t *testing.T) {
 	ctx := context.Background()
 
 	// Fill the byte budget entirely.
-	r1, err := q.reserve(ctx, putQueuePendingBytesCap)
+	r1, err := q.reserve(ctx, q.spoolCap)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r1 != putQueuePendingBytesCap {
-		t.Fatalf("reserved = %d, want %d", r1, putQueuePendingBytesCap)
+	if r1.bytes != q.spoolCap || r1.inline {
+		t.Fatalf("reserved = %+v, want %d spooled bytes", r1, q.spoolCap)
 	}
 
 	// A blocked reservation aborts when its context is canceled (e.g. the
 	// HTTP client goes away).
+	const spooled = smallObjectSize + 1
 	cctx, cancel := context.WithCancel(ctx)
 	errc := make(chan error, 1)
 	go func() {
-		_, err := q.reserve(cctx, 1)
+		_, err := q.reserve(cctx, spooled)
 		errc <- err
 	}()
 	select {
@@ -97,19 +98,19 @@ func TestPutQueueReserveBackpressure(t *testing.T) {
 
 	// Freed capacity admits new reservations.
 	q.unreserve(r1)
-	r2, err := q.reserve(ctx, 1)
+	r2, err := q.reserve(ctx, spooled)
 	if err != nil {
 		t.Fatal(err)
 	}
 	q.unreserve(r2)
 
 	// A single blob bigger than the whole budget is clamped and admitted.
-	big, err := q.reserve(ctx, putQueuePendingBytesCap*3)
+	big, err := q.reserve(ctx, q.spoolCap*3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if big != putQueuePendingBytesCap {
-		t.Fatalf("oversized reservation = %d, want clamp to %d", big, putQueuePendingBytesCap)
+	if big.bytes != q.spoolCap {
+		t.Fatalf("oversized reservation = %+v, want clamp to %d", big, q.spoolCap)
 	}
 	q.unreserve(big)
 }
@@ -118,21 +119,76 @@ func TestPutQueueReserveCountCap(t *testing.T) {
 	q := newTestPutQueue(t)
 	ctx := context.Background()
 
+	const spooled = smallObjectSize + 1
 	for range putQueuePendingCountCap {
-		if _, err := q.reserve(ctx, 0); err != nil {
+		if _, err := q.reserve(ctx, spooled); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := q.reserve(cctx, 0); !errors.Is(err, context.Canceled) {
+	if _, err := q.reserve(cctx, spooled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("reserve over count cap = %v, want context.Canceled", err)
 	}
 
-	q.unreserve(0)
-	if _, err := q.reserve(ctx, 0); err != nil {
+	q.unreserve(putReservation{bytes: spooled})
+	if _, err := q.reserve(ctx, spooled); err != nil {
 		t.Fatalf("reserve after freeing a slot: %v", err)
+	}
+}
+
+// TestPutQueueReserveInlineLane checks that small (inline) PUTs, including
+// zero-byte ones, are admitted through their own lane while the spooled
+// lane is completely full, and that the inline lane has its own cap.
+func TestPutQueueReserveInlineLane(t *testing.T) {
+	q := newTestPutQueue(t)
+	ctx := context.Background()
+
+	// reserve tries a non-blocking acquire before consulting ctx, so a
+	// pre-canceled context distinguishes "admitted immediately" (nil)
+	// from "would have blocked" (context.Canceled) without any waiting.
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	// Exhaust the spooled lane's byte budget with one big blob.
+	big, err := q.reserve(ctx, q.spoolCap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.reserve(canceled, smallObjectSize+1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("spooled reserve at capacity = %v, want context.Canceled", err)
+	}
+
+	// Inline PUTs, including empty ones, are still admitted immediately.
+	for _, size := range []int64{0, 1, smallObjectSize} {
+		r, err := q.reserve(canceled, size)
+		if err != nil {
+			t.Fatalf("inline reserve(%d) while spooled lane full = %v, want admitted", size, err)
+		}
+		if !r.inline || r.bytes != 0 {
+			t.Fatalf("inline reserve(%d) = %+v, want inline reservation", size, r)
+		}
+	}
+
+	// The inline lane has its own cap, independent of the spooled lane.
+	for range putQueuePendingInlineCap - 3 {
+		if _, err := q.reserve(canceled, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := q.reserve(canceled, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("inline reserve over inline cap = %v, want context.Canceled", err)
+	}
+	q.unreserve(putReservation{inline: true})
+	if _, err := q.reserve(canceled, 0); err != nil {
+		t.Fatalf("inline reserve after freeing a slot: %v", err)
+	}
+
+	// And freeing spooled room doesn't require touching the inline lane.
+	q.unreserve(big)
+	if _, err := q.reserve(canceled, smallObjectSize+1); err != nil {
+		t.Fatalf("spooled reserve after freeing bytes: %v", err)
 	}
 }
 
@@ -212,7 +268,7 @@ func makePending(t *testing.T, q *putQueue, ns int64, actionID string, content [
 		storedSize:       int64(len(content)),
 		uncompressedSize: int64(len(content)),
 		createTime:       q.srv.now().Unix(),
-		reservedBytes:    reserved,
+		reservation:      reserved,
 	}
 	if len(content) <= smallObjectSize {
 		p.smallData = content

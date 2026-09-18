@@ -52,22 +52,44 @@ const (
 )
 
 const (
-	// putQueuePendingBytesCap bounds the total declared size of pending
-	// PUTs, which in turn bounds the spool directory's disk usage and the
-	// backlog of blobs awaiting a copy into the main blob directory. It
-	// bounds disk, not memory (the count cap bounds memory), so it can be
-	// generous: individual PUTs run to hundreds of MB and each holds its
-	// reservation for its whole pending window (spool, copy, batch flush;
-	// or a few minutes of TCP keepalive if the client dies mid-body), so
-	// a cap near a single PUT's size would serialize the big ones. The
-	// spool must still fit on the hot tier's disk alongside the hot
-	// capacity when tiering is enabled.
-	putQueuePendingBytesCap = 16 << 30
+	// The spooled lane's byte cap bounds the total declared size of pending
+	// spooled PUTs, which in turn bounds the spool directory's disk usage
+	// and the backlog of blobs awaiting a copy into the main blob directory.
+	// It is a property of the host (the spool shares a disk with the hot
+	// tier when tiering is enabled), so it is configured per server with
+	// [WithPutSpoolCapacity] and otherwise defaults to the spool
+	// filesystem's size divided by putSpoolCapDivisor, or
+	// defaultPutSpoolCap where the filesystem size can't be read. Spooled
+	// bytes are lz4-compressed, so actual disk usage runs under the cap.
+	//
+	// If gocached_put_queue_blocked_spool_bytes grows while
+	// gocached_put_queue_pending_bytes sits at its cap and the disk has
+	// room, raise it; the cap only delays backpressure, so if pending never
+	// drains between bursts the movers are the constraint instead.
+	putSpoolCapDivisor = 8
+	defaultPutSpoolCap = 16 << 30
 
-	// putQueuePendingCountCap bounds the number of pending PUTs, which in
-	// turn bounds the memory held by the pending map (each entry retains at
-	// most smallObjectSize bytes of inline data).
-	putQueuePendingCountCap = 8192
+	// putQueueSpooledMemBudget bounds the memory held by pending spooled
+	// PUTs (those bigger than smallObjectSize). A spooled entry holds no
+	// blob bytes in memory, only its pendingPut (a few short strings and
+	// paths), its map slot, and a slot in each worker channel buffer;
+	// putQueueSpooledEntryMem is that per-entry allowance. The resulting
+	// count cap is the spooled lane's second constraint, binding when many
+	// small blobs pile up faster than the movers copy them.
+	putQueueSpooledMemBudget = 32 << 20
+	putQueueSpooledEntryMem  = 512
+	putQueuePendingCountCap  = putQueueSpooledMemBudget / putQueueSpooledEntryMem
+
+	// putQueueInlineMemBudget bounds the memory held by pending inline PUTs
+	// (those of at most smallObjectSize bytes, including empty ones), each
+	// of which retains up to smallObjectSize bytes of data. Inline PUTs
+	// have their own lane because they need no copy into the main blob
+	// directory, only a metadata flush, so they should never wait behind
+	// spooled blobs for the movers. The lane's only drain is the flusher,
+	// so if gocached_put_queue_blocked_inline ever grows, SQLite
+	// commit throughput is the constraint, not this budget.
+	putQueueInlineMemBudget  = 64 << 20
+	putQueuePendingInlineCap = putQueueInlineMemBudget / smallObjectSize
 
 	// putFlushInterval is how long the flusher waits after the first item
 	// of a batch before committing it, giving later PUTs a chance to share
@@ -79,11 +101,6 @@ const (
 	// one SQLite transaction; a full batch flushes without waiting for
 	// putFlushInterval.
 	putFlushBatchCap = 512
-
-	// numPutMovers is how many goroutines copy spooled blobs into the main
-	// blob directory. The main directory may be a high-latency network
-	// filesystem, so several copies proceed in parallel.
-	numPutMovers = 8
 
 	// putCopyRetries is how many times a mover attempts a blob's copy into
 	// the main blob directory before the pending PUT is dropped.
@@ -99,14 +116,23 @@ const (
 type pendingPut struct {
 	key              actionKey
 	sha256hex        string
-	storedSize       int64  // bytes stored: len(smallData) if inline, file size (possibly lz4) otherwise
-	uncompressedSize int64  // original uncompressed content size
-	altOutputID      string // the PUT's outputID, or "" if it equals sha256hex
-	createTime       int64  // unix seconds
-	smallData        []byte // non-nil iff the object is stored inline (<= smallObjectSize)
-	queueFile        string // path of the spool file holding the blob bytes; "" if inline
-	reservedBytes    int64  // semaphore weight to release when the entry retires
-	intentPath       string // path of the cleanup intent record; "" until a mover writes it
+	storedSize       int64          // bytes stored: len(smallData) if inline, file size (possibly lz4) otherwise
+	uncompressedSize int64          // original uncompressed content size
+	altOutputID      string         // the PUT's outputID, or "" if it equals sha256hex
+	createTime       int64          // unix seconds
+	smallData        []byte         // non-nil iff the object is stored inline (<= smallObjectSize)
+	queueFile        string         // path of the spool file holding the blob bytes; "" if inline
+	reservation      putReservation // queue room to release when the entry retires
+	intentPath       string         // path of the cleanup intent record; "" until a mover writes it
+}
+
+// putReservation is the queue room held by one accepted PUT, returned by
+// [putQueue.reserve] and released by [putQueue.unreserve]. An inline
+// reservation holds one slot in the inline lane; a spooled one holds one
+// count slot and bytes of byte weight in the spooled lane.
+type putReservation struct {
+	inline bool
+	bytes  int64 // byte weight held in the spooled lane; 0 if inline
 }
 
 // blobName returns the base filename for p's blob in the main and hot blob
@@ -128,22 +154,39 @@ type putQueue struct {
 	dir        string // spool directory for blob bytes
 	cleanupDir string // cleanup intent directory under the main blob dir
 
-	// bytesSem and countSem implement backpressure: a PUT reserves its
-	// declared size (clamped to the cap) and one entry slot before spooling
-	// anything, and the reservation is released when the entry retires.
-	// Blocked reservations abort when the HTTP request context is canceled.
-	bytesSem *semaphore.Weighted
-	countSem *semaphore.Weighted
+	// bytesSem and countSem implement backpressure for the spooled lane: a
+	// PUT bigger than smallObjectSize reserves its declared size (clamped
+	// to the cap) and one entry slot before spooling anything, and the
+	// reservation is released when the entry retires. inlineSem is the
+	// separate lane for PUTs of at most smallObjectSize, so they are never
+	// stuck behind spooled blobs waiting for the movers. Blocked
+	// reservations abort when the HTTP request context is canceled.
+	spoolCap  int64 // byte capacity of the spooled lane; see putSpoolCapDivisor
+	bytesSem  *semaphore.Weighted
+	countSem  *semaphore.Weighted
+	inlineSem *semaphore.Weighted
+
+	// gov sets how many spooled-blob copies into the main blob directory
+	// run concurrently, adapting to the directory's observed latency.
+	gov *moverGovernor
 
 	// mu is a leaf mutex: no other lock is acquired while holding it.
 	mu      sync.Mutex
 	pending map[actionKey]*pendingPut
-	bytes   int64 // sum of reservedBytes over pending
+	inline  int   // number of pending entries holding an inline reservation
+	bytes   int64 // sum of reservation.bytes over pending
+
+	// mainDirsMu guards mainDirs, the set of two-hex-char shard
+	// subdirectories of the main blob directory known to exist, so the
+	// movers pay the MkdirAll round trip to the (possibly remote) main
+	// directory once per shard rather than once per blob.
+	mainDirsMu sync.Mutex
+	mainDirs   map[string]bool
 
 	// moverCh feeds spooled big blobs to the movers; flushCh feeds entries
 	// whose bytes are settled (inline, or copied to the main blob dir) to
-	// the metadata flusher. Both are buffered to putQueuePendingCountCap,
-	// which countSem guarantees is never exceeded, so sends don't block.
+	// the metadata flusher. Both are buffered to the number of entries the
+	// lane semaphores allow to be pending at once, so sends don't block.
 	moverCh chan *pendingPut
 	flushCh chan *pendingPut
 
@@ -155,15 +198,26 @@ type putQueue struct {
 }
 
 func newPutQueue(srv *Server, dir string) *putQueue {
+	spoolCap := srv.putSpoolCap
+	if spoolCap <= 0 {
+		spoolCap = defaultPutSpoolCap
+		if total, err := fsTotalBytes(dir); err == nil && total > 0 {
+			spoolCap = total / putSpoolCapDivisor
+		}
+	}
 	return &putQueue{
 		srv:         srv,
 		dir:         dir,
 		cleanupDir:  filepath.Join(srv.dir, cleanupDirName),
-		bytesSem:    semaphore.NewWeighted(putQueuePendingBytesCap),
+		spoolCap:    spoolCap,
+		bytesSem:    semaphore.NewWeighted(spoolCap),
 		countSem:    semaphore.NewWeighted(putQueuePendingCountCap),
+		inlineSem:   semaphore.NewWeighted(putQueuePendingInlineCap),
+		gov:         newMoverGovernor(srv.putMoversMin, srv.putMoversMax),
 		pending:     make(map[actionKey]*pendingPut),
+		mainDirs:    make(map[string]bool),
 		moverCh:     make(chan *pendingPut, putQueuePendingCountCap),
-		flushCh:     make(chan *pendingPut, putQueuePendingCountCap),
+		flushCh:     make(chan *pendingPut, putQueuePendingCountCap+putQueuePendingInlineCap),
 		intentDelCh: make(chan string, putQueuePendingCountCap),
 	}
 }
@@ -172,41 +226,66 @@ func newPutQueue(srv *Server, dir string) *putQueue {
 // cleanup intent sweeper. It is not called under disableBackgroundLoops;
 // tests drive the pipeline with [Server.drainPendingPuts] and
 // [putQueue.sweepCleanupIntents] instead.
+//
+// One mover goroutine is started per slot the governor could ever grant;
+// each takes a governor slot before copying, so the number of copies in
+// flight follows the governor's current limit, not the goroutine count.
 func (q *putQueue) start(ctx context.Context) {
-	for range numPutMovers {
+	for range q.gov.maxLimit {
 		go q.moverLoop(ctx)
 	}
+	go q.gov.run(ctx)
 	go q.flusherLoop(ctx)
 	go q.runCleanupSweepLoop(ctx)
 }
 
 // reserve blocks until the queue has room for a PUT of the given declared
-// content length, or ctx is done. It returns the reserved byte weight, which
-// the caller must eventually return via unreserve (typically by retiring the
-// pending entry). The weight is clamped to the total capacity so a single
-// blob bigger than the cap is still admitted (alone).
-func (q *putQueue) reserve(ctx context.Context, contentLength int64) (reserved int64, err error) {
-	reserved = min(contentLength, putQueuePendingBytesCap)
+// content length, or ctx is done. It returns the reservation, which the
+// caller must eventually return via unreserve (typically by retiring the
+// pending entry).
+//
+// PUTs of at most smallObjectSize take the inline lane, which has only a
+// count cap. Larger PUTs take the spooled lane, reserving one count slot and
+// their declared size as byte weight; the weight is clamped to the total
+// capacity so a single blob bigger than the cap is still admitted (alone).
+func (q *putQueue) reserve(ctx context.Context, contentLength int64) (putReservation, error) {
+	if contentLength <= smallObjectSize {
+		if !q.inlineSem.TryAcquire(1) {
+			q.srv.m.PutQueueBlocked.Add(1)
+			q.srv.m.PutQueueBlockedInline.Add(1)
+			if err := q.inlineSem.Acquire(ctx, 1); err != nil {
+				return putReservation{}, err
+			}
+		}
+		return putReservation{inline: true}, nil
+	}
+	reserved := min(contentLength, q.spoolCap)
 	if !q.bytesSem.TryAcquire(reserved) {
 		q.srv.m.PutQueueBlocked.Add(1)
+		q.srv.m.PutQueueBlockedSpoolBytes.Add(1)
 		if err := q.bytesSem.Acquire(ctx, reserved); err != nil {
-			return 0, err
+			return putReservation{}, err
 		}
 	}
 	if !q.countSem.TryAcquire(1) {
 		q.srv.m.PutQueueBlocked.Add(1)
+		q.srv.m.PutQueueBlockedSpoolCount.Add(1)
 		if err := q.countSem.Acquire(ctx, 1); err != nil {
 			q.bytesSem.Release(reserved)
-			return 0, err
+			return putReservation{}, err
 		}
 	}
-	return reserved, nil
+	return putReservation{bytes: reserved}, nil
 }
 
 // unreserve returns a reservation made by reserve.
-func (q *putQueue) unreserve(reserved int64) {
+func (q *putQueue) unreserve(r putReservation) {
+	if r.inline {
+		q.inlineSem.Release(1)
+		return
+	}
 	q.countSem.Release(1)
-	q.bytesSem.Release(reserved)
+	q.bytesSem.Release(r.bytes)
 }
 
 // insert adds p to the pending map. It reports whether an entry with p's key
@@ -219,7 +298,10 @@ func (q *putQueue) insert(p *pendingPut) (dup bool) {
 		return true
 	}
 	q.pending[p.key] = p
-	q.bytes += p.reservedBytes
+	q.bytes += p.reservation.bytes
+	if p.reservation.inline {
+		q.inline++
+	}
 	return false
 }
 
@@ -258,21 +340,31 @@ func (q *putQueue) retire(p *pendingPut) bool {
 	cur, ok := q.pending[p.key]
 	if ok = (ok && cur == p); ok {
 		delete(q.pending, p.key)
-		q.bytes -= p.reservedBytes
+		q.bytes -= p.reservation.bytes
+		if p.reservation.inline {
+			q.inline--
+		}
 	}
 	q.mu.Unlock()
 	if ok {
-		q.unreserve(p.reservedBytes)
+		q.unreserve(p.reservation)
 	}
 	return ok
 }
 
-// pendingStats returns the number of pending entries and the sum of their
-// reserved bytes.
+// pendingStats returns the number of pending entries (both lanes) and the
+// sum of the spooled lane's reserved bytes.
 func (q *putQueue) pendingStats() (count int, bytes int64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.pending), q.bytes
+}
+
+// pendingInline returns the number of pending entries in the inline lane.
+func (q *putQueue) pendingInline() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.inline
 }
 
 // drop abandons p after repeated failures: the client already saw success,
@@ -374,18 +466,44 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 			case <-time.After(time.Second << (try - 1)):
 			}
 		}
-		err := q.writeCleanupIntent(p)
-		if err == nil {
-			err = q.copyToMain(p)
-		}
+		err := q.copyUnderGovernor(ctx, p)
 		if err == nil {
 			q.flushCh <- p
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 		q.srv.logf("put-queue: copying blob %v to main dir: %v", p.sha256hex, err)
 		q.srv.m.PutQueueCopyErrs.Add(1)
 	}
 	q.drop(p)
+}
+
+// copyUnderGovernor performs one attempt at p's intent write and blob copy
+// into the main blob directory while holding a mover governor slot, and
+// reports the attempt's latency to the governor and metrics.
+func (q *putQueue) copyUnderGovernor(ctx context.Context, p *pendingPut) error {
+	if err := q.gov.acquire(ctx); err != nil {
+		return err
+	}
+	defer q.gov.release()
+	start := time.Now()
+	err := q.writeCleanupIntent(p)
+	if err == nil {
+		err = q.copyToMain(p)
+	}
+	d := time.Since(start)
+	result := "ok"
+	if err != nil {
+		result = "error"
+	} else {
+		q.gov.observe(p.storedSize, d)
+	}
+	if q.srv.putCopyDuration != nil {
+		q.srv.putCopyDuration.WithLabelValues(result).Observe(d.Seconds())
+	}
+	return err
 }
 
 // writeCleanupIntent creates p's cleanup intent record: a durable note that
@@ -495,7 +613,7 @@ func (q *putQueue) sweepCleanupIntents() error {
 }
 
 // pendingSHA reports whether any in-flight pending PUT references the given
-// blob SHA-256. The pending map is bounded by putQueuePendingCountCap and
+// blob SHA-256. The pending map is bounded by the lane caps and
 // this runs at most once per sweep interval per due intent, so the linear
 // scan is fine.
 func (q *putQueue) pendingSHA(sha string) bool {
@@ -538,7 +656,7 @@ func (q *putQueue) copyToMain(p *pendingPut) error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
+	if err := q.ensureMainDir(filepath.Dir(target)); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
@@ -546,6 +664,26 @@ func (q *putQueue) copyToMain(p *pendingPut) error {
 		os.Remove(tmpName)
 		return err
 	}
+	return nil
+}
+
+// ensureMainDir creates the main blob directory shard dir if this process
+// hasn't already seen it exist. Shard directories are never removed, so a
+// positive result stays valid and each of the 256 shards costs at most one
+// MkdirAll round trip to the (possibly remote) main directory.
+func (q *putQueue) ensureMainDir(dir string) error {
+	q.mainDirsMu.Lock()
+	known := q.mainDirs[dir]
+	q.mainDirsMu.Unlock()
+	if known {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
+	q.mainDirsMu.Lock()
+	q.mainDirs[dir] = true
+	q.mainDirsMu.Unlock()
 	return nil
 }
 
@@ -608,6 +746,13 @@ func (q *putQueue) flushBatch(batch []*pendingPut) error {
 	srv := q.srv
 	srv.sqliteWriteMu.Lock()
 	defer srv.sqliteWriteMu.Unlock()
+
+	if srv.putFlushDuration != nil {
+		start := time.Now()
+		defer func() {
+			srv.putFlushDuration.Observe(time.Since(start).Seconds())
+		}()
+	}
 
 	if srv.writeConn == nil {
 		var err error

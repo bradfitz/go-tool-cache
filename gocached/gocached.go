@@ -439,6 +439,20 @@ func (srv *Server) start() error {
 		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error; and type: put (success), dup, or error",
 		Buckets: reqLatencyBuckets,
 	}, []string{"storage", "type"})
+	// Copies into the main blob directory and metadata flushes are
+	// background work against possibly remote storage; buckets span 1ms
+	// to about a minute.
+	pipelineBuckets := prometheus.ExponentialBuckets(0.001, 2, 16)
+	srv.putCopyDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gocached_put_queue_copy_duration_seconds",
+		Help:    "wall time of each attempt to write a spooled blob's cleanup intent and copy it into the main blob directory, labeled by result: ok or error; small blobs' latency here drives the adaptive mover limit",
+		Buckets: pipelineBuckets,
+	}, []string{"result"})
+	srv.putFlushDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gocached_put_queue_flush_duration_seconds",
+		Help:    "wall time of each put-queue metadata batch transaction, including waiting for the SQLite write lock; divide by gocached_put_queue_flushed_items per flush to see whether SQLite commit throughput is what bounds the inline lane",
+		Buckets: pipelineBuckets,
+	})
 	blobSizeBuckets := []float64{1}
 	for i := 6; i <= 30; i += 2 {
 		bucket := 1 << i
@@ -490,7 +504,8 @@ func (srv *Server) start() error {
 		collectors.NewBuildInfoCollector(),
 	)
 	srv.registerMetrics(reg)
-	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize)
+	reg.MustRegister(srv.shardScanDuration, srv.getDuration, srv.putDuration, srv.blobSize,
+		srv.putCopyDuration, srv.putFlushDuration)
 
 	// Per-scrape gauges for shard stats loop health. GaugeFunc recomputes on
 	// every Prometheus scrape, so the values stay fresh between scans
@@ -559,13 +574,55 @@ func (srv *Server) start() error {
 	reg.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
 			Name: "gocached_put_queue_pending_bytes",
-			Help: "sum of the reserved sizes of pending PUTs; bounds spool disk usage and reflects backpressure toward its cap",
+			Help: "sum of the reserved sizes of pending spooled PUTs; bounds spool disk usage and reflects backpressure toward its cap",
 		},
 		func() float64 {
 			_, b := srv.putq.pendingStats()
 			return float64(b)
 		},
 	))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Name: "gocached_put_queue_pending_inline",
+			Help: "subset of gocached_put_queue_pending that are inline (small) PUTs in the inline lane, which waits only on the metadata flusher and never on the movers",
+		},
+		func() float64 {
+			return float64(srv.putq.pendingInline())
+		},
+	))
+	// The caps are exported so dashboards and alerts can show utilization
+	// as a ratio without knowing the server's configuration.
+	for _, g := range []struct {
+		name, help string
+		fn         func() float64
+	}{
+		{"gocached_put_queue_pending_cap", "capacity of the spooled lane in pending PUTs; compare with gocached_put_queue_pending minus gocached_put_queue_pending_inline",
+			func() float64 { return putQueuePendingCountCap }},
+		{"gocached_put_queue_pending_bytes_cap", "capacity of the spooled lane in reserved bytes; compare with gocached_put_queue_pending_bytes",
+			func() float64 { return float64(srv.putq.spoolCap) }},
+		{"gocached_put_queue_pending_inline_cap", "capacity of the inline lane in pending PUTs; compare with gocached_put_queue_pending_inline",
+			func() float64 { return putQueuePendingInlineCap }},
+		{"gocached_put_queue_mover_backlog", "spooled blobs not yet picked up by a mover goroutine, in addition to those a mover holds while waiting for a governor slot; nonzero while movers are the constraint",
+			func() float64 { return float64(len(srv.putq.moverCh)) }},
+		{"gocached_put_queue_flush_backlog", "settled PUTs waiting for the metadata flusher; nonzero while SQLite commits are the constraint",
+			func() float64 { return float64(len(srv.putq.flushCh)) }},
+		{"gocached_put_queue_movers_limit", "current adaptive limit on concurrent copies into the main blob directory; grows while small-copy latency stays near baseline under demand, shrinks when it climbs",
+			func() float64 { return float64(srv.putq.gov.stats().limit) }},
+		{"gocached_put_queue_movers_active", "copies into the main blob directory currently in flight; pinned at the limit with a nonzero mover backlog means the limit is what bounds the spooled lane",
+			func() float64 { return float64(srv.putq.gov.stats().active) }},
+		{"gocached_put_queue_movers_max", "configured upper bound on the adaptive mover limit; a limit sitting here under demand with baseline latency means the bound is too low",
+			func() float64 { return float64(srv.putq.gov.maxLimit) }},
+		{"gocached_put_queue_copy_latency_baseline_seconds", "the mover governor's estimate of the main blob directory's unloaded small-copy latency",
+			func() float64 { return srv.putq.gov.stats().baseline.Seconds() }},
+		{"gocached_put_queue_copy_latency_recent_seconds", "median small-copy latency in the mover governor's last evaluated interval; its ratio to the baseline drives the limit",
+			func() float64 { return srv.putq.gov.stats().lastMedian.Seconds() }},
+		{"gocached_put_queue_movers_increases", "times the mover governor raised the limit",
+			func() float64 { return float64(srv.putq.gov.stats().increases) }},
+		{"gocached_put_queue_movers_decreases", "times the mover governor lowered the limit; frequent decreases mean the main blob directory saturates at the current load",
+			func() float64 { return float64(srv.putq.gov.stats().decreases) }},
+	} {
+		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{Name: g.name, Help: g.help}, g.fn))
+	}
 
 	if srv.hot != nil {
 		reg.MustRegister(prometheus.NewGaugeFunc(
@@ -727,6 +784,32 @@ func WithHotDir(dir string) ServerOption {
 func WithHotCapacity(bytes int64) ServerOption {
 	return func(srv *Server) {
 		srv.hotCap = bytes
+	}
+}
+
+// WithPutSpoolCapacity sets the byte capacity of the put queue's spooled
+// lane: the total declared size of accepted PUTs whose blobs may be waiting
+// on local disk for a copy into the main blob directory. PUTs beyond it wait
+// (backpressure). The spool lives on the hot tier's filesystem when tiering
+// is enabled (see [WithHotDir]) and must fit there alongside the hot
+// capacity. Zero, the default, uses one eighth of the spool filesystem's
+// size, or 16 GiB if that can't be determined.
+func WithPutSpoolCapacity(bytes int64) ServerOption {
+	return func(srv *Server) {
+		srv.putSpoolCap = bytes
+	}
+}
+
+// WithPutMoverLimits bounds the adaptive number of concurrent copies of
+// spooled blobs into the main blob directory. The server starts at minLimit
+// and raises the limit while the latency of small copies stays near its
+// unloaded baseline and copies are waiting for a slot, backing off when
+// latency climbs; maxLimit caps it. Zero for either uses the default (8 and
+// 256). See gocached_put_queue_movers_* metrics for the observed behavior.
+func WithPutMoverLimits(minLimit, maxLimit int) ServerOption {
+	return func(srv *Server) {
+		srv.putMoversMin = minLimit
+		srv.putMoversMax = maxLimit
 	}
 }
 
@@ -939,6 +1022,9 @@ type Server struct {
 	hotCap         int64  // maximum bytes in hotDir; must be positive if hotDir is set
 	hot            *hotIndex
 	putq           *putQueue
+	putSpoolCap    int64 // byte capacity of the put queue's spooled lane; 0 means derive from the spool filesystem
+	putMoversMin   int   // floor and starting point of the adaptive mover limit; 0 means default
+	putMoversMax   int   // ceiling of the adaptive mover limit; 0 means default
 	verbose        bool
 	logf           logger.Logf
 	clock          func() time.Time // if non-nil, alternate time.Now for testing
@@ -1035,6 +1121,13 @@ type Server struct {
 	putDuration *prometheus.HistogramVec
 	blobSize    *prometheus.HistogramVec
 
+	// putCopyDuration and putFlushDuration observe the put queue's two
+	// background stages: copying a spooled blob into the main blob
+	// directory (labeled by result, ok or error) and committing a metadata
+	// batch to SQLite. They are nil in tests that build a bare Server.
+	putCopyDuration  *prometheus.HistogramVec
+	putFlushDuration prometheus.Histogram
+
 	// Metrics. Exported fields for reflection, but within a private struct
 	// field to control the gocached Server API surface.
 	m struct {
@@ -1072,13 +1165,16 @@ type Server struct {
 		HotEvicted       expvar.Int `type:"counter" name:"hot_evicted" help:"files evicted from the hot tier to stay under its capacity"`
 		HotEvictedBytes  expvar.Int `type:"counter" name:"hot_evicted_bytes" help:"bytes reclaimed by evicting files from the hot tier"`
 
-		PutQueueBlocked      expvar.Int `type:"counter" name:"put_queue_blocked" help:"PUT requests that had to wait for put-queue backpressure before being admitted"`
-		PutQueueCopyErrs     expvar.Int `type:"counter" name:"put_queue_copy_errs" help:"failed attempts to copy a spooled blob into the main blob directory; retried before the PUT is dropped"`
-		PutQueueDropped      expvar.Int `type:"counter" name:"put_queue_dropped" help:"pending PUTs abandoned after repeated copy or flush failures; the client saw success but the object was lost"`
-		PutQueueFlushes      expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
-		PutQueueFlushedItems expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`
-		PutQueueFlushDups    expvar.Int `type:"counter" name:"put_queue_flush_dups" help:"subset of put_queue_flushed_items that were duplicates of an already-stored action"`
-		PutQueueOrphansSwept expvar.Int `type:"counter" name:"put_queue_orphans_swept" help:"blobs deleted from the main blob directory by the cleanup sweeper because a crashed or dropped PUT left them without SQLite accounting"`
+		PutQueueBlocked           expvar.Int `type:"counter" name:"put_queue_blocked" help:"PUT requests that had to wait for put-queue backpressure before being admitted; see the per-lane put_queue_blocked_* counters for which cap bound"`
+		PutQueueBlockedInline     expvar.Int `type:"counter" name:"put_queue_blocked_inline" help:"PUT requests that waited on the inline lane's count cap; the lane drains only through the metadata flusher, so this growing means SQLite commit throughput is the constraint"`
+		PutQueueBlockedSpoolBytes expvar.Int `type:"counter" name:"put_queue_blocked_spool_bytes" help:"PUT requests that waited on the spooled lane's byte cap (see put_queue_pending_bytes_cap); raise the spool capacity if the disk has room, or look at the movers if pending never drains"`
+		PutQueueBlockedSpoolCount expvar.Int `type:"counter" name:"put_queue_blocked_spool_count" help:"PUT requests that waited on the spooled lane's count cap (see put_queue_pending_cap); many small blobs are piling up faster than the movers copy them"`
+		PutQueueCopyErrs          expvar.Int `type:"counter" name:"put_queue_copy_errs" help:"failed attempts to copy a spooled blob into the main blob directory; retried before the PUT is dropped"`
+		PutQueueDropped           expvar.Int `type:"counter" name:"put_queue_dropped" help:"pending PUTs abandoned after repeated copy or flush failures; the client saw success but the object was lost"`
+		PutQueueFlushes           expvar.Int `type:"counter" name:"put_queue_flushes" help:"metadata batch transactions committed by the put-queue flusher"`
+		PutQueueFlushedItems      expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`
+		PutQueueFlushDups         expvar.Int `type:"counter" name:"put_queue_flush_dups" help:"subset of put_queue_flushed_items that were duplicates of an already-stored action"`
+		PutQueueOrphansSwept      expvar.Int `type:"counter" name:"put_queue_orphans_swept" help:"blobs deleted from the main blob directory by the cleanup sweeper because a crashed or dropped PUT left them without SQLite accounting"`
 	}
 }
 
@@ -2002,7 +2098,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 		createTime:       s.now().Unix(),
 		smallData:        smallData,
 		queueFile:        queueFile,
-		reservedBytes:    reserved,
+		reservation:      reserved,
 	}
 
 	if s.putq.enqueue(p) {
