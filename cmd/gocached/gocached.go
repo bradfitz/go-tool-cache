@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ var (
 	hotDir      = flag.String("hot-dir", "", "if non-empty, enable storage tiering with this directory as a fast tier (e.g. local NVMe) holding a bounded copy of recently used blobs; the cache directory remains the source of truth")
 	hotCapacity = flag.Int("hot-capacity-gb", 600, "maximum size of the hot tier directory in GiB; only used with --hot-dir")
 	putSpoolCap = flag.Int("put-spool-gb", 0, "capacity in GiB of the put queue's spooled lane: accepted PUT bytes waiting on local disk (the hot tier's filesystem, with --hot-dir) for a copy into the cache directory; 0 means one eighth of that filesystem's size")
+	putMovers   = flag.String("put-movers", "", "min,max bounds on the adaptive number of concurrent copies of spooled blobs into the cache directory, or a bare N to pin it at N; empty means the defaults (8,256)")
 	verbose     = flag.Bool("verbose", false, "be verbose")
 	listen      = flag.String("listen", ":31364", "listen address for the build-facing HTTP server")
 	debugListen = flag.String("debug-listen", "", "if non-empty, listen address for the debug HTTP server (pprof, metrics, etc)")
@@ -92,6 +94,13 @@ func main() {
 	if *putSpoolCap > 0 {
 		opts = append(opts, gocached.WithPutSpoolCapacity(int64(*putSpoolCap)<<30))
 	}
+	if *putMovers != "" {
+		minMovers, maxMovers, err := parsePutMovers(*putMovers)
+		if err != nil {
+			log.Fatalf("--put-movers: %v", err)
+		}
+		opts = append(opts, gocached.WithPutMoverLimits(minMovers, maxMovers))
+	}
 
 	if *jwtIssuer != "" {
 		if len(jwtClaims) == 0 {
@@ -144,4 +153,19 @@ func main() {
 
 	log.Printf("gocached: listening on %s ...", *listen)
 	log.Fatal(http.ListenAndServe(*listen, srv))
+}
+
+// parsePutMovers parses the --put-movers flag: "min,max" bounds on the
+// adaptive mover limit, or a bare "N" meaning a fixed limit of N.
+func parsePutMovers(s string) (minMovers, maxMovers int, err error) {
+	lo, hi, ok := strings.Cut(s, ",")
+	if !ok {
+		hi = lo
+	}
+	minMovers, err1 := strconv.Atoi(strings.TrimSpace(lo))
+	maxMovers, err2 := strconv.Atoi(strings.TrimSpace(hi))
+	if err1 != nil || err2 != nil || minMovers <= 0 || maxMovers < minMovers {
+		return 0, 0, fmt.Errorf("want N or min,max with 0 < min <= max; got %q", s)
+	}
+	return minMovers, maxMovers, nil
 }
