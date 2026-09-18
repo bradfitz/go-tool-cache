@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -538,15 +539,28 @@ func (q *putQueue) copyToMain(p *pendingPut) error {
 		os.Remove(tmpName)
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0750); err != nil {
-		os.Remove(tmpName)
-		return err
-	}
-	if err := os.Rename(tmpName, target); err != nil {
+	if err := renameCreatingDir(tmpName, target); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
 	return nil
+}
+
+// renameCreatingDir renames src to dst, creating dst's parent directory if
+// it doesn't exist. It attempts the rename first so that the common case,
+// a shard directory that has existed since the first blob landed in it,
+// costs one filesystem operation instead of an MkdirAll round trip plus
+// the rename, and it recovers if the directory is removed out from under
+// the server rather than trusting any remembered state.
+func renameCreatingDir(src, dst string) error {
+	err := os.Rename(src, dst)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0750); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
 }
 
 // flusherLoop batches entries from flushCh into single SQLite transactions.

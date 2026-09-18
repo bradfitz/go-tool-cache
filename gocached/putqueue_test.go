@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -133,6 +134,48 @@ func TestPutQueueReserveCountCap(t *testing.T) {
 	q.unreserve(0)
 	if _, err := q.reserve(ctx, 0); err != nil {
 		t.Fatalf("reserve after freeing a slot: %v", err)
+	}
+}
+
+func TestRenameCreatingDir(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "ab", "blob")
+	write := func(name string) string {
+		t.Helper()
+		src := filepath.Join(dir, name)
+		if err := os.WriteFile(src, []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return src
+	}
+
+	// The parent doesn't exist yet: created on demand.
+	if err := renameCreatingDir(write("one"), dst); err != nil {
+		t.Fatalf("rename into missing dir: %v", err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "one" {
+		t.Fatalf("dst = %q, %v; want %q", got, err, "one")
+	}
+
+	// The parent exists: the plain rename succeeds.
+	if err := renameCreatingDir(write("two"), dst); err != nil {
+		t.Fatalf("rename into existing dir: %v", err)
+	}
+
+	// The parent was removed out from under us: recreated, not cached.
+	if err := os.RemoveAll(filepath.Dir(dst)); err != nil {
+		t.Fatal(err)
+	}
+	if err := renameCreatingDir(write("three"), dst); err != nil {
+		t.Fatalf("rename after dir removal: %v", err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "three" {
+		t.Fatalf("dst = %q, %v; want %q", got, err, "three")
+	}
+
+	// A missing source is a real error, not something to paper over.
+	if err := renameCreatingDir(filepath.Join(dir, "nope"), dst); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("rename of missing src = %v, want not-exist", err)
 	}
 }
 
