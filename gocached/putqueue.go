@@ -374,10 +374,7 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 			case <-time.After(time.Second << (try - 1)):
 			}
 		}
-		err := q.writeCleanupIntent(p)
-		if err == nil {
-			err = q.copyToMain(p)
-		}
+		err := q.copyTimed(p)
 		if err == nil {
 			q.flushCh <- p
 			return
@@ -386,6 +383,24 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 		q.srv.m.PutQueueCopyErrs.Add(1)
 	}
 	q.drop(p)
+}
+
+// copyTimed performs one attempt at p's intent write and blob copy into the
+// main blob directory and records the attempt's wall time.
+func (q *putQueue) copyTimed(p *pendingPut) error {
+	start := time.Now()
+	err := q.writeCleanupIntent(p)
+	if err == nil {
+		err = q.copyToMain(p)
+	}
+	if q.srv.putCopyDuration != nil {
+		result := "ok"
+		if err != nil {
+			result = "error"
+		}
+		q.srv.putCopyDuration.WithLabelValues(result).Observe(time.Since(start).Seconds())
+	}
+	return err
 }
 
 // writeCleanupIntent creates p's cleanup intent record: a durable note that
@@ -606,6 +621,12 @@ func (q *putQueue) flushBatchWithRetry(ctx context.Context, batch []*pendingPut)
 // transaction, then finishes each entry.
 func (q *putQueue) flushBatch(batch []*pendingPut) error {
 	srv := q.srv
+	if srv.putFlushDuration != nil {
+		start := time.Now()
+		defer func() {
+			srv.putFlushDuration.Observe(time.Since(start).Seconds())
+		}()
+	}
 	srv.sqliteWriteMu.Lock()
 	defer srv.sqliteWriteMu.Unlock()
 
