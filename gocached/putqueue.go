@@ -103,11 +103,6 @@ const (
 	// putFlushInterval.
 	putFlushBatchCap = 512
 
-	// numPutMovers is how many goroutines copy spooled blobs into the main
-	// blob directory. The main directory may be a high-latency network
-	// filesystem, so several copies proceed in parallel.
-	numPutMovers = 8
-
 	// putCopyRetries is how many times a mover attempts a blob's copy into
 	// the main blob directory before the pending PUT is dropped.
 	putCopyRetries = 3
@@ -172,6 +167,10 @@ type putQueue struct {
 	countSem  *semaphore.Weighted
 	inlineSem *semaphore.Weighted
 
+	// gov sets how many spooled-blob copies into the main blob directory
+	// run concurrently, adapting to the directory's observed latency.
+	gov *moverGovernor
+
 	// mu is a leaf mutex: no other lock is acquired while holding it.
 	mu      sync.Mutex
 	pending map[actionKey]*pendingPut
@@ -208,6 +207,7 @@ func newPutQueue(srv *Server, dir string) *putQueue {
 		bytesSem:    semaphore.NewWeighted(spoolCap),
 		countSem:    semaphore.NewWeighted(putQueuePendingCountCap),
 		inlineSem:   semaphore.NewWeighted(putQueuePendingInlineCap),
+		gov:         newMoverGovernor(srv.putMoversMin, srv.putMoversMax),
 		pending:     make(map[actionKey]*pendingPut),
 		moverCh:     make(chan *pendingPut, putQueuePendingCountCap),
 		flushCh:     make(chan *pendingPut, putQueuePendingCountCap+putQueuePendingInlineCap),
@@ -219,10 +219,15 @@ func newPutQueue(srv *Server, dir string) *putQueue {
 // cleanup intent sweeper. It is not called under disableBackgroundLoops;
 // tests drive the pipeline with [Server.drainPendingPuts] and
 // [putQueue.sweepCleanupIntents] instead.
+//
+// One mover goroutine is started per slot the governor could ever grant;
+// each takes a governor slot before copying, so the number of copies in
+// flight follows the governor's current limit, not the goroutine count.
 func (q *putQueue) start(ctx context.Context) {
-	for range numPutMovers {
+	for range q.gov.maxLimit {
 		go q.moverLoop(ctx)
 	}
+	go q.gov.run(ctx)
 	go q.flusherLoop(ctx)
 	go q.runCleanupSweepLoop(ctx)
 }
@@ -454,9 +459,12 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 			case <-time.After(time.Second << (try - 1)):
 			}
 		}
-		err := q.copyTimed(p)
+		err := q.copyUnderGovernor(ctx, p)
 		if err == nil {
 			q.flushCh <- p
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 		q.srv.logf("put-queue: copying blob %v to main dir: %v", p.sha256hex, err)
@@ -465,20 +473,28 @@ func (q *putQueue) moveToFlush(ctx context.Context, p *pendingPut) {
 	q.drop(p)
 }
 
-// copyTimed performs one attempt at p's intent write and blob copy into the
-// main blob directory and records the attempt's wall time.
-func (q *putQueue) copyTimed(p *pendingPut) error {
+// copyUnderGovernor performs one attempt at p's intent write and blob copy
+// into the main blob directory while holding a mover governor slot, and
+// reports the attempt's latency to the governor and metrics.
+func (q *putQueue) copyUnderGovernor(ctx context.Context, p *pendingPut) error {
+	if err := q.gov.acquire(ctx); err != nil {
+		return err
+	}
+	defer q.gov.release()
 	start := time.Now()
 	err := q.writeCleanupIntent(p)
 	if err == nil {
 		err = q.copyToMain(p)
 	}
+	d := time.Since(start)
+	result := "ok"
+	if err != nil {
+		result = "error"
+	} else {
+		q.gov.observe(p.storedSize, d)
+	}
 	if q.srv.putCopyDuration != nil {
-		result := "ok"
-		if err != nil {
-			result = "error"
-		}
-		q.srv.putCopyDuration.WithLabelValues(result).Observe(time.Since(start).Seconds())
+		q.srv.putCopyDuration.WithLabelValues(result).Observe(d.Seconds())
 	}
 	return err
 }
