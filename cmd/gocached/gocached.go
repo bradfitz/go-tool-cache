@@ -39,6 +39,15 @@ var (
 	shardPrefixLen = flag.Int("shard-prefix-len", 2, "number of SHA256 hex characters per usage-stats shard key (valid 1..4); total shards = 16^n. Defaults to 2 (256 shards). Increase if a single shard's stats scan becomes too slow on a large DB")
 
 	jwtIssuer = flag.String("jwt-issuer", "", "the issuer to trust JWTs from; if set, all requests will require auth, and must set at least one -jwt-claim")
+
+	peerTag          = flag.String("peer-tag", "", "if non-empty, a tailnet tag such as tag:ci-mac-colo; pool this cache with the gocached servers on the tailnet nodes carrying it, learned by watching the local tailscaled. Each action is stored on exactly one server in the pool, chosen by rendezvous hashing, and requests for actions owned by another server are proxied to it over the LAN with TLS whose trust is established over the tailnet. Not supported with --jwt-issuer")
+	peerList         = flag.String("peers", "", "comma-separated host:port list of peer gocached servers' --peer-advert-listen addresses to pool with instead of --peer-tag, trusted because configured; for testing or hosts without tailscaled")
+	peerName         = flag.String("peer-name", "", "this server's name in the peer pool; with --peers it decides which actions this server owns, so it should be stable across restarts and unique in the pool. Defaults to the hostname")
+	peerAdvertListen = flag.String("peer-advert-listen", "", "listen address of the plain-HTTP server peers reach over the tailnet to learn this server's LAN address and certificate; defaults to :7890, and every member of a pool must use the same port")
+	peerTLSListen    = flag.String("peer-tls-listen", "", "listen address of the TLS port peers send forwarded requests to over the LAN; defaults to :31367")
+	peerLANIP        = flag.String("peer-lan-ip", "", "IPv4 address peers should reach this server's --peer-tls-listen port at; defaults to the address of the interface with the default route")
+	peerWeight       = flag.Float64("peer-weight", 1, "this server's share of the pool's keyspace relative to peers with weight 1")
+	tailscaledSocket = flag.String("tailscaled-socket", "", "path of tailscaled's LocalAPI socket, for --peer-tag; defaults to the platform's usual location, including the macOS GUI variants")
 	// See example GitHub token claims for what can be available:
 	// https://docs.github.com/en/actions/concepts/security/openid-connect
 	jwtClaims       = make(jwtClaimValue)
@@ -91,6 +100,22 @@ func main() {
 	}
 	if *putSpoolCap > 0 {
 		opts = append(opts, gocached.WithPutSpoolCapacity(int64(*putSpoolCap)<<30))
+	}
+
+	if *peerTag != "" || *peerList != "" {
+		pc := gocached.PeerConfig{
+			Name:             *peerName,
+			Tag:              *peerTag,
+			TailscaledSocket: *tailscaledSocket,
+			AdvertAddr:       *peerAdvertListen,
+			TLSAddr:          *peerTLSListen,
+			LANIP:            *peerLANIP,
+			Weight:           *peerWeight,
+		}
+		if *peerList != "" {
+			pc.Peers = strings.Split(*peerList, ",")
+		}
+		opts = append(opts, gocached.WithPeers(pc))
 	}
 
 	if *jwtIssuer != "" {
