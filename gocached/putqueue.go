@@ -266,6 +266,17 @@ func (q *putQueue) reserve(ctx context.Context, contentLength int64) (putReserva
 	return putReservation{bytes: reserved}, nil
 }
 
+// tryReserveInline is like reserve for an inline-sized object, but never
+// blocks: it reports false, without counting a blocked PUT, if the inline
+// lane is full. It is for opportunistic writes (a copy of a small object
+// fetched from a peer) that are better skipped than waited for.
+func (q *putQueue) tryReserveInline() (putReservation, bool) {
+	if !q.inlineSem.TryAcquire(1) {
+		return putReservation{}, false
+	}
+	return putReservation{inline: true}, true
+}
+
 // unreserve returns a reservation made by reserve.
 func (q *putQueue) unreserve(r putReservation) {
 	if r.inline {

@@ -8,6 +8,14 @@
 // It uses sqlite (the pure Go modernc.org/sqlite driver) to store metadata and
 // indexes.
 //
+// With [WithPeers], several servers on one LAN pool their caches: each action
+// is stored on the one server that rendezvous hashing assigns it to, and a
+// server proxies requests for actions it doesn't own to their owner. Clients
+// keep talking only to their local server. Peers are the tailnet nodes
+// carrying a configured tag, reached over the LAN with TLS whose trust is
+// bootstrapped through the tailnet; see the tagpeers, lansport, and
+// rendezvous packages, and peers.go here.
+//
 /*
 
 It speaks the same protocol as go-cacher-server, but requires
@@ -68,6 +76,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/tailscale/tb/lansport"
 	_ "modernc.org/sqlite"
 )
 
@@ -431,12 +440,12 @@ func (srv *Server) start() error {
 	reqLatencyBuckets := []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2}
 	srv.getDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_get_duration_seconds",
-		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), none (HEAD request), or error; and type: get (hit), miss (404), or error",
+		Help:    "wall time of each cache get request, labeled by storage path: hot (hot tier disk), disk, inline, pending (put-queue), peer (forwarded to the owning LAN peer), none (HEAD request), or error; and type: get (hit), miss (404), or error",
 		Buckets: reqLatencyBuckets,
 	}, []string{"storage", "type"})
 	srv.putDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_put_duration_seconds",
-		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, or error; and type: put (success), dup, or error",
+		Help:    "wall time of each cache put request, labeled by storage path: disk, inline, peer (forwarded to the owning LAN peer), or error; and type: put (success), dup, or error",
 		Buckets: reqLatencyBuckets,
 	}, []string{"storage", "type"})
 	// Copies into the main blob directory and metadata flushes are
@@ -460,7 +469,7 @@ func (srv *Server) start() error {
 	}
 	srv.blobSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "gocached_blob_size_bytes",
-		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, or error; and type: get, put, or dup",
+		Help:    "object size in bytes transmitted on the wire (whether compressed or uncompressed) for successful GETs and PUTs, labeled by storage: hot, disk, inline, peer, or error; and type: get, put, or dup",
 		Buckets: blobSizeBuckets,
 	}, []string{"storage", "type"})
 
@@ -672,6 +681,20 @@ func (srv *Server) start() error {
 		}
 
 		go srv.runCleanSessionsLoop()
+	}
+
+	if srv.peerCfg != nil {
+		if len(srv.jwtIssuers) > 0 {
+			// Forwarded requests would need to carry the client's
+			// namespace grant to the peer, and peers would need to
+			// authenticate to each other. Neither exists yet.
+			return errors.New("peering is not supported together with JWT auth")
+		}
+		ps, err := newPeerSet(srv, *srv.peerCfg)
+		if err != nil {
+			return fmt.Errorf("peering: %w", err)
+		}
+		srv.peers = ps
 	}
 
 	if !srv.disableBackgroundLoops {
@@ -938,6 +961,12 @@ func NewServer(opts ...ServerOption) (*Server, error) {
 func (srv *Server) Close() error {
 	srv.shutdownCancel()
 
+	// Tell peers we're leaving before the drain below, which can take a
+	// while, so they stop routing to us right away.
+	if srv.peers != nil {
+		srv.peers.close()
+	}
+
 	// Settle any PUTs the background pipeline hadn't finished: their
 	// metadata exists only in memory until flushed.
 	var err error
@@ -1014,6 +1043,14 @@ type Server struct {
 	jwtIssuers       []string                                                                  // accepted issuer URLs
 	namespaceMapping func(ctx context.Context, claims map[string]any) (*NamespaceGrant, error) // required when jwtIssuers is non-empty
 
+	// peerCfg is the LAN peering configuration from [WithPeers], or nil
+	// when peering is disabled. peers is the live peer state built from it
+	// in start; it is nil when peering is disabled. peerPollInterval, if
+	// positive, overrides the peer status poll interval (tests only).
+	peerCfg          *PeerConfig
+	peers            *peerSet
+	peerPollInterval time.Duration
+
 	mu               sync.RWMutex            // guards following fields in this block
 	sessions         map[string]*sessionData // maps access token -> session data.
 	accessDirty      map[actionKey]int64     // action -> accessTime
@@ -1081,7 +1118,7 @@ type Server struct {
 	// getDuration, putDuration, and blobSize observe the wall time and transfer
 	// size of each /action GET and PUT request handler, labeled by storage and
 	// type. type is one of "get" (hit), "miss" (404), "put", "dup", or "error".
-	// storage is one of "disk", "inline", "none", or "error".
+	// storage is one of "disk", "inline", "peer", "none", or "error".
 	getDuration *prometheus.HistogramVec
 	putDuration *prometheus.HistogramVec
 	blobSize    *prometheus.HistogramVec
@@ -1140,6 +1177,19 @@ type Server struct {
 		PutQueueFlushedItems      expvar.Int `type:"counter" name:"put_queue_flushed_items" help:"pending PUTs whose metadata was committed by the put-queue flusher"`
 		PutQueueFlushDups         expvar.Int `type:"counter" name:"put_queue_flush_dups" help:"subset of put_queue_flushed_items that were duplicates of an already-stored action"`
 		PutQueueOrphansSwept      expvar.Int `type:"counter" name:"put_queue_orphans_swept" help:"blobs deleted from the main blob directory by the cleanup sweeper because a crashed or dropped PUT left them without SQLite accounting"`
+
+		PeersKnown          expvar.Int `type:"gauge" name:"peers_known" help:"peer gocached servers this server knows about, reachable or not; always 0 with peering disabled"`
+		PeersHealthy        expvar.Int `type:"gauge" name:"peers_healthy" help:"peers that are reachable over the LAN and therefore in the rendezvous hashing set"`
+		PeerFwdGets         expvar.Int `type:"counter" name:"peer_fwd_gets" help:"GETs that missed locally and were forwarded to the owning peer"`
+		PeerFwdGetHits      expvar.Int `type:"counter" name:"peer_fwd_get_hits" help:"forwarded GETs the owning peer answered with the object"`
+		PeerFwdGetErrs      expvar.Int `type:"counter" name:"peer_fwd_get_errs" help:"forwarded GETs that failed for a reason other than a miss; reported to the client as a miss"`
+		PeerFwdGetPopulated expvar.Int `type:"counter" name:"peer_fwd_get_populated" help:"subset of peer_fwd_get_hits for inline-sized objects that were also stored locally, so later reads on this server are local"`
+		PeerFwdPuts         expvar.Int `type:"counter" name:"peer_fwd_puts" help:"PUTs forwarded to the owning peer"`
+		PeerFwdPutErrs      expvar.Int `type:"counter" name:"peer_fwd_put_errs" help:"forwarded PUTs that failed"`
+		PeerFwdPutPopulated expvar.Int `type:"counter" name:"peer_fwd_put_populated" help:"forwarded PUTs of inline-sized objects that were also stored locally, so later reads on this server are local"`
+		PeerFwdPutFallbacks expvar.Int `type:"counter" name:"peer_fwd_put_fallbacks" help:"subset of peer_fwd_put_errs where the peer was unreachable before any body was read, so the object was stored locally instead"`
+		PeerServedGets      expvar.Int `type:"counter" name:"peer_served_gets" help:"GETs received from peers that forwarded them to this server as the owner"`
+		PeerServedPuts      expvar.Int `type:"counter" name:"peer_served_puts" help:"PUTs received from peers that forwarded them to this server as the owner"`
 	}
 }
 
@@ -1201,6 +1251,20 @@ func (srv *Server) now() time.Time {
 	return srv.clock()
 }
 
+// stdLogger returns a *log.Logger that writes through srv.logf with the
+// given prefix, for libraries that want one.
+func (srv *Server) stdLogger(prefix string) *log.Logger {
+	return log.New(logfWriter{srv.logf}, prefix, 0)
+}
+
+// logfWriter adapts a logger.Logf to io.Writer, one line per Write.
+type logfWriter struct{ logf logger.Logf }
+
+func (w logfWriter) Write(p []byte) (int, error) {
+	w.logf("%s", strings.TrimRight(string(p), "\n"))
+	return len(p), nil
+}
+
 // ServeHTTPDebug serves debug HTTP endpoints. It is unauthenticated, so should
 // only be used on a separate debug listener.
 func (srv *Server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
@@ -1214,6 +1278,7 @@ func (srv *Server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "<p>This is a shared Go build cache server, hit by GOCACHEPROG clients.</p>")
 		io.WriteString(w, "<p>See <a href='/usage'>/usage</a> for usage stats.</p>")
 		io.WriteString(w, "<p>See <a href='/sessions'>/sessions</a> for session data</p>")
+		io.WriteString(w, "<p>See <a href='/peers'>/peers</a> for LAN peer status</p>")
 		io.WriteString(w, "<p>See <a href='/metrics'>/metrics</a> for Prometheus metrics.</p>")
 		io.WriteString(w, "<p>See <a href='/debug/pprof/'>/debug/pprof/</a> for pprof</p>")
 		io.WriteString(w, "<p>See <a href='/debug/pprof/goroutine?debug=2'>/debug/pprof/goroutine?debug=2</a> - full goroutines</p>")
@@ -1221,6 +1286,11 @@ func (srv *Server) ServeHTTPDebug(w http.ResponseWriter, r *http.Request) {
 		srv.serveUsage(w, r)
 	case r.URL.Path == "/sessions":
 		srv.serveSessions(w, r)
+	case r.URL.Path == "/peers":
+		srv.servePeers(w, r)
+	case r.URL.Path == peerStatusPath && srv.peers != nil:
+		// The same JSON peers fetch from the peer port, for debugging.
+		srv.servePeerStatus(w, r)
 	case r.URL.Path == "/metrics":
 		srv.metricsHandler.ServeHTTP(w, r)
 	case strings.HasPrefix(r.URL.Path, "/debug/pprof/profile"):
@@ -1250,6 +1320,22 @@ func (srv *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Call inside func to capture maybe-updated sessionData pointer.
 		srv.processRequestStats(reqStats, sessionData)
 	}()
+
+	if _, fromPeer := lansport.FromPeer(r); fromPeer {
+		// A verified peer, on the lansport TLS port. Peering is only
+		// enabled without JWT auth (see start), so none of this involves
+		// sessions.
+		if r.URL.Path == peerStatusPath {
+			srv.servePeerStatus(w, r)
+			return
+		}
+		switch r.Method {
+		case "PUT":
+			srv.m.PeerServedPuts.Add(1)
+		case "GET", "HEAD":
+			srv.m.PeerServedGets.Add(1)
+		}
+	}
 
 	// Handle session auth first if enabled.
 	if srv.jwtValidator != nil {
@@ -1504,6 +1590,15 @@ func (srv *Server) handleGetAction(w http.ResponseWriter, r *http.Request, stats
 		&sha256hex, &storedSize, &uncompressedSize, &smallData, &altObjectID, &accessTime, &actionKey.NamespaceID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			// A local miss for an action a peer owns is forwarded to
+			// that peer. Local storage is checked first regardless of
+			// owner, since it's cheap and this server may still hold
+			// objects from before it was pooled or from when the ring
+			// looked different.
+			if p, ok := srv.peerOwner(r, actionID); ok {
+				labels = srv.peers.proxyGet(w, r, stats, p, actionID)
+				return
+			}
 			labels = writeObjectResponseLabels{storage: "none", result: "miss"}
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -1557,10 +1652,11 @@ type objectSource struct {
 // latency metric.
 type writeObjectResponseLabels struct {
 	// storage says where the object bytes came from: "inline" (the
-	// database), "disk" (the main blob directory), or "hot" (the hot
-	// tier); "none" for a response without a body (a HEAD request, an
-	// empty object, or a miss); or "error". Callers serving from the
-	// put-queue relabel hits as "pending" via markPending.
+	// database), "disk" (the main blob directory), "hot" (the hot
+	// tier), or "peer" (a LAN peer); "none" for a response without a
+	// body (a HEAD request, an empty object, or a miss); or "error".
+	// Callers serving from the put-queue relabel hits as "pending" via
+	// markPending.
 	storage string
 
 	// result is the request outcome: "get" (a hit), "miss" (a 404), or
@@ -1980,6 +2076,36 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, stats *stats,
 	if r.ContentLength == -1 {
 		http.Error(w, "missing Content-Length", http.StatusBadRequest)
 		return
+	}
+
+	// A PUT for an action a peer owns goes to that peer. Inline-sized
+	// objects are buffered, forwarded, and also stored here, and fall back
+	// to local storage if the peer fails at any point. Larger objects are
+	// streamed to the peer and stored only there; if the peer can't be
+	// reached before any of the body has been read, proxyPut declines and
+	// the object is stored locally.
+	if p, ok := s.peerOwner(r, actionID); ok {
+		handled := true
+		if r.ContentLength <= smallObjectSize {
+			data, err := io.ReadAll(io.LimitReader(r.Body, r.ContentLength+1))
+			if err != nil || int64(len(data)) != r.ContentLength {
+				s.logf("Read content error: %v", err)
+				stats.PutErrs++
+				http.Error(w, "Read content error", http.StatusInternalServerError)
+				return
+			}
+			s.peers.proxyPutSmall(w, r, stats, p, actionID, outputID, data)
+		} else {
+			handled = s.peers.proxyPut(w, r, stats, p, actionID, outputID)
+		}
+		if handled {
+			storage = "peer"
+			result = "put"
+			if stats.PutErrs > 0 {
+				result = "error"
+			}
+			return
+		}
 	}
 
 	// Backpressure: reserve queue room for the declared size before reading
@@ -3187,10 +3313,7 @@ func (srv *Server) serveUsage(w http.ResponseWriter, r *http.Request) {
 	// is implementation noise for /usage readers; if anyone needs the
 	// breakdown they can read gocached_{blob,pending_blob}_{count,bytes}
 	// from /metrics.
-	dCount, dBytes := srv.sumShardDeltas()
-	live := us.All()
-	live.Count += dCount
-	live.Size += dBytes
+	live, _ := srv.liveUsage()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, "<html><body><h1>gocached usage stats</h1>\n")
